@@ -39,7 +39,7 @@ const api: KryptApi = {
   },
   profiles: {
     list: (): Promise<Profile[]> => ipcRenderer.invoke('profiles:list'),
-    save: (name, description) => ipcRenderer.invoke('profiles:save', name, description),
+    save: (name, description, kind) => ipcRenderer.invoke('profiles:save', name, description, kind),
     apply: (id) => ipcRenderer.invoke('profiles:apply', id),
     rename: (id, name) => ipcRenderer.invoke('profiles:rename', id, name),
     update: (id) => ipcRenderer.invoke('profiles:update', id),

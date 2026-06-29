@@ -284,91 +284,104 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
     if not candidates:
         return 0, []
 
-    new_rows: list[dict] = []
-
+    # Phase 1: collect genuinely-new candidates + their cached market using a
+    # SHORT read connection — no write lock is held across the network calls below.
     with db.get_db() as conn:
+        pending: list[dict] = []
         for entry in candidates:
-            t = entry["raw"]
-            trade_id = t.get("trade_id", "")
+            trade_id = entry["raw"].get("trade_id", "")
             if not trade_id or db.whale_trade_exists(conn, trade_id):
                 continue
-            ticker = entry["ticker"]
-            mkt = db.get_market(conn, ticker)
-            if not mkt:
-                api_mkt = await kalshi_api.fetch_market(ticker)
-                if api_mkt:
-                    event_tk = api_mkt.get("event_ticker", "")
-                    series_tk = (
-                        event_tk.split("-")[0] if event_tk and "-" in event_tk else ""
-                    )
-                    db.upsert_market(
-                        conn,
-                        {
-                            "ticker": ticker,
-                            "event_ticker": event_tk,
-                            "series_ticker": series_tk,
-                            "title": api_mkt.get("title", ""),
-                            "yes_sub_title": api_mkt.get("yes_sub_title", ""),
-                            "category": "",
-                            "status": api_mkt.get("status", "open"),
-                            "close_time": api_mkt.get("close_time", ""),
-                            "volume": api_mkt.get("volume_fp", 0),
-                            "volume_24h": api_mkt.get("volume_24h_fp", 0),
-                            "open_interest": api_mkt.get("open_interest_fp", 0),
-                            "yes_bid": api_mkt.get("yes_bid_dollars", 0),
-                            "yes_ask": api_mkt.get("yes_ask_dollars", 0),
-                            "last_price": api_mkt.get("last_price_dollars", 0),
-                            "result": api_mkt.get("result", ""),
-                            "settlement_value": api_mkt.get("settlement_value_dollars"),
-                        },
-                    )
-                    mkt = db.get_market(conn, ticker)
+            entry["trade_id"] = trade_id
+            entry["mkt"] = db.get_market(conn, entry["ticker"])
+            pending.append(entry)
 
-            title = ""
-            event_ticker = ""
-            close_time = ""
-            mkt_vol = oi = 0.0
-            cat = ""
-            yes_sub = ""
-            if mkt:
-                title = mkt.get("title", "") or mkt.get("yes_sub_title", "")
-                yes_sub = mkt.get("yes_sub_title", "")
-                event_ticker = mkt.get("event_ticker", "")
-                close_time = mkt.get("close_time", "")
-                mkt_vol = _to_float(mkt.get("volume", 0))
-                oi = _to_float(mkt.get("open_interest", 0))
-                cat = mkt.get("category", "")
+    if not pending:
+        return 0, []
 
-            if not cat:
-                cat = await _resolve_category(ticker, title)
+    # Network I/O (fetch_market for cache misses + category resolution) happens
+    # OUTSIDE any transaction, so the SQLite write lock is never held across an
+    # await — which previously caused intermittent 'database is locked' failures
+    # for concurrent IPC writes (manual order, Sync, Resolve All, config save).
+    fetched_markets: dict[str, dict] = {}
+    for entry in pending:
+        ticker = entry["ticker"]
+        mkt = entry["mkt"]
+        if not mkt:
+            api_mkt = await kalshi_api.fetch_market(ticker)
+            if api_mkt:
+                event_tk = api_mkt.get("event_ticker", "")
+                series_tk = event_tk.split("-")[0] if event_tk and "-" in event_tk else ""
+                mkt = {
+                    "ticker": ticker,
+                    "event_ticker": event_tk,
+                    "series_ticker": series_tk,
+                    "title": api_mkt.get("title", ""),
+                    "yes_sub_title": api_mkt.get("yes_sub_title", ""),
+                    "category": "",
+                    "status": api_mkt.get("status", "open"),
+                    "close_time": api_mkt.get("close_time", ""),
+                    "volume": api_mkt.get("volume_fp", 0),
+                    "volume_24h": api_mkt.get("volume_24h_fp", 0),
+                    "open_interest": api_mkt.get("open_interest_fp", 0),
+                    "yes_bid": api_mkt.get("yes_bid_dollars", 0),
+                    "yes_ask": api_mkt.get("yes_ask_dollars", 0),
+                    "last_price": api_mkt.get("last_price_dollars", 0),
+                    "result": api_mkt.get("result", ""),
+                    "settlement_value": api_mkt.get("settlement_value_dollars"),
+                }
+                fetched_markets[ticker] = mkt
+            entry["mkt"] = mkt
 
-            days_left = _parse_days_to_close(close_time)
-            confidence = compute_whale_score(
-                dollar_value=entry["dollar"],
-                price=entry["price"],
-                taker_side=entry["taker_side"],
-                market_volume=mkt_vol,
-                open_interest=oi,
-                days_to_close=days_left,
-                category=cat,
-            )
+        title = event_ticker = close_time = yes_sub = ""
+        mkt_vol = oi = 0.0
+        cat = ""
+        if mkt:
+            title = mkt.get("title", "") or mkt.get("yes_sub_title", "")
+            yes_sub = mkt.get("yes_sub_title", "")
+            event_ticker = mkt.get("event_ticker", "")
+            close_time = mkt.get("close_time", "")
+            mkt_vol = _to_float(mkt.get("volume", 0))
+            oi = _to_float(mkt.get("open_interest", 0))
+            cat = mkt.get("category", "")
+        if not cat:
+            cat = await _resolve_category(ticker, title)
 
-            data = {
-                "trade_id": trade_id,
-                "ticker": ticker,
-                "event_ticker": event_ticker,
-                "title": title or ticker,
-                "yes_sub_title": yes_sub,
-                "category": cat,
-                "taker_side": entry["taker_side"],
-                "count_fp": entry["count_fp"],
-                "price": entry["price"],
-                "dollar_value": entry["dollar"],
-                "market_volume": mkt_vol,
-                "open_interest": oi,
-                "confidence": confidence,
-            }
-            wid = db.insert_whale_trade(conn, data)
+        days_left = _parse_days_to_close(close_time)
+        confidence = compute_whale_score(
+            dollar_value=entry["dollar"], price=entry["price"],
+            taker_side=entry["taker_side"], market_volume=mkt_vol,
+            open_interest=oi, days_to_close=days_left, category=cat,
+        )
+        entry["data"] = {
+            "trade_id": entry["trade_id"],
+            "ticker": ticker,
+            "event_ticker": event_ticker,
+            "title": title or ticker,
+            "yes_sub_title": yes_sub,
+            "category": cat,
+            "taker_side": entry["taker_side"],
+            "count_fp": entry["count_fp"],
+            "price": entry["price"],
+            "dollar_value": entry["dollar"],
+            "market_volume": mkt_vol,
+            "open_interest": oi,
+            "confidence": confidence,
+        }
+
+    # Phase 2: tight write transaction with NO awaits inside (lock held ms, not s).
+    new_rows: list[dict] = []
+    with db.get_db() as conn:
+        for entry in pending:
+            if db.whale_trade_exists(conn, entry["trade_id"]):
+                continue
+            m = fetched_markets.get(entry["ticker"])
+            if m:
+                # Persist the resolved category so repeat whale markets in this
+                # series don't trigger another fetch_series next scan.
+                m["category"] = entry["data"].get("category", "") or m.get("category", "")
+                db.upsert_market(conn, m)
+            wid = db.insert_whale_trade(conn, entry["data"])
             if wid:
                 row = conn.execute(
                     "SELECT * FROM whale_trades WHERE id=?", (wid,)
@@ -423,6 +436,12 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 )
 
     with db.get_db() as conn:
+        # Bulk-load the previous snapshot for every market in ONE query instead
+        # of a per-market lookup inside the loop (was a ~500× N+1 on a table
+        # that grows every scan).
+        prev_snaps = db.get_previous_snapshots_bulk(
+            conn, [m.get("ticker") for m in markets if m.get("ticker")]
+        )
         for market in markets:
             ticker = market["ticker"]
             if is_micro_market(ticker):
@@ -436,7 +455,7 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
             close_time = market.get("close_time", "")
             days_left = _parse_days_to_close(close_time)
 
-            prev = db.get_previous_snapshot(conn, ticker)
+            prev = prev_snaps.get(ticker)
             prev_vol = _to_float(prev.get("volume_24h", 0)) if prev else 0
             prev_price = (
                 _to_float(prev.get("yes_bid", 0) or prev.get("last_price", 0))
@@ -491,13 +510,16 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
             if not signals:
                 continue
 
-            direction = cluster_dir
-            if "price_move" in signals:
-                direction = "yes" if price_change > 0 else "no"
-
             for stype in signals:
                 if stype not in allowed_signals:
                     continue
+                # Direction PER signal type — a price_move's sign must not override
+                # a trade_cluster's dominant side (that bought the wrong side);
+                # volume_spike has no inherent side, so it follows the cluster.
+                if stype == "price_move":
+                    direction = "yes" if price_change > 0 else "no"
+                else:
+                    direction = cluster_dir
                 if contrarian_only:
                     if direction == "yes" and cur_price > MOMENTUM_YES_MAX_YES_PRICE:
                         continue
@@ -564,18 +586,19 @@ async def resolve_alerts_from_markets() -> int:
 
     tickers = list({a["ticker"] for a in unresolved if a["ticker"]})
     resolved = 0
-    for ticker in tickers:
-        try:
-            market = await kalshi_api.fetch_market(ticker)
-        except Exception:
-            continue
-        if not market:
-            continue
-        status = (market.get("status") or "").lower()
-        result = (market.get("result") or "").lower()
-        if status not in ("determined", "finalized", "settled") or not result:
-            continue
-        with db.get_db() as conn:
+    # Fetch every market concurrently (capped) instead of serially with a sleep
+    # between each — a 100-signal backlog was a ~10-minute serial crawl that
+    # blocked the trader loop; now it's one bounded burst.
+    markets = await kalshi_api.fetch_markets_map(tickers)
+    with db.get_db() as conn:
+        for ticker in tickers:
+            market = markets.get(ticker)
+            if not market:
+                continue
+            status = (market.get("status") or "").lower()
+            result = (market.get("result") or "").lower()
+            if status not in ("determined", "finalized", "settled") or not result:
+                continue
             for a in [x for x in unresolved if x["ticker"] == ticker]:
                 if a["direction"] == "yes":
                     correct = result == "yes"
@@ -587,7 +610,6 @@ async def resolve_alerts_from_markets() -> int:
                     conn, a["id"], correct, 1.0 if correct else 0.0, pnl
                 )
                 resolved += 1
-        await asyncio.sleep(0.1)
     return resolved
 
 
@@ -598,36 +620,28 @@ async def resolve_whales_from_markets() -> int:
         return 0
     tickers = list({t["ticker"] for t in unresolved if t["ticker"]})
     resolved = 0
-    for ticker in tickers:
-        try:
-            market = await kalshi_api.fetch_market(ticker)
-        except Exception:
-            continue
-        if not market:
-            continue
-        status = (market.get("status") or "").lower()
-        result = (market.get("result") or "").lower()
-        if status not in ("determined", "finalized", "settled") or not result:
-            continue
-        with db.get_db() as conn:
+    # Concurrent (capped) market fetch instead of a serial sleep-throttled crawl.
+    markets = await kalshi_api.fetch_markets_map(tickers)
+    with db.get_db() as conn:
+        for ticker in tickers:
+            market = markets.get(ticker)
+            if not market:
+                continue
+            status = (market.get("status") or "").lower()
+            result = (market.get("result") or "").lower()
+            if status not in ("determined", "finalized", "settled") or not result:
+                continue
             for t in [x for x in unresolved if x["ticker"] == ticker]:
-                if t["taker_side"] == "yes":
-                    correct = result == "yes"
-                    pnl = (
-                        (1.0 - t["price"]) * t["dollar_value"]
-                        if correct
-                        else -t["dollar_value"]
-                    )
-                else:
-                    correct = result == "no"
-                    pnl = (
-                        (t["price"]) * t["dollar_value"]
-                        if correct
-                        else -t["dollar_value"]
-                    )
+                # dollar_value is the trade COST (contracts × price), so the
+                # contract count is dollar_value/price and a win profits
+                # contracts × (1 − price). (The old per-side math scaled by cost,
+                # not contracts, and used the wrong price on the NO side.)
+                p = float(t["price"]) or 0.0
+                contracts = (t["dollar_value"] / p) if p else 0.0
+                correct = result == t["taker_side"]
+                pnl = contracts * (1.0 - p) if correct else -t["dollar_value"]
                 db.mark_whale_resolved(
                     conn, t["id"], correct, 1.0 if correct else 0.0, pnl
                 )
                 resolved += 1
-        await asyncio.sleep(0.1)
     return resolved

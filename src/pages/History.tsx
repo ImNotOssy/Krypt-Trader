@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { History as HistoryIcon, Play, Receipt, Square, Trophy } from 'lucide-react';
+import { History as HistoryIcon, Play, Receipt, Square, Trash2, Trophy } from 'lucide-react';
 import type { BotRun } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
-import { Card, Empty, Page, ShareableStat, StatCard } from '../components/common';
+import { useToast } from '../state/ToastProvider';
+import { Card, ConfirmDialog, Empty, Page, ShareableStat, StatCard } from '../components/common';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtPct, fmtUsd, fmtDateTime } from '../utils/format';
 
@@ -11,8 +12,33 @@ type HistoryTab = 'runs' | 'trades';
 
 export function HistoryPage() {
   const { positions, account, config } = useApp();
+  const toast = useToast();
   const [tab, setTab] = useState<HistoryTab>('runs');
   const [runs, setRuns] = useState<BotRun[]>([]);
+  const [showWipe, setShowWipe] = useState(false);
+  const [wiping, setWiping] = useState(false);
+
+  const wipeHistory = async (): Promise<void> => {
+    setShowWipe(false);
+    setWiping(true);
+    try {
+      const r = await window.krypt.app.factoryReset();
+      if (r.ok) {
+        const summary = (r.data as { deleted?: Record<string, number> })?.deleted || {};
+        const n = Object.entries(summary)
+          .filter(([k]) => !k.startsWith('_'))
+          .reduce((acc, [, v]) => acc + (Number(v) > 0 ? Number(v) : 0), 0);
+        setRuns([]);
+        toast.success(n > 0 ? `History cleared — ${n} rows removed` : (r.message || 'History was already empty'));
+      } else {
+        toast.error(r.message || 'Wipe failed');
+      }
+    } catch (e: any) {
+      toast.error(`${e?.message || e}`);
+    } finally {
+      setWiping(false);
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -52,6 +78,17 @@ export function HistoryPage() {
     <Page
       title="History"
       subtitle="Per-run rollups (the bot's session diary) and the full settled trade ledger."
+      actions={
+        <button
+          onClick={() => setShowWipe(true)}
+          disabled={wiping}
+          className="inline-flex items-center gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/20 disabled:opacity-50"
+          title="Delete all local trade history — settings, profiles, and API keys are kept"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          {wiping ? 'Wiping…' : 'Wipe History'}
+        </button>
+      }
     >
       <div className="mb-4 inline-flex rounded-md border border-krypt-border bg-krypt-surface2 p-0.5">
         <TabButton active={tab === 'runs'} onClick={() => setTab('runs')} icon={<HistoryIcon className="h-3.5 w-3.5" />}>
@@ -66,6 +103,24 @@ export function HistoryPage() {
 
       {tab === 'runs' && <RunHistory runs={runs} env={config?.kalshiEnv} />}
       {tab === 'trades' && <TradeHistory resolved={resolved} account={account} />}
+
+      <ConfirmDialog
+        open={showWipe}
+        title="Wipe trade history?"
+        danger
+        confirmLabel="Wipe History"
+        onClose={() => setShowWipe(false)}
+        onConfirm={() => void wipeHistory()}
+        body={
+          <>
+            Permanently deletes all locally stored <b>positions, run history,
+            P&amp;L snapshots, daily stats, and signals</b> (both Demo and Live).
+            <br /><br />
+            Your <b>settings, profiles, and API keys are kept.</b> Any positions
+            still live on Kalshi are re-imported on the next sync.
+          </>
+        }
+      />
     </Page>
   );
 }

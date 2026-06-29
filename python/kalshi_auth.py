@@ -340,6 +340,11 @@ def sync_server_time(force: bool = False) -> int:
     now_local = time.time()
     if (not force) and (now_local - _last_sync) < _RESYNC_INTERVAL_SEC:
         return _server_offset_ms
+    # Back off for the FULL interval on every attempt (success or failure).
+    # Previously _last_sync was only set on success, so a failed/missing-Date
+    # sync left the gate permanently open and this blocking 5s HEAD ran on the
+    # event loop for EVERY signed request — freezing the stop-loss/order loop.
+    _last_sync = now_local
     try:
         with httpx.Client(timeout=5.0) as c:
             resp = c.head(_server_time_url())
@@ -348,7 +353,6 @@ def sync_server_time(force: bool = False) -> int:
             server_dt = parsedate_to_datetime(date_hdr).timestamp()
             new_offset = int((server_dt - now_local) * 1000) - 750
             _server_offset_ms = new_offset
-            _last_sync = now_local
             logger.debug(f"Kalshi clock sync: offset = {new_offset} ms")
     except Exception as e:
         logger.warning(f"Kalshi clock sync failed ({e})")

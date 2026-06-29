@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Ban } from 'lucide-react';
+import { Ban, RefreshCw } from 'lucide-react';
 import type { BotPosition } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
@@ -21,7 +21,7 @@ const STATUS_COLORS: Record<string, string> = {
 type Tab = 'open' | 'pending' | 'won' | 'lost' | 'errors' | 'all';
 
 export function PositionsPage() {
-  const { positions } = useApp();
+  const { positions, refresh } = useApp();
   const toast = useToast();
   const [tab, setTab] = useState<Tab>('open');
   const [src, setSrc] = useState<'all' | 'whale' | 'momentum'>('all');
@@ -72,14 +72,35 @@ export function PositionsPage() {
     }
   };
 
+  const refreshNow = async (): Promise<void> => {
+    setBusy('refresh');
+    try {
+      // Sync the local book with Kalshi: poll working orders for fresh fills,
+      // then reconcile open/external positions, before pulling the rows in.
+      await window.krypt.backend.runOnce('pollOrders');
+      await window.krypt.backend.runOnce('reconcilePositions');
+      await Promise.all([refresh.positions(), refresh.account()]);
+      toast.success('Synced open & pending with Kalshi');
+    } catch {
+      toast.error('Sync failed');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <Page
       title="Positions"
       subtitle="Live + recent positions. Tap Cancel All to flatten any working orders on Kalshi."
       actions={
-        <button onClick={cancelAll} disabled={!!busy} className="krypt-btn-danger">
-          <Ban className="h-4 w-4" /> Cancel All
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={refreshNow} disabled={!!busy} className="krypt-btn-default" title="Sync open & pending orders with Kalshi">
+            <RefreshCw className={cls('h-4 w-4', busy === 'refresh' && 'animate-spin')} /> Refresh
+          </button>
+          <button onClick={cancelAll} disabled={!!busy} className="krypt-btn-danger">
+            <Ban className="h-4 w-4" /> Cancel All
+          </button>
+        </div>
       }
     >
       <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -165,7 +186,10 @@ function Tabs<T extends string>({
 }
 
 function PositionRow({ p }: { p: BotPosition }) {
-  const pnl = p.pnlUsd;
+  // Resolved rows show realized P&L; open filled rows show live (unrealized)
+  // mark-to-market P&L at the current price.
+  const realized = p.resolved;
+  const pnl = realized ? p.pnlUsd : p.livePnlUsd;
   return (
     <tr>
       <td className="text-xs text-krypt-muted">{fmtRelative(p.createdAt)}</td>
@@ -175,7 +199,9 @@ function PositionRow({ p }: { p: BotPosition }) {
             'inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] uppercase',
             p.signalSource === 'whale'
               ? 'bg-krypt-purple/15 text-krypt-purple'
-              : 'bg-krypt-pink/15 text-krypt-pink',
+              : p.signalSource === 'external'
+                ? 'bg-krypt-dim/15 text-krypt-muted'
+                : 'bg-krypt-pink/15 text-krypt-pink',
           )}
         >
           {p.signalSource}
@@ -223,14 +249,33 @@ function PositionRow({ p }: { p: BotPosition }) {
           <span className="krypt-pill text-krypt-muted">closed</span>
         )}
       </td>
-      <td className="font-mono text-xs text-krypt-purple">+{p.edgePts.toFixed(1)}</td>
+      <td className="font-mono text-xs text-krypt-purple">
+        {p.signalSource === 'external'
+          ? <span className="text-krypt-dim" title="Imported from Kalshi — no entry signal">—</span>
+          : `+${p.edgePts.toFixed(1)}`}
+      </td>
       <td
         className={cls(
           'font-mono text-xs',
           pnl == null ? 'text-krypt-dim' : pnl >= 0 ? 'text-krypt-win' : 'text-krypt-loss',
         )}
       >
-        {p.resolved ? fmtUsd(pnl, { sign: true }) : '—'}
+        {pnl == null ? (
+          '—'
+        ) : (
+          <span
+            title={
+              realized
+                ? 'Realized P&L'
+                : `Unrealized P&L at ${p.markPriceCents != null ? `${Math.round(p.markPriceCents)}¢` : 'current price'}`
+            }
+          >
+            {fmtUsd(pnl, { sign: true })}
+            {!realized && (
+              <span className="ml-1 text-[9px] uppercase tracking-wide text-krypt-dim">live</span>
+            )}
+          </span>
+        )}
       </td>
     </tr>
   );

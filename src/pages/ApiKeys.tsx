@@ -39,6 +39,11 @@ export function ApiKeysPage() {
 
   const switchEnv = async (env: KalshiEnv): Promise<void> => {
     if (config?.kalshiEnv === env) return;
+    if (env === 'production' && !window.confirm(
+      config?.enableTrading
+        ? 'Switch active session to PRODUCTION (real money)?\n\nAuto-trading is ON — the bot may place REAL-money orders right away.'
+        : 'Switch active session to PRODUCTION (real money)?\n\nThis environment trades real funds.',
+    )) return;
     setBusy(true);
     try {
       await window.krypt.config.update({ kalshiEnv: env });

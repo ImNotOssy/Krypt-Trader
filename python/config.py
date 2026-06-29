@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any
 
+import rules
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "kalshi_env": "demo",
@@ -82,6 +84,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "crypto15m_entry_threshold": 0.70,
     "crypto15m_entry_max": 0.98,
     "crypto15m_exit_threshold": 0.40,
+    # Cents BELOW the bid to price a stop-loss SELL so it sweeps depth and fills
+    # in a fast drop instead of resting at the top of a falling book. 0 = at bid.
+    "crypto15m_stop_slippage_cents": 0,
     "crypto15m_min_delta_pct": 0.0,
     "crypto15m_entry_diff": 0.02,
     "crypto15m_entry_style": "maker",
@@ -95,9 +100,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "crypto15m_balance_pct": 0.02,
     "crypto15m_max_loss_pct": 0.0,
     "crypto15m_max_concurrent": 7,
+    # Which assets the executor may open NEW positions on. None = all enabled;
+    # a list of symbols restricts to those (set from the 15m tab's Trade toggles).
+    "crypto15m_assets": None,
     "crypto15m_poll_sec": 4,
     "crypto15m_direction_mode": "favorite",
     "crypto15m_record_signals": True,
+    # Underlying MACD/RSI on 1-min closes (detection-only rule fields).
+    "crypto15m_indicator_detect": True,
+    # Up+Down ≠ $1 arbitrage flag (market-neutral edge, detection-only).
+    "crypto15m_arb_detect": True,
+    "crypto15m_arb_min_edge_cents": 1.0,
+    # Custom entry rule builder: when on, the user's {field,op,value} conditions
+    # REPLACE the built-in favorite/signal gate for the 15m executor.
+    "crypto15m_use_rules": False,
+    "crypto15m_rules": [],
 
     "event_webhook_url": "",
     "stats_webhook_url": "",
@@ -361,8 +378,10 @@ CRYPTO15M_PRESETS: list[dict[str, Any]] = [
             "crypto15m_direction_mode": "favorite",
             "crypto15m_entry_threshold": 0.95,
             "crypto15m_entry_max": 0.98,
+            "crypto15m_min_delta_pct": 0.0,
             "crypto15m_exit_threshold": 0.40,
             "crypto15m_entry_style": "maker",
+            "crypto15m_use_rules": False,
         },
     },
     {
@@ -381,8 +400,70 @@ CRYPTO15M_PRESETS: list[dict[str, Any]] = [
             "crypto15m_direction_mode": "contrarian",
             "crypto15m_entry_threshold": 0.90,
             "crypto15m_entry_max": 0.98,
+            "crypto15m_min_delta_pct": 0.0,
             "crypto15m_exit_threshold": 0.0,
             "crypto15m_entry_style": "maker",
+            "crypto15m_use_rules": False,
+        },
+    },
+    {
+        "id": "c15-momentum",
+        "name": "Momentum (Δ-confirmed)",
+        "tagline": "Buy the favorite only after the underlying has already moved.",
+        "description": (
+            "Enter the favorite only once the underlying has moved >=0.2% from "
+            "the 15-minute open — a momentum filter. Unproven; paper-trade first."
+        ),
+        "config": {
+            "crypto15m_direction_mode": "favorite",
+            "crypto15m_entry_threshold": 0.80,
+            "crypto15m_entry_max": 0.98,
+            "crypto15m_min_delta_pct": 0.002,
+            "crypto15m_exit_threshold": 0.40,
+            "crypto15m_entry_style": "maker",
+            "crypto15m_use_rules": False,
+        },
+    },
+    {
+        "id": "c15-fav-90-95",
+        "name": "Favorite 90-95c",
+        "tagline": "Favorites in the 90-95c pocket.",
+        "description": (
+            "Buy favorites priced 90-95c. Priced off the mid and unconfirmed on "
+            "real fills near close — paper-trade first."
+        ),
+        "config": {
+            "crypto15m_direction_mode": "favorite",
+            "crypto15m_entry_threshold": 0.90,
+            "crypto15m_entry_max": 0.95,
+            "crypto15m_min_delta_pct": 0.0,
+            "crypto15m_exit_threshold": 0.40,
+            "crypto15m_entry_style": "maker",
+            "crypto15m_use_rules": False,
+        },
+    },
+    {
+        "id": "c15-macd-trend",
+        "name": "MACD Trend (rules)",
+        "tagline": "Enter Up when Up is favored and the underlying MACD is bullish.",
+        "description": (
+            "Experimental rule-builder preset: enter Up when Up is favored "
+            "(>=55%) and the 1-minute underlying MACD histogram is positive, in "
+            "the last 6 minutes. Uses the new MACD field — recorded, not yet "
+            "backtested. Paper-trade first."
+        ),
+        "config": {
+            "crypto15m_direction_mode": "favorite",
+            "crypto15m_entry_style": "maker",
+            "crypto15m_exit_threshold": 0.40,
+            "crypto15m_min_delta_pct": 0.0,
+            "crypto15m_indicator_detect": True,
+            "crypto15m_use_rules": True,
+            "crypto15m_rules": [
+                {"field": "upProb", "op": ">=", "value": 0.55},
+                {"field": "macdHist", "op": ">", "value": 0.0},
+                {"field": "minsLeft", "op": "<=", "value": 6.0},
+            ],
         },
     },
 ]
@@ -434,6 +515,15 @@ _UNIT_KEYS = [
     "gambling_trade_probability",
 ]
 
+# Snapshot fields a crypto15m entry rule may gate on (the rule-builder vocabulary).
+# Anything not in this set is dropped by sanitize_rules so the running executor
+# only ever sees rules over fields it actually computes.
+_CRYPTO15M_RULE_FIELDS = [
+    "favoritePrice", "entryCost", "upProb", "downProb", "deltaPct",
+    "minsLeft", "hourUtc", "peersAgree", "marketBias",
+    "arbEdgeCents", "macd", "macdSignal", "macdHist", "macdCross", "rsi",
+]
+
 
 def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     d = DEFAULT_CONFIG
@@ -463,6 +553,20 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_live"] = bool(cfg.get("crypto15m_live", False))
     cfg["crypto15m_order_size"] = _clampi(cfg.get("crypto15m_order_size"), 1, 10_000, d["crypto15m_order_size"])
     cfg["crypto15m_max_concurrent"] = _clampi(cfg.get("crypto15m_max_concurrent"), 1, 50, d["crypto15m_max_concurrent"])
+    # crypto15m_assets: None = all enabled; a list restricts to valid symbols
+    # (uppercased, unknowns dropped). Any non-list/non-None falls back to all.
+    aw = cfg.get("crypto15m_assets")
+    if isinstance(aw, list):
+        try:
+            from crypto15m import ALL_ASSETS as _C15_ALL
+            valid = {a.upper() for a in _C15_ALL}
+        except Exception:
+            valid = {"BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"}
+        cfg["crypto15m_assets"] = [
+            a.upper() for a in aw if isinstance(a, str) and a.upper() in valid
+        ]
+    elif aw is not None:
+        cfg["crypto15m_assets"] = None
     if cfg.get("crypto15m_sizing_mode") not in ("fixed", "balance_pct"):
         cfg["crypto15m_sizing_mode"] = d["crypto15m_sizing_mode"]
     cfg["crypto15m_balance_pct"] = _clampf(cfg.get("crypto15m_balance_pct"), 0.0, 1.0, d["crypto15m_balance_pct"])
@@ -473,8 +577,25 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if cfg.get("crypto15m_entry_style") not in ("maker", "taker"):
         cfg["crypto15m_entry_style"] = d["crypto15m_entry_style"]
     cfg["crypto15m_maker_cancel_min"] = _clampf(cfg.get("crypto15m_maker_cancel_min"), 0.0, 15.0, d["crypto15m_maker_cancel_min"])
+    cfg["crypto15m_stop_slippage_cents"] = _clampi(cfg.get("crypto15m_stop_slippage_cents"), 0, 50, d["crypto15m_stop_slippage_cents"])
     cfg["crypto15m_hours_start_utc"] = _clampi(cfg.get("crypto15m_hours_start_utc"), 0, 24, d["crypto15m_hours_start_utc"])
     cfg["crypto15m_hours_end_utc"] = _clampi(cfg.get("crypto15m_hours_end_utc"), 0, 24, d["crypto15m_hours_end_utc"])
+    cfg["crypto15m_indicator_detect"] = bool(cfg.get("crypto15m_indicator_detect", True))
+    cfg["crypto15m_arb_detect"] = bool(cfg.get("crypto15m_arb_detect", True))
+    cfg["crypto15m_arb_min_edge_cents"] = _clampf(cfg.get("crypto15m_arb_min_edge_cents"), 0.0, 100.0, d["crypto15m_arb_min_edge_cents"])
+    cfg["crypto15m_use_rules"] = bool(cfg.get("crypto15m_use_rules", False))
+    cfg["crypto15m_rules"] = rules.sanitize_rules(cfg.get("crypto15m_rules"), _CRYPTO15M_RULE_FIELDS)
+    # Floor the scan/poll intervals so a user can't drive them toward ~1s and get
+    # rate-limited / banned by Kalshi (the UI had no minimum).
+    cfg["trade_scan_interval"] = _clampi(cfg.get("trade_scan_interval"), 5, 3600, d["trade_scan_interval"])
+    cfg["position_poll_interval"] = _clampi(cfg.get("position_poll_interval"), 5, 3600, d["position_poll_interval"])
+    cfg["balance_poll_interval"] = _clampi(cfg.get("balance_poll_interval"), 10, 3600, d["balance_poll_interval"])
+    cfg["resolution_check_interval"] = _clampi(cfg.get("resolution_check_interval"), 30, 86400, d["resolution_check_interval"])
+    cfg["whale_scan_interval"] = _clampi(cfg.get("whale_scan_interval"), 30, 3600, d["whale_scan_interval"])
+    cfg["momentum_scan_interval"] = _clampi(cfg.get("momentum_scan_interval"), 30, 3600, d["momentum_scan_interval"])
+    cfg["market_refresh_interval"] = _clampi(cfg.get("market_refresh_interval"), 30, 86400, d["market_refresh_interval"])
+    cfg["crypto15m_poll_sec"] = _clampi(cfg.get("crypto15m_poll_sec"), 2, 60, d["crypto15m_poll_sec"])
+    cfg["order_expiration_sec"] = _clampi(cfg.get("order_expiration_sec"), 10, 3600, d["order_expiration_sec"])
     return cfg
 
 

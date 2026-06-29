@@ -8,6 +8,7 @@ from typing import Optional
 import crypto15m
 import db
 import kalshi_api
+import rules as rules_engine
 import trader
 
 logger = logging.getLogger("crypto15m")
@@ -17,6 +18,14 @@ logger = logging.getLogger("crypto15m")
 
 def direction_for_favorite(favorite: str) -> str:
     return "yes" if favorite == "up" else "no"
+
+
+def evaluate_rules(asset: dict, rules: list) -> tuple[bool, str]:
+    """Evaluate the crypto entry rule-set against an asset snapshot (fields are
+    snapshot keys like favoritePrice / macdHist / rsi / minsLeft / arbEdgeCents).
+    Thin wrapper over the shared engine so crypto and the main bot evaluate
+    rules identically."""
+    return rules_engine.evaluate_rules(asset, rules)
 
 
 def entry_limit_cents(entry_cost: float, entry_diff: float) -> int:
@@ -40,8 +49,7 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
         return None
     yes_bid = crypto15m._price_dollars(market, "yes_bid")
     yes_ask = crypto15m._price_dollars(market, "yes_ask")
-    up = (yes_bid + yes_ask) / 2 if (yes_bid or yes_ask) else crypto15m._price_dollars(market, "last_price")
-    up = max(0.0, min(1.0, up))
+    up = crypto15m._mid_up(yes_bid, yes_ask, crypto15m._price_dollars(market, "last_price"))
     return up if direction == "yes" else (1.0 - up)
 
 
@@ -57,6 +65,18 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         return False, "no market"
     if asset.get("favorite") not in ("up", "down"):
         return False, "no favorite"
+    # The trading-hours gate is a HARD time control and always applies — even
+    # with custom rules, which replace only the favorite/signal EDGE (the rule
+    # vocabulary can't express a wrapping overnight window). Without this,
+    # use_rules would silently trade 24h.
+    if not crypto15m.hours_ok(cfg):
+        return False, "outside trading hours"
+    # Custom rule-set (rule builder): the user's composed conditions REPLACE the
+    # built-in favorite/signal gate. The side bought still comes from
+    # direction_mode; the rules decide WHEN to enter (they can gate on minsLeft
+    # themselves, so the entry window is theirs to control).
+    if cfg.get("crypto15m_use_rules"):
+        return evaluate_rules(asset, cfg.get("crypto15m_rules") or [])
     if not asset.get("signal"):
         return False, "no signal"
     return True, "ok"
@@ -70,6 +90,17 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
     if int(position.get("filled_contracts") or 0) <= 0:
         return False
     return side_prob < crypto15m._const(cfg, "exit_threshold")
+
+
+def _stop_slippage(cfg: dict) -> int:
+    """Cents below the bid to price a stop-loss SELL (user setting
+    `crypto15m_stop_slippage_cents`), so it sweeps book depth and fills in a fast
+    drop instead of resting at the top of a falling book. 0 = sell at the bid.
+    Clamped 0..50."""
+    try:
+        return max(0, min(50, int(cfg.get("crypto15m_stop_slippage_cents", 0) or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clamp01(v) -> float:
@@ -309,6 +340,7 @@ def _entry_expired(pos: dict, cfg: dict) -> bool:
 async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Optional[dict]:
     pid, ticker, direction = pos["id"], pos["ticker"], pos["direction"]
     filled = int(pos.get("filled_contracts") or 0)
+    slippage = _stop_slippage(cfg)
     exit_cents: Optional[int] = None
     try:
         book = await kalshi_api.get_orderbook(ticker)
@@ -320,7 +352,9 @@ async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Opti
     if exit_cents is None:
         sp = side_prob_from_market(market, direction) or 0.0
         exit_cents = int(round(sp * 100)) - 2
-    exit_cents = max(1, min(99, exit_cents))
+    # Price `slippage` cents THROUGH the bid so the stop-loss sweeps depth and
+    # fills instead of resting at the top of a falling book.
+    exit_cents = max(1, min(99, exit_cents - slippage))
 
     coid = f"krypt-c15x-{pos['asset']}-{uuid.uuid4().hex[:8]}"
     try:
@@ -412,6 +446,103 @@ async def _settle_if_closed(pos: dict) -> Optional[dict]:
         return db.fetch_crypto15m_by_id(conn, pos["id"])
 
 
+async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
+    """Re-price a resting stop-loss SELL that has gone stale so it actually fills.
+
+    A stop-loss fires precisely when the held side is dropping, so a limit sell
+    placed at the best bid is, within seconds, left ABOVE the now-lower bid and
+    rests UNFILLED — the position then rides to settlement at the full loss (the
+    #1 'stop-loss didn't work' complaint). While the market is still open and the
+    resting exit has NOT partially filled, cancel it and re-place the full size
+    at the current best bid, walking the order down with the market until it
+    clears (a marketable sell AT the bid is a taker and matches immediately).
+
+    Only a zero-fill order is chased (safe to fully re-place). A partially-filled
+    exit is left to ride to settlement, where _settle_if_closed credits the
+    partial and settles only the residual — so we can never double-sell. A
+    race-guard re-reads the cancelled order's FINAL fill in case it filled
+    between the last poll and the cancel."""
+    if int(pos.get("exit_filled_contracts") or 0) > 0:
+        return None
+    filled = int(pos.get("filled_contracts") or 0)
+    if filled <= 0:
+        return None
+    direction = pos["direction"]
+    cur_limit = int(pos.get("exit_limit_cents") or 0)
+
+    try:
+        book = await kalshi_api.get_orderbook(pos["ticker"])
+        bids = book.get(direction) or []
+        best_bid = max((int(b[0]) for b in bids if b and b[0] is not None), default=0)
+    except Exception:
+        best_bid = 0
+    if best_bid <= 0:
+        return None  # no liquidity to sell into — settlement will flatten it
+    if cur_limit and cur_limit <= best_bid:
+        return None  # our sell is at/under the top bid → still marketable, hold
+
+    # Re-price `slippage` cents through the bid as well, matching the initial stop.
+    new_cents = max(1, min(99, best_bid - _stop_slippage(cfg)))
+    kid = pos.get("exit_kalshi_order_id")
+    if kid:
+        try:
+            await kalshi_api.cancel_order(kid)
+        except Exception:
+            pass
+        # The cancelled order may have filled in the race — re-read it and, if so,
+        # record/resolve instead of placing a second sell for the same contracts.
+        try:
+            resp = await kalshi_api.get_order(kid)
+            parsed = trader._parse_kalshi_order(
+                (resp.get("order") if isinstance(resp, dict) else resp) or {}
+            )
+            sold = int(parsed.get("filled") or 0)
+            if sold > 0:
+                proceeds = parsed["cost_cents"] / 100.0
+                with db.get_db() as conn:
+                    if sold >= filled:
+                        pnl = proceeds - float(pos.get("cost_usd") or 0.0)
+                        _mark_resolved(
+                            conn, pos["id"], status="exited",
+                            exit_filled_contracts=sold, proceeds_usd=proceeds,
+                            pnl_usd=pnl, outcome_correct=1 if pnl > 0 else 0,
+                        )
+                    else:
+                        db.update_crypto15m_position(
+                            conn, pos["id"],
+                            exit_filled_contracts=sold, proceeds_usd=proceeds,
+                        )
+                    return db.fetch_crypto15m_by_id(conn, pos["id"])
+        except Exception:
+            pass
+
+    coid = f"krypt-c15x-{pos['asset']}-{uuid.uuid4().hex[:8]}"
+    try:
+        resp = await kalshi_api.place_limit_order(
+            ticker=pos["ticker"], side=direction, action="sell",
+            count=filled, price_cents=new_cents, client_order_id=coid,
+        )
+    except Exception as e:
+        with db.get_db() as conn:
+            db.update_crypto15m_position(
+                conn, pos["id"], error=f"stop-loss re-price failed: {str(e)[:140]}"
+            )
+        return None
+    order = (resp.get("order") if isinstance(resp, dict) else None) or resp or {}
+    with db.get_db() as conn:
+        db.update_crypto15m_position(
+            conn, pos["id"], status="exiting", exit_reason="stop_loss",
+            exit_client_order_id=coid,
+            exit_kalshi_order_id=order.get("order_id") if isinstance(order, dict) else None,
+            exit_limit_cents=new_cents,
+        )
+        logger.info(
+            f"[live] STOP-LOSS re-price {pos['asset']} x{filled} @ {new_cents}c "
+            f"(was {cur_limit}c — chasing the bid down)"
+        )
+        return db.fetch_crypto15m_by_id(conn, pos["id"])
+
+
 async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
     status = pos.get("status")
 
@@ -428,6 +559,11 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
         return await _poll_entry(pos, cfg)
     if status == "exiting":
         row = await _poll_exit(pos)
+        if row:
+            return row
+        # Chase the bid down if the resting stop-loss has gone stale, so it fills
+        # instead of riding to settlement at the full loss.
+        row = await _chase_exit(pos, cfg)
         if row:
             return row
         return await _settle_if_closed(pos)
@@ -510,6 +646,8 @@ async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
     for sym, a in assets.items():
         if sym in open_by_asset:
             continue
+        if not crypto15m.asset_enabled(cfg, sym):
+            continue  # asset toggled off in the 15m tab — monitor only, no entries
         if a.get("ticker") in errored_tickers:
             continue
         ok, _why = should_enter(a, cfg, has_open=False, open_count=open_count)

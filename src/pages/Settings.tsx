@@ -41,6 +41,11 @@ export function SettingsPage() {
   // missing keys for the target env). Make it loud: switch, then verify + tell them.
   const switchEnv = async (e: 'demo' | 'production'): Promise<void> => {
     if (!config || e === config.kalshiEnv) return;
+    if (e === 'production' && !window.confirm(
+      config.enableTrading
+        ? 'Switch to PRODUCTION (real money)?\n\nAuto-trading is currently ON — the bot may place REAL-money orders on your Kalshi account immediately after switching.'
+        : 'Switch to PRODUCTION (real money)?\n\nOrders placed in this environment use real funds.',
+    )) return;
     await update('kalshiEnv', e);
     const label = e === 'production' ? 'Production (real money)' : 'Demo (play money)';
     const creds = e === 'production' ? credentialsAll?.production : credentialsAll?.demo;

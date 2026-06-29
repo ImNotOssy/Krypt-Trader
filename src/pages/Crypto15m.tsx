@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bitcoin, RefreshCw, RotateCcw, SlidersHorizontal, Wallet, Zap } from 'lucide-react';
+import { Bitcoin, FolderPlus, RefreshCw, RotateCcw, SlidersHorizontal, Wallet, Zap } from 'lucide-react';
 import type {
   Crypto15mAsset, Crypto15mPosition,
-  Crypto15mSizing, Crypto15mSnapshot, Crypto15mStatus, TraderConfig,
+  Crypto15mSizing, Crypto15mSnapshot, Crypto15mStatus, RuleCondition, TraderConfig,
 } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
-import { Empty, Page, Switch } from '../components/common';
+import { useToast } from '../state/ToastProvider';
+import { Empty, NameDialog, Page, Switch } from '../components/common';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtUsd } from '../utils/format';
 
@@ -194,6 +195,8 @@ export function Crypto15mPage() {
         </div>
       )}
 
+      <AssetTradeToggles config={config} busy={busy} onPatch={patchAndReload} />
+
       {!snap && loading ? (
         <Empty title="Loading 15-minute crypto markets…" description="Fetching Kalshi markets and spot prices." />
       ) : snap && snap.assets.length === 0 ? (
@@ -212,6 +215,49 @@ export function Crypto15mPage() {
         </div>
       )}
     </Page>
+  );
+}
+
+const C15_ALL_ASSETS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
+
+function AssetTradeToggles({
+  config, busy, onPatch,
+}: {
+  config?: TraderConfig | null;
+  busy: boolean;
+  onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
+}) {
+  // null/undefined crypto15mAssets = all enabled. Toggling builds an explicit
+  // list; the executor only opens NEW positions on enabled assets.
+  const enabled = config?.crypto15mAssets ?? C15_ALL_ASSETS;
+  const toggle = (s: string): void => {
+    const cur = config?.crypto15mAssets ?? [...C15_ALL_ASSETS];
+    const next = cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s];
+    void onPatch({ crypto15mAssets: next });
+  };
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-1.5 rounded-xl border border-krypt-border bg-krypt-surface p-3">
+      <span className="mr-1 text-[11px] uppercase tracking-wider text-krypt-dim">Trade</span>
+      {C15_ALL_ASSETS.map((s) => (
+        <button
+          key={s}
+          disabled={busy}
+          onClick={() => toggle(s)}
+          className={cls(
+            'rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors',
+            enabled.includes(s)
+              ? 'border-krypt-win/40 bg-krypt-win/10 text-white'
+              : 'border-krypt-border bg-krypt-surface2 text-krypt-dim line-through',
+          )}
+          title={enabled.includes(s) ? `Trading ${s} — click to disable` : `${s} disabled — click to enable`}
+        >
+          {s}
+        </button>
+      ))}
+      <span className="ml-2 text-[11px] text-krypt-dim">
+        New entries only — disabled assets are still monitored and open positions keep being managed.
+      </span>
+    </div>
   );
 }
 
@@ -247,6 +293,7 @@ const C15_DEFAULTS = {
   entryThreshold: 0.70,
   entryMax: 0.98,
   exitThreshold: 0.4,
+  stopSlippageCents: 0,
   minDeltaPct: 0,
   entryDiff: 0.02,
   entryStyle: 'maker' as 'maker' | 'taker',
@@ -261,14 +308,58 @@ const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<Trad
   {
     id: 'favorite', name: 'Deep Favorite',
     hint: 'Only the deepest favorites (95–98¢) — the one band that didn\'t lose in collected data (small sample).',
-    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.95, crypto15mEntryMax: 0.98, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker' },
+    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.95, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
   },
   {
     id: 'contrarian', name: 'Contrarian Fade',
     hint: 'Fade extreme favorites — buy the cheap side, hold to settle. Measured ≈ break-even.',
-    patch: { crypto15mDirectionMode: 'contrarian', crypto15mEntryThreshold: 0.9, crypto15mEntryMax: 0.98, crypto15mExitThreshold: 0, crypto15mEntryStyle: 'maker' },
+    patch: { crypto15mDirectionMode: 'contrarian', crypto15mEntryThreshold: 0.9, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+  },
+  {
+    id: 'momentum', name: 'Momentum (Δ-confirmed)',
+    hint: 'Buy the favorite only once the underlying has already moved ≥0.2% this window — a momentum filter on the 15-min open.',
+    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.80, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0.002, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+  },
+  {
+    id: 'fav-90-95', name: 'Favorite 90–95¢',
+    hint: 'Favorites in the 90–95¢ pocket. Caveat: priced off the mid — unconfirmed on real fills near close.',
+    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.90, crypto15mEntryMax: 0.95, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+  },
+  {
+    id: 'macd-trend', name: 'MACD Trend (rules)',
+    hint: 'Experimental: enter Up when Up is favored and the 1-min underlying MACD is bullish, in the last 6 min. Uses the rule builder + MACD field — recorded, not yet backtested.',
+    patch: {
+      crypto15mDirectionMode: 'favorite', crypto15mEntryStyle: 'maker', crypto15mExitThreshold: 0.4,
+      crypto15mMinDeltaPct: 0, crypto15mIndicatorDetect: true, crypto15mUseRules: true,
+      crypto15mRules: [
+        { field: 'upProb', op: '>=', value: 0.55 },
+        { field: 'macdHist', op: '>', value: 0 },
+        { field: 'minsLeft', op: '<=', value: 6 },
+      ],
+    },
   },
 ];
+
+// Snapshot fields a custom entry rule may gate on (mirrors the backend's
+// _CRYPTO15M_RULE_FIELDS allow-list in config.py).
+const C15_RULE_FIELDS: { v: string; label: string }[] = [
+  { v: 'favoritePrice', label: 'Favorite price (0–1)' },
+  { v: 'entryCost', label: 'Entry cost (0–1)' },
+  { v: 'upProb', label: 'Up probability (0–1)' },
+  { v: 'downProb', label: 'Down probability (0–1)' },
+  { v: 'deltaPct', label: 'Underlying Δ (fraction)' },
+  { v: 'minsLeft', label: 'Minutes left' },
+  { v: 'hourUtc', label: 'Hour (UTC 0–23)' },
+  { v: 'peersAgree', label: 'Peers agree (0–1)' },
+  { v: 'marketBias', label: 'Market bias (−1..1)' },
+  { v: 'arbEdgeCents', label: 'Arb edge (¢)' },
+  { v: 'macd', label: 'MACD line' },
+  { v: 'macdSignal', label: 'MACD signal' },
+  { v: 'macdHist', label: 'MACD histogram' },
+  { v: 'macdCross', label: 'MACD cross (+1/0/−1)' },
+  { v: 'rsi', label: 'RSI (0–100)' },
+];
+const C15_RULE_OPS = ['>=', '<=', '>', '<'] as const;
 
 function StrategySettings({
   config, liveSignals, spotSource, spotOk, hoursOk, sizing,
@@ -282,8 +373,16 @@ function StrategySettings({
 }) {
   const sizingMode = config?.crypto15mSizingMode ?? 'fixed';
   const [savingPreset, setSavingPreset] = useState<string | null>(null);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const toast = useToast();
   const update = async (patch: Partial<TraderConfig>) => {
     try { await window.krypt.config.update(patch); } catch {   }
+  };
+  const saveProfile = async (name: string): Promise<void> => {
+    setSaveOpen(false);
+    const r = await window.krypt.profiles.save(name, undefined, 'crypto15m');
+    if (r.ok) toast.success(r.message || 'Saved 15m crypto profile');
+    else toast.error(r.message || 'Failed to save profile');
   };
   const num = (k: keyof TraderConfig, d: number) => {
     const v = config?.[k] as number | undefined;
@@ -303,6 +402,7 @@ function StrategySettings({
     crypto15mEntryThreshold: C15_DEFAULTS.entryThreshold,
     crypto15mEntryMax: C15_DEFAULTS.entryMax,
     crypto15mExitThreshold: C15_DEFAULTS.exitThreshold,
+    crypto15mStopSlippageCents: C15_DEFAULTS.stopSlippageCents,
     crypto15mMinDeltaPct: C15_DEFAULTS.minDeltaPct,
     crypto15mEntryDiff: C15_DEFAULTS.entryDiff,
     crypto15mEntryStyle: C15_DEFAULTS.entryStyle,
@@ -350,8 +450,15 @@ function StrategySettings({
           </button>
         ))}
         <button
+          onClick={() => setSaveOpen(true)}
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1 text-[11px] text-krypt-muted transition-colors hover:border-krypt-purple/40 hover:text-white"
+          title="Save these 15m crypto settings as a profile"
+        >
+          <FolderPlus className="h-3 w-3" /> Save as profile
+        </button>
+        <button
           onClick={resetDefaults}
-          className="ml-auto inline-flex items-center gap-1 rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1 text-[11px] text-krypt-dim transition-colors hover:border-krypt-warn/40 hover:text-krypt-warn"
+          className="inline-flex items-center gap-1 rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1 text-[11px] text-krypt-dim transition-colors hover:border-krypt-warn/40 hover:text-krypt-warn"
         >
           <RotateCcw className="h-3 w-3" /> Reset
         </button>
@@ -393,6 +500,12 @@ function StrategySettings({
           value={Math.round(num('crypto15mExitThreshold', C15_DEFAULTS.exitThreshold) * 100)}
           hint="Executor sells if the held side falls to this price. 0 = hold to settlement."
           onCommit={(v) => void update({ crypto15mExitThreshold: v / 100 })}
+        />
+        <NumField
+          label="Stop slippage" suffix="¢" min={0} max={50} step={1}
+          value={num('crypto15mStopSlippageCents', C15_DEFAULTS.stopSlippageCents)}
+          hint="When the stop-loss sells, price this many cents BELOW the bid so it sweeps the book and fills fast in a drop instead of resting unfilled. 0 = sell at the bid."
+          onCommit={(v) => void update({ crypto15mStopSlippageCents: Math.round(v) })}
         />
         <SelectField
           label="Entry style" value={entryStyle}
@@ -468,7 +581,130 @@ function StrategySettings({
           Contrarian: when a side is an extreme favorite (≥ threshold) the executor buys the CHEAP opposite side — a low-win, high-payoff longshot. Set stop-loss to 0 to hold to settlement.
         </p>
       )}
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <Switch
+          checked={config?.crypto15mIndicatorDetect ?? true}
+          onChange={(v) => void update({ crypto15mIndicatorDetect: v })}
+          label="Underlying MACD / RSI"
+          description="Compute MACD & RSI on the 1-min underlying (Hyperliquid). Detection-only — surfaced per asset and usable as rule fields."
+        />
+        <Switch
+          checked={config?.crypto15mArbDetect ?? true}
+          onChange={(v) => void update({ crypto15mArbDetect: v })}
+          label="Arbitrage detector"
+          description="Flag when the Up + Down asks sum below $1 (market-neutral edge, gross of fees). Detection-only."
+        />
+      </div>
+
+      <RuleBuilder config={config} update={update} />
+
+      <NameDialog
+        open={saveOpen}
+        title="Save 15m crypto profile"
+        label="Saves the current 15-minute crypto strategy as a reusable profile (separate from the main engine — find it under Profiles → 15m crypto)."
+        placeholder="Profile name"
+        confirmLabel="Save"
+        onSubmit={(name) => void saveProfile(name)}
+        onClose={() => setSaveOpen(false)}
+      />
     </div>
+  );
+}
+
+function RuleBuilder({
+  config, update,
+}: {
+  config: TraderConfig | null;
+  update: (patch: Partial<TraderConfig>) => void | Promise<void>;
+}) {
+  const useRules = !!config?.crypto15mUseRules;
+  const rules = config?.crypto15mRules ?? [];
+
+  const setRules = (next: RuleCondition[]) => void update({ crypto15mRules: next });
+  const addRule = () => setRules([...rules, { field: 'rsi', op: '<', value: 30 }]);
+  const removeRule = (i: number) => setRules(rules.filter((_, idx) => idx !== i));
+  const patchRule = (i: number, patch: Partial<RuleCondition>) =>
+    setRules(rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+
+  return (
+    <div className="mt-3 rounded-lg border border-krypt-border bg-krypt-surface2 p-3">
+      <Switch
+        checked={useRules}
+        onChange={(v) => void update({ crypto15mUseRules: v })}
+        label="Custom entry rules"
+        description="Replace the built-in favorite/signal gate with your own conditions (ALL must pass). The entry window & trading hours still apply; the side bought still follows Direction."
+      />
+      {useRules && (
+        <div className="mt-3 flex flex-col gap-2">
+          {rules.length === 0 && (
+            <div className="rounded-md border border-krypt-warn/30 bg-krypt-warn/5 px-2 py-1.5 text-[11px] text-krypt-warn">
+              Rules are on but none are set — nothing will enter. Add at least one condition.
+            </div>
+          )}
+          {rules.map((r, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <select
+                value={r.field}
+                onChange={(e) => patchRule(i, { field: e.target.value })}
+                className="krypt-input flex-1 py-1 text-xs"
+              >
+                {C15_RULE_FIELDS.map((f) => <option key={f.v} value={f.v}>{f.label}</option>)}
+              </select>
+              <select
+                value={r.op}
+                onChange={(e) => patchRule(i, { op: e.target.value as RuleCondition['op'] })}
+                className="krypt-input w-16 py-1 text-xs"
+              >
+                {C15_RULE_OPS.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+              <RuleValueInput value={r.value} onCommit={(n) => patchRule(i, { value: n })} />
+              <button
+                onClick={() => removeRule(i)}
+                className="krypt-btn-ghost px-2 py-1 text-xs text-krypt-loss"
+                title="Remove condition"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={addRule}
+            className="self-start rounded-md border border-krypt-border bg-krypt-surface px-2.5 py-1 text-[11px] text-krypt-muted transition-colors hover:border-krypt-purple/40 hover:text-white"
+          >
+            + Add condition
+          </button>
+          <p className="text-[10px] text-krypt-dim">
+            e.g. <span className="font-mono">macdHist &gt; 0</span>, <span className="font-mono">rsi &lt; 35</span>, <span className="font-mono">favoritePrice ≥ 0.95</span>. Indicator/arb fields need their detector above turned on to populate (a missing field rejects the entry).
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Rule value field with a local text buffer committed on blur/Enter. Uses
+ *  type="text" (not number) so a trailing "0." isn't sanitized away mid-type,
+ *  and only commits on blur so the synchronous config echo can't snap it back —
+ *  the bug that made fractional thresholds (0.55, 0.002) un-typeable. */
+function RuleValueInput({ value, onCommit }: { value: number; onCommit: (n: number) => void }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => { setText(String(value)); }, [value]);
+  const commit = (): void => {
+    const n = Number(text);
+    if (text.trim() !== '' && !Number.isNaN(n) && n !== value) onCommit(n);
+    else setText(String(value));
+  };
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+      className="krypt-input w-24 py-1 font-mono text-xs"
+    />
   );
 }
 
@@ -627,6 +863,7 @@ function AssetCard({ a }: { a: Crypto15mAsset }) {
               entry <span className="font-mono text-white">{pct(a.entryCost)}</span>
             </span>
           </div>
+          <IndicatorStrip a={a} />
         </>
       )}
 
@@ -692,6 +929,43 @@ function Foot({ label, value }: { label: string; value: string }) {
     <div className="bg-krypt-surface px-2 py-2">
       <div className="text-[9px] uppercase tracking-wider text-krypt-dim">{label}</div>
       <div className="mt-0.5 font-mono text-white">{value}</div>
+    </div>
+  );
+}
+
+/** Compact MACD/RSI + arbitrage chips, shown only when the detectors populate them. */
+function IndicatorStrip({ a }: { a: Crypto15mAsset }) {
+  const hasInd = a.macdHist != null || a.rsi != null;
+  const hasArb = a.arbEdgeCents != null && a.arbEdgeCents > 0;
+  if (!hasInd && !hasArb) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+      {a.rsi != null && (
+        <span className="rounded bg-krypt-surface2 px-1.5 py-0.5 text-krypt-dim">
+          RSI{' '}
+          <span className={cls('font-mono', a.rsi >= 70 ? 'text-krypt-loss' : a.rsi <= 30 ? 'text-krypt-win' : 'text-white')}>
+            {a.rsi.toFixed(0)}
+          </span>
+        </span>
+      )}
+      {a.macdHist != null && (
+        <span className="rounded bg-krypt-surface2 px-1.5 py-0.5 text-krypt-dim">
+          MACD{' '}
+          <span className={cls('font-mono', a.macdHist >= 0 ? 'text-krypt-win' : 'text-krypt-loss')}>
+            {a.macdHist >= 0 ? '+' : ''}{a.macdHist.toFixed(3)}
+          </span>
+          {a.macdCross === 1 && <span className="ml-0.5 text-krypt-win">▲</span>}
+          {a.macdCross === -1 && <span className="ml-0.5 text-krypt-loss">▼</span>}
+        </span>
+      )}
+      {hasArb && (
+        <span
+          className="rounded bg-krypt-win/10 px-1.5 py-0.5 font-semibold text-krypt-win"
+          title="Up + Down asks sum below $1 — buyable arbitrage (gross of fees)"
+        >
+          arb +{a.arbEdgeCents!.toFixed(1)}¢
+        </span>
+      )}
     </div>
   );
 }

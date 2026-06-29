@@ -8,7 +8,7 @@ import uuid
 
 import httpx
 
-from kalshi_auth import sign_headers, get_env, sync_server_time
+from kalshi_auth import sign_headers, get_env, sync_server_time, ENV_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,30 @@ async def fetch_market(ticker: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     return data.get("market", data)
+
+
+async def fetch_markets_map(tickers, concurrency: int = 8) -> dict:
+    """Fetch many markets concurrently → {ticker: market}, skipping misses.
+
+    Replaces the serial `for t in tickers: await fetch_market(t)` chains in the
+    resolution paths, where one slow endpoint could stall the whole pass
+    (N tickers × the per-request timeout). A semaphore caps the in-flight burst
+    so even a large unresolved backlog stays friendly to Kalshi's rate limits
+    (fetch_market's own retry/backoff still applies per request)."""
+    uniq = [t for t in dict.fromkeys(tickers) if t]
+    if not uniq:
+        return {}
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(tk: str):
+        async with sem:
+            try:
+                return tk, await fetch_market(tk)
+            except Exception:
+                return tk, None
+
+    pairs = await asyncio.gather(*[_one(t) for t in uniq])
+    return {tk: m for tk, m in pairs if m}
 
 
 async def fetch_all_open_markets(max_pages: int = 10) -> list:
@@ -468,8 +492,13 @@ async def place_limit_order(
         "time_in_force": "good_till_canceled",
         "self_trade_prevention_type": "taker_at_cross",
     }
-    return await _signed_request("POST", ORDERS_V2_PATH, json=body)
+    # Hold ENV_LOCK across sign+send so a concurrent credential test / env switch
+    # (which briefly flips the global signing env) can never route this real-money
+    # order to the wrong Kalshi account.
+    async with ENV_LOCK:
+        return await _signed_request("POST", ORDERS_V2_PATH, json=body)
 
 
 async def cancel_order(order_id: str) -> dict:
-    return await _signed_request("DELETE", f"{ORDERS_V2_PATH}/{order_id}")
+    async with ENV_LOCK:
+        return await _signed_request("DELETE", f"{ORDERS_V2_PATH}/{order_id}")

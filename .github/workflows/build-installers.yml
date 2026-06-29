@@ -1,0 +1,63 @@
+name: Build Installers
+
+# Builds native installers on each OS and leaves them as downloadable artifacts
+# on the run, for you to distribute yourself. It does NOT publish a GitHub
+# Release or wire up auto-update. Runs automatically on a push to main/build, or
+# on demand from the Actions tab.
+on:
+  push:
+    branches: [main, build]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux            # AppImage + deb
+          - os: windows-latest
+            name: windows          # nsis .exe
+          - os: macos-13
+            name: mac-intel        # x64 .dmg
+          - os: macos-latest
+            name: mac-apple-silicon # arm64 .dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Build app, bundle backend, package installer
+        run: npm run dist
+        env:
+          # Build the macOS app unsigned — no Apple Developer cert/secrets needed.
+          # electron-builder ad-hoc signs arm64 so it still launches (right-click
+          # > Open the first time). No-op on Linux/Windows.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: krypt-trader-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.exe
+            release/*.dmg

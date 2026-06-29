@@ -27,7 +27,10 @@ export function NameDialog({
   useEffect(() => {
     if (!open) return;
     setValue(initialValue);
-    const t = setTimeout(() => inputRef.current?.select(), 30);
+    const t = setTimeout(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }, 30);
     return () => clearTimeout(t);
   }, [open, initialValue]);
 
@@ -280,7 +283,7 @@ export function Switch({
 }
 
 export function NumberInput({
-  value, onChange, min, max, step, suffix, prefix, disabled,
+  value, onChange, min, max, suffix, prefix, disabled,
 }: {
   value: number;
   onChange: (v: number) => void;
@@ -291,6 +294,19 @@ export function NumberInput({
   prefix?: string;
   disabled?: boolean;
 }) {
+  // Local text buffer committed on blur/Enter (type=text so a trailing "0." or
+  // "-" survives mid-type) — a controlled type=number bound to round-tripped
+  // config snapped values back on every keystroke, making decimals un-typeable.
+  const [text, setText] = useState(String(Number.isFinite(value) ? value : 0));
+  useEffect(() => { setText(String(Number.isFinite(value) ? value : 0)); }, [value]);
+  const commit = (): void => {
+    let n = parseFloat(text);
+    if (!Number.isFinite(n)) { setText(String(Number.isFinite(value) ? value : 0)); return; }
+    if (min != null) n = Math.max(min, n);
+    if (max != null) n = Math.min(max, n);
+    if (n !== value) onChange(n);
+    setText(String(n));
+  };
   return (
     <div className={cls('relative', disabled && 'opacity-50')}>
       {prefix && (
@@ -299,16 +315,13 @@ export function NumberInput({
         </span>
       )}
       <input
-        type="number"
-        value={Number.isFinite(value) ? value : 0}
-        min={min}
-        max={max}
-        step={step}
+        type="text"
+        inputMode="decimal"
+        value={text}
         disabled={disabled}
-        onChange={(e) => {
-          const n = parseFloat(e.target.value);
-          if (Number.isFinite(n)) onChange(n);
-        }}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
         className={cls(
           'krypt-input font-mono',
           prefix && 'pl-7',

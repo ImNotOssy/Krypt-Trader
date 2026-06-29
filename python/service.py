@@ -144,18 +144,64 @@ async def respond_err(req_id: str, msg: str) -> None:
 
 
 
+async def _start_run_if_balance_known(env: str, cents: int) -> None:
+    """Start a bot_run only when the balance is actually known. A cold/failed
+    balance fetch returns (0,0); recording that as start_total would poison
+    bot_runs (the per-run P&L shown on History), so defer instead."""
+    if trader.cached_balance(env) is None:
+        logger.warning(f"deferring bot_run start ({env}): balance not yet known")
+        return
+    with db.get_db() as conn:
+        stats = db.aggregate_stats(conn, env)
+        port_usd = float(stats.get("open_cost") or 0.0) + db.open_crypto15m_filled_cost_usd(conn, env)
+        STATE.active_run_id = db.start_bot_run(
+            conn, env=env,
+            cash_usd=cents / 100.0,
+            portfolio_usd=port_usd,
+            lifetime_trades=int(stats.get("total_opened") or 0),
+            lifetime_wins=int(stats.get("wins") or 0),
+            lifetime_losses=int(stats.get("losses") or 0),
+        )
+    logger.info(
+        f"Bot run #{STATE.active_run_id} started "
+        f"(env={env}, start_total=${cents / 100.0 + port_usd:.2f})"
+    )
+
+
 async def _build_account_snapshot() -> dict:
     env = kalshi_auth.get_env()
-    cash_cents = port_cents = 0
+    cash_cents = 0
     if STATE.auth_ok:
         try:
-            cents, port = await trader.refresh_balance(STATE.cfg, force=False)
-            cash_cents = cents
-            port_cents = port
+            await trader.refresh_balance(STATE.cfg, force=False)
         except Exception:
             pass
+        # Read the displayed balance from the last-known-good per-env cache, NOT
+        # from the refresh return value: a failed poll on a cold cache returns
+        # (0,0), which would flash the UI balance to $0 and back. The cache holds
+        # the last successful fetch and is only overwritten by another success.
+        bal = trader.cached_balance(env)
+        if bal is not None:
+            cash_cents = int(bal.get("cents", 0))
     cash_usd = cash_cents / 100.0
-    port_usd = port_cents / 100.0
+    # Kalshi's /portfolio/balance returns ONLY cash, and does NOT reduce it for
+    # resting/unfilled orders — so value open positions at the cost basis of
+    # FILLED contracts (open_cost). Counting unfilled committed notional would
+    # double-count cash that's still in `balance` (it briefly inflated total, e.g.
+    # $212 on a $142 balance). A filled buy already reduced cash, so
+    # cash + filled-cost reconstructs the account and stays P&L-neutral as an
+    # order goes submitted -> filled; total moves only on a real settlement,
+    # which is what keeps daily P&L and the daily stop-loss correct.
+    with db.get_db() as conn:
+        stats_env = db.aggregate_stats(conn, env)
+        stats_demo = db.aggregate_stats(conn, "demo")
+        stats_prod = db.aggregate_stats(conn, "production")
+        crypto_open_cost = db.open_crypto15m_filled_cost_usd(conn, env)
+    open_cost = stats_env["open_cost"]
+    # Include 15m-crypto held cost (those positions are excluded from the main
+    # bot_positions reconcile import, so add their cost here or the total would
+    # under-count the cash already spent on them).
+    port_usd = open_cost + crypto_open_cost
     total = cash_usd + port_usd
 
     user_start = float(STATE.cfg.get("start_bankroll_usd", 0.0) or 0.0)
@@ -173,18 +219,15 @@ async def _build_account_snapshot() -> dict:
             baseline_source = "live"
     roi = ((total - baseline) / baseline * 100.0) if baseline > 0 else 0.0
 
-    with db.get_db() as conn:
-        stats_env = db.aggregate_stats(conn, env)
-        stats_demo = db.aggregate_stats(conn, "demo")
-        stats_prod = db.aggregate_stats(conn, "production")
-
     wl = stats_env["wins"] + stats_env["losses"]
     wr = (stats_env["wins"] / wl * 100.0) if wl else 0.0
-    open_cost = stats_env["open_cost"]
-    unrealized = port_usd - open_cost
+    # Open positions are valued at cost (no live mark-to-market), so there is no
+    # unrealized P&L to report.
+    unrealized = 0.0
 
     with db.get_db() as conn:
-        first_today = db.first_snapshot_of_today(conn, env)
+        first_today = db.first_snapshot_of_today(
+            conn, env, int(STATE.cfg.get("trading_timezone_offset_min", 0) or 0))
         bankroll_baseline_snap = db.earliest_pnl_total(conn, env)
         active_run = db.get_active_run(conn, env) if STATE.active_run_id else None
 
@@ -263,6 +306,22 @@ async def _build_account_snapshot() -> dict:
 
 
 
+def _live_pnl_usd(r: dict) -> float | None:
+    """Unrealized (mark-to-market) P&L for an OPEN filled position: held
+    contracts valued at the live mark price minus cost. None for resolved rows
+    (use realized pnl), unfilled rows, or rows without a mark yet."""
+    if r.get("resolved"):
+        return None
+    mark = r.get("mark_price_cents")
+    if mark is None:
+        return None
+    filled = int(r.get("filled_contracts") or 0)
+    if filled <= 0:
+        return None
+    market_value = filled * float(mark) / 100.0
+    return round(market_value - float(r.get("cost_usd") or 0.0), 2)
+
+
 def _position_row_to_js(r: dict) -> dict:
     return {
         "id": int(r["id"]),
@@ -302,6 +361,15 @@ def _position_row_to_js(r: dict) -> dict:
             else None
         ),
         "pnlUsd": float(r["pnl_usd"]) if r.get("pnl_usd") is not None else None,
+        "markPriceCents": (
+            float(r["mark_price_cents"])
+            if r.get("mark_price_cents") is not None
+            else None
+        ),
+        # Unrealized mark-to-market P&L for a still-open filled position (held
+        # contracts at the live mark minus cost). None until filled + marked;
+        # resolved rows use the realized `pnlUsd` instead.
+        "livePnlUsd": _live_pnl_usd(r),
         "balanceBeforeUsd": (
             float(r["balance_before_usd"])
             if r.get("balance_before_usd") is not None
@@ -392,6 +460,11 @@ def _should_fire_event_webhook(pos_id: int, kind: str) -> bool:
     if _event_webhook_last.get(pos_id) == kind:
         return False
     _event_webhook_last[pos_id] = kind
+    # Cap the dedup memory so a 24/7 session can't grow it without bound; evict
+    # the oldest entries (dict preserves insertion order).
+    if len(_event_webhook_last) > 2000:
+        for old in list(_event_webhook_last)[:500]:
+            _event_webhook_last.pop(old, None)
     return True
 
 
@@ -617,7 +690,13 @@ async def _scanner_and_trader_loop() -> None:
         try:
             if now - last_account_emit >= 15:
                 snap = await _build_account_snapshot()
-                if STATE.auth_ok:
+                # Only PERSIST a snapshot/heartbeat when the balance is actually
+                # known. Startup auth-verify is lenient, so auth_ok can be True
+                # while the balance fetch has never succeeded (cached_balance is
+                # None) -> snap totals are $0, which would poison today's baseline
+                # and silently defeat the daily stop-loss. Still emit for display.
+                balance_known = trader.cached_balance(kalshi_auth.get_env()) is not None
+                if STATE.auth_ok and balance_known:
                     with db.get_db() as conn:
                         db.insert_pnl_snapshot(
                             conn,
@@ -708,22 +787,29 @@ async def _h_setConfig(p: dict) -> dict:
         f"env={cfg.get('kalshi_env')}"
     )
     new_env = cfg.get("kalshi_env", "demo")
-    prev_env = kalshi_auth.get_env()
-    kalshi_auth.set_env(new_env)
-
-    if new_env != prev_env:
-        kalshi_auth.reset_credential_cache()
-        if kalshi_auth.credentials_present(new_env):
-            try:
-                kalshi_auth.prime_credentials(sync_time=True)
-                bal = await kalshi_api.get_balance()
-                int(bal.get("balance", 0))
-                STATE.auth_ok = True
-            except Exception as e:
-                logger.warning(f"env-switch auth failed: {e}")
+    # Hold ENV_LOCK across the env flip + its verifying balance fetch so a
+    # concurrent credential test can't desync the global signing env (which would
+    # route a live order to the wrong account). refresh_balance below takes the
+    # same (non-reentrant) lock, so it must run AFTER this block, not inside it.
+    async with kalshi_auth.ENV_LOCK:
+        prev_env = kalshi_auth.get_env()
+        kalshi_auth.set_env(new_env)
+        env_changed = new_env != prev_env
+        if env_changed:
+            kalshi_auth.reset_credential_cache()
+            if kalshi_auth.credentials_present(new_env):
+                try:
+                    kalshi_auth.prime_credentials(sync_time=True)
+                    bal = await kalshi_api.get_balance()
+                    int(bal.get("balance", 0))
+                    STATE.auth_ok = True
+                except Exception as e:
+                    logger.warning(f"env-switch auth failed: {e}")
+                    STATE.auth_ok = False
+            else:
                 STATE.auth_ok = False
-        else:
-            STATE.auth_ok = False
+
+    if env_changed:
         await emit_event("backend:authChanged", {"authOk": STATE.auth_ok})
 
         try:
@@ -732,21 +818,8 @@ async def _h_setConfig(p: dict) -> dict:
                     db.end_bot_run(conn, STATE.active_run_id)
                 STATE.active_run_id = 0
             if STATE.auth_ok:
-                cents, port = await trader.refresh_balance(STATE.cfg, force=True)
-                with db.get_db() as conn:
-                    stats = db.aggregate_stats(conn, new_env)
-                    STATE.active_run_id = db.start_bot_run(
-                        conn, env=new_env,
-                        cash_usd=cents / 100.0,
-                        portfolio_usd=port / 100.0,
-                        lifetime_trades=int(stats.get("total_opened") or 0),
-                        lifetime_wins=int(stats.get("wins") or 0),
-                        lifetime_losses=int(stats.get("losses") or 0),
-                    )
-                logger.info(
-                    f"Bot run #{STATE.active_run_id} started after env switch "
-                    f"(env={new_env})"
-                )
+                cents, _ = await trader.refresh_balance(STATE.cfg, force=True)
+                await _start_run_if_balance_known(new_env, cents)
         except Exception as e:
             logger.warning(f"could not roll bot_run on env switch: {e}")
     return {"ok": True}
@@ -785,10 +858,12 @@ async def _h_testCredentials(p: dict) -> dict:
     if not kalshi_auth.credentials_present(target_env):
         raise RuntimeError(f"credentials not set for {target_env}")
 
-    saved_env = kalshi_auth.get_env()
     # Hold the env lock so the account poller / trade loop can't fetch a balance
-    # while we've temporarily flipped the global env to the other account.
+    # or place an order while we've temporarily flipped the global env. Capture
+    # saved_env INSIDE the lock so a concurrent (now also-locked) env switch can't
+    # be clobbered by our restore.
     async with kalshi_auth.ENV_LOCK:
+        saved_env = kalshi_auth.get_env()
         if target_env != saved_env:
             kalshi_auth.set_env(target_env)
         kalshi_auth.reset_credential_cache()
@@ -1093,23 +1168,8 @@ async def _h_factoryReset(_p: dict) -> dict:
 
     if STATE.auth_ok:
         try:
-            cents, port = await trader.refresh_balance(STATE.cfg, force=True)
-            env = kalshi_auth.get_env()
-            with db.get_db() as conn:
-                stats = db.aggregate_stats(conn, env)
-                STATE.active_run_id = db.start_bot_run(
-                    conn, env=env,
-                    cash_usd=cents / 100.0,
-                    portfolio_usd=port / 100.0,
-                    lifetime_trades=int(stats.get("total_opened") or 0),
-                    lifetime_wins=int(stats.get("wins") or 0),
-                    lifetime_losses=int(stats.get("losses") or 0),
-                )
-            logger.info(
-                f"Bot run #{STATE.active_run_id} started after factory reset "
-                f"(env={env}, "
-                f"start_total=${(cents + port) / 100:.2f})"
-            )
+            cents, _ = await trader.refresh_balance(STATE.cfg, force=True)
+            await _start_run_if_balance_known(kalshi_auth.get_env(), cents)
         except Exception as e:
             logger.warning(f"factoryReset: post-reset run start: {e}")
 
@@ -1177,7 +1237,9 @@ async def _dispatch_request(req: dict) -> None:
         result = await h(params)
         await respond_ok(rid, result)
     except Exception as e:
-        logger.debug(
+        # Surface state-changing handler failures in backend.log (was debug, which
+        # the log level filters out, so RPC errors were invisible).
+        logger.warning(
             f"RPC {method} failed: {e}\n{traceback.format_exc(limit=3)}"
         )
         await respond_err(rid, f"{type(e).__name__}: {e}")
@@ -1298,24 +1360,8 @@ async def _main() -> None:
 
     if STATE.auth_ok:
         try:
-            cents, port = await trader.refresh_balance(STATE.cfg, force=True)
-            env_now = kalshi_auth.get_env()
-            with db.get_db() as conn:
-                stats = db.aggregate_stats(conn, env_now)
-                STATE.active_run_id = db.start_bot_run(
-                    conn,
-                    env=env_now,
-                    cash_usd=cents / 100.0,
-                    portfolio_usd=port / 100.0,
-                    lifetime_trades=int(stats.get("total_opened") or 0),
-                    lifetime_wins=int(stats.get("wins") or 0),
-                    lifetime_losses=int(stats.get("losses") or 0),
-                )
-            logger.info(
-                f"Bot run #{STATE.active_run_id} started "
-                f"(env={env_now}, "
-                f"start_total=${(cents + port) / 100.0:.2f})"
-            )
+            cents, _ = await trader.refresh_balance(STATE.cfg, force=True)
+            await _start_run_if_balance_known(kalshi_auth.get_env(), cents)
         except Exception as e:
             logger.warning(f"could not open bot_run: {e}")
 

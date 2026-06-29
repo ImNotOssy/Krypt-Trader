@@ -62,9 +62,11 @@ class PythonBackend {
     } catch {
     }
     setTimeout(() => {
-      if (this.child && !this.child.killed) {
+      // Kill the captured child, not this.child — a restart may have spawned a
+      // new one in the grace window, and we must not SIGTERM the new backend.
+      if (c && !c.killed) {
         try {
-          this.child.kill('SIGTERM');
+          c.kill('SIGTERM');
         } catch {
         }
       }
@@ -144,6 +146,15 @@ class PythonBackend {
         reject(e as Error);
       }
     });
+  }
+
+  private rejectPending(reason: string): void {
+    // Fail in-flight RPCs immediately when the backend dies, instead of letting
+    // every caller hang for the full 30s timeout.
+    for (const [, p] of this.pending) {
+      try { p.reject(new Error(reason)); } catch {   }
+    }
+    this.pending.clear();
   }
 
 
@@ -251,11 +262,19 @@ class PythonBackend {
     child.stdout.on('data', (chunk: string) => this.onStdout(chunk));
     child.stderr.on('data', (chunk: string) => this.onStderr(chunk));
     child.on('error', (err) => {
+      // Ignore a stale child's late error — a slow shutdown during restart can
+      // leave the previous child emitting after a new one was already spawned.
+      if (this.child !== child) return;
       this.lastError = `child error: ${err.message}`;
       this.pythonOk = false;
     });
     child.on('exit', (code, signal) => {
+      // Identity guard: if a new child was already assigned (restart race), the
+      // OLD child's late exit must NOT null the new child or schedule another
+      // spawn — that left two live Python backends both placing real orders.
+      if (this.child !== child) return;
       this.child = null;
+      this.rejectPending('backend exited');
       if (this.requestedStop) {
         this.setStatus('stopped');
         return;
@@ -391,13 +410,10 @@ class PythonBackend {
   }
 
   private emitStatus(): void {
+    // The registered status handler (main.ts) owns the backend:info window
+    // broadcast — don't also send it here, or every status change fires twice.
     const info = this.info();
     for (const h of this.statusHandlers) h(info);
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) {
-        win.webContents.send('backend:info', info);
-      }
-    }
   }
 }
 

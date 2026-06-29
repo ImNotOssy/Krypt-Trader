@@ -15,7 +15,6 @@ interface AppStateApi {
   scannerStats: ScannerStats | null;
   positions: BotPosition[];
   signals: SignalRow[];
-  logs: LogEntry[];
   credentials: CredentialsState | null;
   credentialsAll: CredentialsStatusAll | null;
   strategies: StrategyPreset[];
@@ -39,6 +38,14 @@ export function useApp(): AppStateApi {
   return ctx;
 }
 
+// Logs stream frequently; keeping them in their own context means a new log line
+// only re-renders log consumers (the Logs page), not the whole app via useApp().
+const LogsCtx = createContext<LogEntry[]>([]);
+
+export function useLogs(): LogEntry[] {
+  return useContext(LogsCtx);
+}
+
 const DEFAULT_BACKEND: BackendInfo = {
   status: 'stopped',
   pid: null,
@@ -59,7 +66,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [credentials, setCredentials] = useState<CredentialsState | null>(null);
   const [credentialsAll, setCredentialsAll] = useState<CredentialsStatusAll | null>(null);
   const [strategies, setStrategies] = useState<StrategyPreset[]>([]);
-  const [appVersion, setAppVersion] = useState('1.3.0');
+  const [appVersion, setAppVersion] = useState('2.0.0');
 
   const positionsByIdRef = useRef<Map<number, BotPosition>>(new Map());
   const signalsByKeyRef = useRef<Map<string, SignalRow>>(new Map());
@@ -248,7 +255,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       scannerStats,
       positions,
       signals,
-      logs,
       credentials,
       credentialsAll,
       strategies,
@@ -265,9 +271,13 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }),
     [
       state, config, backend, account, scannerStats, positions, signals,
-      logs, credentials, strategies, appVersion,
+      credentials, credentialsAll, strategies, appVersion,
     ],
   );
 
-  return <AppCtx.Provider value={api}>{children}</AppCtx.Provider>;
+  return (
+    <AppCtx.Provider value={api}>
+      <LogsCtx.Provider value={logs}>{children}</LogsCtx.Provider>
+    </AppCtx.Provider>
+  );
 }

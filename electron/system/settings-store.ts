@@ -110,6 +110,7 @@ export const DEFAULT_CONFIG: TraderConfig = {
 export const DEFAULT_STATE: AppState = {
   config: { ...DEFAULT_CONFIG },
   activeProfileId: null,
+  activeCrypto15mProfileId: null,
   customProfiles: [],
   startMinimized: false,
   startWithWindows: false,
@@ -136,6 +137,7 @@ function mergeProfile(loaded: any): Profile | null {
     id: String(loaded.id),
     name: String(loaded.name),
     description: loaded.description ? String(loaded.description) : undefined,
+    kind: loaded.kind === 'crypto15m' ? 'crypto15m' : 'main',
     createdAt: loaded.createdAt || new Date().toISOString(),
     updatedAt: loaded.updatedAt || new Date().toISOString(),
     builtin: !!loaded.builtin,
@@ -151,6 +153,7 @@ function mergeState(loaded: any): AppState {
   return {
     config: mergeConfig(loaded.config),
     activeProfileId: loaded.activeProfileId || null,
+    activeCrypto15mProfileId: loaded.activeCrypto15mProfileId || null,
     customProfiles: profiles,
     startMinimized: !!loaded.startMinimized,
     startWithWindows: !!loaded.startWithWindows,
@@ -174,7 +177,12 @@ export function load(): AppState {
     const raw = readFileSync(f, 'utf-8');
     cached = mergeState(JSON.parse(raw));
   } catch (e) {
-    console.error('settings parse failed, falling back to defaults:', e);
+    console.error('settings parse failed, backing up + falling back to defaults:', e);
+    try {
+      // Preserve the user's (corrupt/locked) file before persistBounds overwrites
+      // settings.json on the next window move — otherwise all profiles are lost.
+      renameSync(f, `${f}.corrupt-${Date.now()}.bak`);
+    } catch {   }
     cached = { ...DEFAULT_STATE };
   }
   return cached;
@@ -208,6 +216,9 @@ export function replaceConfig(config: TraderConfig): AppState {
 
 export function resetConfig(): AppState {
   const cur = get();
-  const next: AppState = { ...cur, config: { ...DEFAULT_CONFIG }, activeProfileId: null };
+  const next: AppState = {
+    ...cur, config: { ...DEFAULT_CONFIG },
+    activeProfileId: null, activeCrypto15mProfileId: null,
+  };
   return save(next);
 }

@@ -1,9 +1,12 @@
+import { useState } from 'react';
 import {
-  Activity, BarChart3, Bitcoin, BookOpen, Briefcase, FileText, Folder, Info, KeyRound,
-  LayoutDashboard, ListChecks, Orbit, Settings, Sparkles, Wallet,
+  Activity, BarChart3, Bitcoin, BookOpen, Briefcase, Folder, Info, KeyRound,
+  LayoutDashboard, ListChecks, Orbit, Settings, Share2, Sparkles, Wallet,
 } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
+import { KryptSprite } from './KryptSprite';
+import { FlexStatsCard } from './FlexStatsCard';
 import type { PageId } from '../App';
 
 const NAV: { id: PageId; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
@@ -28,19 +31,25 @@ interface SidebarProps {
 
 export function Sidebar({ page, setPage }: SidebarProps) {
   const { config, account, backend } = useApp();
+  const [showStats, setShowStats] = useState(false);
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-krypt-border bg-krypt-void/40">
       <div className="px-4 py-4">
         <div className="flex items-center gap-2">
-          <div className="grid h-9 w-9 place-items-center rounded-lg bg-krypt-glow text-white shadow-krypt-soft">
-            <FileText className="h-4 w-4" />
-          </div>
+          <KryptSprite size={38} title="Krypt" />
           <div>
             <div className="font-pixel text-[10px] uppercase tracking-[0.18em] text-white/90">
               Krypt
             </div>
-            <div className="text-xs text-krypt-muted">Auto-trader v1</div>
+            <button
+              onClick={() => setShowStats(true)}
+              className="group flex items-center gap-1 text-xs text-krypt-muted transition-colors hover:text-white"
+              title="Open your shareable stats card"
+            >
+              <Share2 className="h-3 w-3 text-krypt-purple opacity-80 transition-opacity group-hover:opacity-100" />
+              <span className="underline-offset-2 group-hover:underline">Krypt Stats</span>
+            </button>
           </div>
         </div>
       </div>
@@ -65,6 +74,13 @@ export function Sidebar({ page, setPage }: SidebarProps) {
             </button>
           );
         })}
+
+        {/* Idle mascot lounging in the sidebar's empty space — fills the dead
+            scroll area with a little blue pet instead of blank padding. */}
+        <div className="relative flex min-h-0 flex-1 select-none items-end justify-center pb-3 pt-2">
+          <div className="pointer-events-none absolute bottom-2 h-3 w-16 rounded-[100%] bg-krypt-pink/25 blur-md" />
+          <KryptSprite size={72} pet title="krypt" className="relative" />
+        </div>
       </nav>
 
       <div className="border-t border-krypt-border px-3 pt-3">
@@ -116,6 +132,8 @@ export function Sidebar({ page, setPage }: SidebarProps) {
           </div>
         </div>
       </div>
+
+      {showStats && <FlexStatsCard onClose={() => setShowStats(false)} />}
     </aside>
   );
 }

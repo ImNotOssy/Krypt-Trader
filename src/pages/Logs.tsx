@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Eraser, FolderOpen } from 'lucide-react';
-import { useApp } from '../state/AppStateProvider';
+import { useLogs } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Page } from '../components/common';
 import { cls, fmtTimeShort } from '../utils/format';
@@ -14,7 +14,7 @@ const LEVEL_COLORS: Record<string, string> = {
 };
 
 export function LogsPage() {
-  const { logs } = useApp();
+  const logs = useLogs();
   const toast = useToast();
   const [filter, setFilter] = useState('');
   const [src, setSrc] = useState<string>('all');

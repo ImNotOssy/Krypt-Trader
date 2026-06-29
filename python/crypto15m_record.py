@@ -57,6 +57,11 @@ def _capture_ticks(snap: dict, env: str) -> int:
                 "spot": a.get("spotUsd"),
                 "open_spot": a.get("open15mUsd"),
                 "delta_pct": a.get("deltaPct"),
+                "macd": a.get("macd"),
+                "macd_signal": a.get("macdSignal"),
+                "macd_hist": a.get("macdHist"),
+                "macd_cross": a.get("macdCross"),
+                "rsi": a.get("rsi"),
                 "kalshi_env": env,
             })
             captured += 1
@@ -85,6 +90,11 @@ def _capture(snap: dict, env: str) -> int:
             "delta_pct": a.get("deltaPct"),
             "open_spot": a.get("open15mUsd"),
             "obs_spot": a.get("spotUsd"),
+            "macd": a.get("macd"),
+            "macd_signal": a.get("macdSignal"),
+            "macd_hist": a.get("macdHist"),
+            "macd_cross": a.get("macdCross"),
+            "rsi": a.get("rsi"),
             "kalshi_env": env,
         }
         with db.get_db() as conn:

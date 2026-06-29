@@ -21,14 +21,18 @@ if (process.platform === 'win32') {
 let mainWindow: BrowserWindow | null = null;
 
 function iconPath(): string {
+  // Windows uses the multi-resolution .ico; Linux/macOS need a raster .png for
+  // the window/taskbar icon, so list both and pick whichever exists.
+  const file = process.platform === 'win32' ? 'krypt.ico' : 'krypt.png';
   const candidates = [
     app.isPackaged
-      ? join(process.resourcesPath, 'app.asar.unpacked', 'resources', 'krypt.ico')
-      : join(process.cwd(), 'resources', 'krypt.ico'),
+      ? join(process.resourcesPath, 'app.asar.unpacked', 'resources', file)
+      : join(process.cwd(), 'resources', file),
     app.isPackaged
-      ? join(process.resourcesPath, 'krypt.ico')
-      : join(process.cwd(), 'resources', 'krypt.ico'),
-    join(__dirname, '..', 'resources', 'krypt.ico'),
+      ? join(process.resourcesPath, file)
+      : join(process.cwd(), 'resources', file),
+    join(__dirname, '..', 'resources', file),
+    join(__dirname, '..', 'resources', 'krypt.png'),
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;
@@ -41,6 +45,7 @@ function createMainWindow(): BrowserWindow {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
+    mainWindow.webContents.focus();
     return mainWindow;
   }
   const state = store.get();
@@ -48,8 +53,19 @@ function createMainWindow(): BrowserWindow {
   const primary = screen.getPrimaryDisplay();
   const width = bounds?.width ?? Math.min(1380, primary.workArea.width - 40);
   const height = bounds?.height ?? Math.min(900, primary.workArea.height - 40);
-  const x = bounds?.x;
-  const y = bounds?.y;
+  // Only reuse saved x/y if the window would still be visible on a connected
+  // display — a monitor may have been unplugged / resolution changed since, which
+  // would otherwise open the window off-screen and unreachable. Else let Electron
+  // center it on the primary display.
+  const onScreen = !!bounds && screen.getAllDisplays().some((d) => {
+    const a = d.workArea;
+    return (
+      bounds.x < a.x + a.width && bounds.x + bounds.width > a.x &&
+      bounds.y < a.y + a.height && bounds.y + bounds.height > a.y
+    );
+  });
+  const x = onScreen ? bounds!.x : undefined;
+  const y = onScreen ? bounds!.y : undefined;
 
   mainWindow = new BrowserWindow({
     width,
@@ -94,6 +110,7 @@ function createMainWindow(): BrowserWindow {
     if (state.startMinimized && process.argv.includes('--autostart')) {
     } else {
       mainWindow?.show();
+      mainWindow?.focus();
     }
   });
 
@@ -108,6 +125,17 @@ function createMainWindow(): BrowserWindow {
   mainWindow.on('resize', persistBounds);
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window:maximizeChange', true));
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window:maximizeChange', false));
+
+  // Frameless windows on Windows often regain OS focus WITHOUT handing keyboard
+  // focus to the web contents — so inputs show a caret but silently drop
+  // keystrokes until you alt-tab away and back. Re-focusing the web contents on
+  // every show/focus fixes the intermittent "can't type in a box" bug after a
+  // tray-restore, minimize-restore, or alt-tab.
+  const focusContents = (): void => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.focus();
+  };
+  mainWindow.on('show', focusContents);
+  mainWindow.on('focus', focusContents);
 
   mainWindow.on('close', (e) => {
     if (!quitting) {
@@ -134,6 +162,7 @@ if (!gotLock) {
     if (w.isMinimized()) w.restore();
     w.show();
     w.focus();
+    w.webContents.focus();
   });
 
   app.whenReady().then(bootstrap);

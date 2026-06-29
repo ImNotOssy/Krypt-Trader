@@ -53,6 +53,29 @@ button {
   -webkit-app-region: no-drag;
 }
 
+/* ── Krypt sprite (8-frame idle strip, 50×50 per frame) ──
+   Frame stepping is driven by the Web Animations API in KryptSprite.tsx;
+   this just sets up crisp pixel scaling. */
+.krypt-sprite {
+  display: inline-block;
+  image-rendering: pixelated;
+}
+
+/* Soft "alive" bob for the lounging pet + a glowing blue drop shadow. */
+.krypt-pet {
+  animation: krypt-bob 2.8s ease-in-out infinite;
+  filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.45));
+}
+@keyframes krypt-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .krypt-pet {
+    animation: none;
+  }
+}
+
 @layer components {
   .krypt-card {
     @apply rounded-xl border border-krypt-border bg-krypt-surface p-5;

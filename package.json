@@ -1,7 +1,7 @@
 {
   "name": "krypt-trader",
   "productName": "Krypt Trader",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "description": "A free, fully-featured Kalshi auto-trading bot. Whale tracker, momentum scanner, and configurable trading engine in one polished desktop app. Part of the Krypt free tools suite.",
   "main": "dist-electron/main.js",
   "author": {
@@ -85,6 +85,24 @@
       ],
       "icon": "resources/krypt.ico",
       "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "build/icon.png",
+      "category": "Office",
+      "maintainer": "Krypt <hi@krypt.cc>",
+      "artifactName": "${productName}-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.finance",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,

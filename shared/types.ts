@@ -5,6 +5,14 @@ export type OrderStyle = 'limit_cross' | 'limit_mid' | 'market';
 
 export type SignalSource = 'whale' | 'momentum' | 'convergence' | 'external';
 
+/** One composed entry condition in the rule builder: `<field> <op> <value>`.
+ *  field = a crypto snapshot key (favoritePrice, macdHist, rsi, minsLeft, …). */
+export interface RuleCondition {
+  field: string;
+  op: '>=' | '<=' | '>' | '<';
+  value: number;
+}
+
 
 export interface TraderConfig {
   kalshiEnv: KalshiEnv;
@@ -92,11 +100,13 @@ export interface TraderConfig {
   crypto15mBalancePct?: number;
   crypto15mMaxLossPct?: number;
   crypto15mMaxConcurrent?: number;
+  crypto15mAssets?: string[] | null;        // which assets the executor may enter (null = all)
   crypto15mDirectionMode?: 'favorite' | 'contrarian';
   crypto15mTimeDelayMin?: number;
   crypto15mEntryThreshold?: number;
   crypto15mEntryMax?: number;
   crypto15mExitThreshold?: number;
+  crypto15mStopSlippageCents?: number;
   crypto15mMinDeltaPct?: number;
   crypto15mEntryDiff?: number;
   crypto15mEntryStyle?: 'maker' | 'taker';
@@ -104,6 +114,11 @@ export interface TraderConfig {
   crypto15mHoursStartUtc?: number;
   crypto15mHoursEndUtc?: number;
   crypto15mRecordSignals?: boolean;
+  crypto15mIndicatorDetect?: boolean;            // compute underlying MACD/RSI (rule fields, detection-only)
+  crypto15mArbDetect?: boolean;                  // detect Up+Down ≠ $1 arbitrage
+  crypto15mArbMinEdgeCents?: number;             // minimum edge (cents) to flag an arb
+  crypto15mUseRules?: boolean;                   // use the composed rule-set as the entry gate
+  crypto15mRules?: RuleCondition[];              // composed entry conditions (all AND-ed)
 }
 
 export interface CredentialsState {
@@ -127,10 +142,14 @@ export interface CredentialsInput {
 }
 
 
+/** Which engine a profile configures. Legacy profiles (no kind) are 'main'. */
+export type ProfileKind = 'main' | 'crypto15m';
+
 export interface Profile {
   id: string;
   name: string;
   description?: string;
+  kind?: ProfileKind;
   createdAt: string;
   updatedAt: string;
   config: TraderConfig;
@@ -141,6 +160,7 @@ export interface Profile {
 export interface AppState {
   config: TraderConfig;
   activeProfileId: string | null;
+  activeCrypto15mProfileId: string | null;
   customProfiles: Profile[];
   startMinimized: boolean;
   startWithWindows: boolean;
@@ -271,6 +291,10 @@ export interface BotPosition {
   outcomeCorrect: number | null;
   settlementUsd: number | null;
   pnlUsd: number | null;
+  /** Current price of the held side, in cents (live mark). Null until marked. */
+  markPriceCents: number | null;
+  /** Unrealized mark-to-market P&L for an open filled position; null when resolved/unmarked. */
+  livePnlUsd: number | null;
   balanceBeforeUsd: number | null;
   kalshiEnv: KalshiEnv;
   createdAt: string;
@@ -353,6 +377,9 @@ export interface Crypto15mConstants {
   entryStyle?: 'maker' | 'taker';
   hoursStartUtc?: number;
   hoursEndUtc?: number;
+  indicatorDetect?: boolean;
+  arbDetect?: boolean;
+  useRules?: boolean;
 }
 
 export interface Crypto15mAsset {
@@ -377,6 +404,21 @@ export interface Crypto15mAsset {
   signal: boolean;
   openMarketCount: number;
   error: string | null;
+  // timing + cross-asset correlation (optional rule-builder fields)
+  hourUtc?: number | null;       // current UTC hour 0-23
+  peersAgree?: number | null;    // 0..1 — fraction of other coins favoring the same side
+  marketBias?: number | null;    // -1..1 — market-wide up/down lean (breadth)
+  // Up+Down ≠ $1 arbitrage (market-neutral edge, detection-only)
+  upAsk?: number | null;         // best ask to BUY the up/yes side (0..1)
+  downAsk?: number | null;       // best ask to BUY the down/no side (0..1)
+  arbEdgeCents?: number | null;  // 100 − (upAsk+downAsk)*100; > 0 = buyable arb (gross of fees)
+  arbSignal?: boolean;           // arbEdgeCents >= the configured minimum
+  // underlying technical indicators (MACD/RSI on the 1-min underlying; rule fields)
+  macd?: number | null;          // MACD line
+  macdSignal?: number | null;    // MACD signal line
+  macdHist?: number | null;      // MACD histogram = macd − signal
+  macdCross?: number | null;     // +1 bullish / −1 bearish / 0 no cross on this bar
+  rsi?: number | null;           // Wilder RSI(14), 0..100
 }
 
 export interface Crypto15mSnapshot {
@@ -484,7 +526,7 @@ export interface KryptApi {
   };
   profiles: {
     list: () => Promise<Profile[]>;
-    save: (name: string, description?: string) => Promise<ActionResult<Profile>>;
+    save: (name: string, description?: string, kind?: ProfileKind) => Promise<ActionResult<Profile>>;
     apply: (id: string) => Promise<ActionResult<TraderConfig>>;
     rename: (id: string, name: string) => Promise<ActionResult>;
     update: (id: string) => Promise<ActionResult<Profile>>;

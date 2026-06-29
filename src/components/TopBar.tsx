@@ -2,6 +2,7 @@ import { Pause, Play, Power, RefreshCw } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { ShareButton } from './common';
+import { BossWidget } from './BossFight';
 import { cls, fmtPct, fmtUsd } from '../utils/format';
 import { computeTradeWarnings } from '../utils/warnings';
 
@@ -13,6 +14,9 @@ export function TopBar() {
 
   const toggle = async (): Promise<void> => {
     const next = !tradingOn;
+    if (next && config?.kalshiEnv === 'production' && !window.confirm(
+      'Start auto-trading on PRODUCTION?\n\nThe bot will place REAL-money orders on your Kalshi account.',
+    )) return;
     const r = await window.krypt.trading.setEnabled(next);
     if (!r.ok) {
       toast.error(r.message || 'Failed to toggle trading');
@@ -44,6 +48,7 @@ export function TopBar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <BossWidget />
         <div className="hidden items-center gap-3 px-3 md:flex">
           <Stat label="Balance" value={fmtUsd(account?.totalUsd ?? 0)} />
           <Stat

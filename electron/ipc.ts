@@ -9,6 +9,7 @@ import type {
   CredentialsState,
   PositionFilter,
   Profile,
+  ProfileKind,
   SignalFilter,
   TraderConfig,
 } from '../shared/types';
@@ -24,6 +25,46 @@ const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
   message,
 });
 const err = (message: string): ActionResult => ({ ok: false, message });
+
+// Profiles store a full config snapshot, but applying one only patches the
+// slice for its engine — so a main profile never disturbs the 15m crypto
+// settings and vice-versa, and neither re-arms the env / live switches.
+const MAIN_EXCLUDE = new Set(['kalshiEnv', 'enableTrading']);
+const CRYPTO_ARM_EXCLUDE = new Set(['crypto15mEnabled', 'crypto15mLive']);
+
+const isCrypto15mKey = (k: string): boolean => k.startsWith('crypto15m');
+
+function profileSlice(config: TraderConfig, kind: ProfileKind): Partial<TraderConfig> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(config)) {
+    const crypto = isCrypto15mKey(k);
+    if (kind === 'crypto15m') {
+      if (crypto && !CRYPTO_ARM_EXCLUDE.has(k)) out[k] = v;
+    } else if (!crypto && !MAIN_EXCLUDE.has(k)) {
+      out[k] = v;
+    }
+  }
+  return out as Partial<TraderConfig>;
+}
+
+const profileKindOf = (p: Profile): ProfileKind => (p.kind === 'crypto15m' ? 'crypto15m' : 'main');
+
+// A manual config edit diverges from any applied strategy/profile snapshot, so
+// drop the matching "active" marker — otherwise the Strategies/Profiles UI keeps
+// flagging a strategy as "Active" after its settings were changed. Env / master
+// switch (MAIN_EXCLUDE) and the 15m arm switches (CRYPTO_ARM_EXCLUDE) aren't part
+// of a saved snapshot, so they don't clear it.
+function clearActiveMarkersForPatch(patch: Partial<TraderConfig>): void {
+  const keys = Object.keys(patch || {});
+  const touchesMain = keys.some((k) => !isCrypto15mKey(k) && !MAIN_EXCLUDE.has(k));
+  const touchesCrypto = keys.some((k) => isCrypto15mKey(k) && !CRYPTO_ARM_EXCLUDE.has(k));
+  const cur = store.get();
+  const next = { ...cur };
+  let changed = false;
+  if (touchesMain && cur.activeProfileId) { next.activeProfileId = null; changed = true; }
+  if (touchesCrypto && cur.activeCrypto15mProfileId) { next.activeCrypto15mProfileId = null; changed = true; }
+  if (changed) store.save(next);
+}
 
 function broadcastState(state: AppState): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -81,13 +122,19 @@ export function registerIpc(): void {
 
   ipcMain.handle('config:get', () => store.get().config);
   ipcMain.handle('config:update', async (_e, patch: Partial<TraderConfig>) => {
-    const next = store.patchConfig(patch);
+    store.patchConfig(patch);
+    clearActiveMarkersForPatch(patch);
+    const next = store.get();
     broadcastState(next);
     await pushConfigToBackend();
     return next.config;
   });
   ipcMain.handle('config:replace', async (_e, cfg: TraderConfig) => {
-    const next = store.replaceConfig(cfg);
+    store.replaceConfig(cfg);
+    // A full replace no longer matches any saved strategy/profile snapshot.
+    const next = store.save({
+      ...store.get(), activeProfileId: null, activeCrypto15mProfileId: null,
+    });
     broadcastState(next);
     await pushConfigToBackend();
     return next.config;
@@ -103,10 +150,17 @@ export function registerIpc(): void {
     const s = findStrategy(id);
     if (!s || s.comingSoon) return store.get().config;
     const curCfg = store.get().config;
-    // Applying a strategy must NOT change the environment or master kill-switch.
+    // Applying a main-engine strategy must NOT change the environment, master
+    // kill-switch, or the independently-tuned 15m crypto engine (mirrors the
+    // profiles:apply strategy branch — the two engines are independent).
     const next = store.replaceConfig({
-      ...s.config, kalshiEnv: curCfg.kalshiEnv, enableTrading: curCfg.enableTrading,
-    });
+      ...s.config,
+      ...profileSlice(curCfg, 'crypto15m'),
+      crypto15mEnabled: curCfg.crypto15mEnabled,
+      crypto15mLive: curCfg.crypto15mLive,
+      kalshiEnv: curCfg.kalshiEnv,
+      enableTrading: curCfg.enableTrading,
+    } as TraderConfig);
     const stateNext = store.save({ ...store.get(), activeProfileId: id });
     broadcastState(stateNext);
     await pushConfigToBackend();
@@ -114,14 +168,16 @@ export function registerIpc(): void {
   });
 
   ipcMain.handle('profiles:list', () => store.get().customProfiles);
-  ipcMain.handle('profiles:save', (_e, name: string, description?: string) => {
+  ipcMain.handle('profiles:save', (_e, name: string, description?: string, kind?: ProfileKind) => {
     if (!name?.trim()) return err('Profile name required');
     const cur = store.get();
     const now = new Date().toISOString();
+    const pkind: ProfileKind = kind === 'crypto15m' ? 'crypto15m' : 'main';
     const profile: Profile = {
       id: genId(),
       name: name.trim(),
       description: description?.trim() || undefined,
+      kind: pkind,
       createdAt: now,
       updatedAt: now,
       config: { ...cur.config },
@@ -129,10 +185,12 @@ export function registerIpc(): void {
     const next = store.save({
       ...cur,
       customProfiles: [...cur.customProfiles, profile],
-      activeProfileId: profile.id,
+      ...(pkind === 'crypto15m'
+        ? { activeCrypto15mProfileId: profile.id }
+        : { activeProfileId: profile.id }),
     });
     broadcastState(next);
-    return ok(profile, `Saved profile "${profile.name}"`);
+    return ok(profile, `Saved ${pkind === 'crypto15m' ? '15m crypto ' : ''}profile "${profile.name}"`);
   });
   ipcMain.handle('profiles:apply', async (_e, id: string) => {
     const cur = store.get();
@@ -141,9 +199,16 @@ export function registerIpc(): void {
       const s = findStrategy(id);
       if (s?.comingSoon) return err(`"${s.name}" is coming soon`);
       if (s) {
+        // Strategy presets are main-engine. Reset the main config to the
+        // strategy, but preserve the current 15m crypto settings + env/switch.
         const next = store.replaceConfig({
-          ...s.config, kalshiEnv: cur.config.kalshiEnv, enableTrading: cur.config.enableTrading,
-        });
+          ...s.config,
+          ...profileSlice(cur.config, 'crypto15m'),
+          crypto15mEnabled: cur.config.crypto15mEnabled,
+          crypto15mLive: cur.config.crypto15mLive,
+          kalshiEnv: cur.config.kalshiEnv,
+          enableTrading: cur.config.enableTrading,
+        } as TraderConfig);
         const stateNext = store.save({ ...store.get(), activeProfileId: id });
         broadcastState(stateNext);
         await pushConfigToBackend();
@@ -151,10 +216,15 @@ export function registerIpc(): void {
       }
       return err('Profile not found');
     }
-    const next = store.replaceConfig({
-      ...p.config, kalshiEnv: cur.config.kalshiEnv, enableTrading: cur.config.enableTrading,
+    const pkind = profileKindOf(p);
+    // Patch only this engine's slice so the other engine is left untouched.
+    const next = store.patchConfig(profileSlice(p.config, pkind));
+    const stateNext = store.save({
+      ...store.get(),
+      ...(pkind === 'crypto15m'
+        ? { activeCrypto15mProfileId: id }
+        : { activeProfileId: id }),
     });
-    const stateNext = store.save({ ...store.get(), activeProfileId: id });
     broadcastState(stateNext);
     await pushConfigToBackend();
     return ok(next.config, `Applied profile "${p.name}"`);
@@ -190,6 +260,8 @@ export function registerIpc(): void {
       ...cur,
       customProfiles: cur.customProfiles.filter((p) => p.id !== id),
       activeProfileId: cur.activeProfileId === id ? null : cur.activeProfileId,
+      activeCrypto15mProfileId:
+        cur.activeCrypto15mProfileId === id ? null : cur.activeCrypto15mProfileId,
     });
     broadcastState(next);
     return ok();
@@ -232,6 +304,7 @@ export function registerIpc(): void {
       const dup: Profile = {
         ...p,
         id: genId(),
+        kind: p.kind === 'crypto15m' ? 'crypto15m' : 'main',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };

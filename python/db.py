@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS bot_positions (
     outcome_correct INTEGER DEFAULT NULL,
     settlement_usd REAL DEFAULT NULL,
     pnl_usd REAL DEFAULT NULL,
+    mark_price_cents REAL DEFAULT NULL,
     closed_early INTEGER DEFAULT 0,
     balance_before_usd REAL DEFAULT NULL,
     kalshi_env TEXT DEFAULT 'demo',
@@ -277,6 +278,11 @@ CREATE TABLE IF NOT EXISTS crypto15m_signals (
     delta_pct REAL,                    -- abs(open-live)/open underlying move
     open_spot REAL,
     obs_spot REAL,
+    macd REAL,                         -- underlying MACD line (1-min closes)
+    macd_signal REAL,                  -- MACD signal line
+    macd_hist REAL,                    -- MACD histogram = macd - signal
+    macd_cross INTEGER,                -- +1 bullish / -1 bearish / 0 no cross
+    rsi REAL,                          -- Wilder RSI(14) of the underlying
     resolved INTEGER DEFAULT 0,
     up_won INTEGER DEFAULT NULL,       -- 1 if the up/yes side settled true
     settled_at TEXT DEFAULT NULL,
@@ -303,6 +309,11 @@ CREATE TABLE IF NOT EXISTS crypto15m_ticks (
     spot REAL,                         -- live underlying USD
     open_spot REAL,                    -- quarter-open underlying USD
     delta_pct REAL,                    -- abs(open-live)/open
+    macd REAL,                         -- underlying MACD line (1-min closes)
+    macd_signal REAL,                  -- MACD signal line
+    macd_hist REAL,                    -- MACD histogram = macd - signal
+    macd_cross INTEGER,                -- +1 bullish / -1 bearish / 0 no cross
+    rsi REAL,                          -- Wilder RSI(14) of the underlying
     kalshi_env TEXT DEFAULT 'demo'
 );
 CREATE INDEX IF NOT EXISTS idx_c15tick_ticker ON crypto15m_ticks(ticker, observed_at);
@@ -375,10 +386,21 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         for migration in [
             "ALTER TABLE bot_positions ADD COLUMN closed_early INTEGER DEFAULT 0",
+            "ALTER TABLE bot_positions ADD COLUMN mark_price_cents REAL DEFAULT NULL",
             "ALTER TABLE alerts ADD COLUMN yes_sub_title TEXT DEFAULT ''",
             "ALTER TABLE bot_runs ADD COLUMN start_trades_opened INTEGER DEFAULT 0",
             "ALTER TABLE bot_runs ADD COLUMN start_trades_won INTEGER DEFAULT 0",
             "ALTER TABLE bot_runs ADD COLUMN start_trades_lost INTEGER DEFAULT 0",
+            "ALTER TABLE crypto15m_signals ADD COLUMN macd REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN macd_signal REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN macd_hist REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN macd_cross INTEGER",
+            "ALTER TABLE crypto15m_signals ADD COLUMN rsi REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN macd REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN macd_signal REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN macd_hist REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN macd_cross INTEGER",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN rsi REAL",
         ]:
             try:
                 conn.execute(migration)
@@ -395,6 +417,9 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
         "order_events",
         "alerts",
         "whale_trades",
+        "crypto15m_positions",
+        "crypto15m_signals",
+        "crypto15m_ticks",
     ]
     if wipe_markets:
         targets.extend(["markets", "events", "trades", "market_snapshots"])
@@ -419,6 +444,7 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
                 "DELETE FROM sqlite_sequence WHERE name IN "
                 "('bot_positions','bot_runs','pnl_snapshots',"
                 "'daily_stats','order_events','alerts','whale_trades',"
+                "'crypto15m_positions','crypto15m_signals','crypto15m_ticks',"
                 "'markets','events','trades','market_snapshots')",
             )
     except sqlite3.OperationalError:
@@ -778,6 +804,33 @@ def get_previous_snapshot(conn, ticker: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_previous_snapshots_bulk(conn, tickers) -> dict:
+    """Second-most-recent snapshot per ticker (same as get_previous_snapshot's
+    LIMIT 1 OFFSET 1, i.e. rn=2) for many tickers in ONE query — replaces a
+    ~500× N+1 in the momentum scan. Returns {ticker: {volume_24h, yes_bid,
+    last_price}}. Chunked under SQLite's 999-variable limit."""
+    out: dict[str, dict] = {}
+    uniq = [t for t in dict.fromkeys(tickers) if t]
+    CHUNK = 400
+    for i in range(0, len(uniq), CHUNK):
+        chunk = uniq[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"""SELECT ticker, volume_24h, yes_bid, last_price FROM (
+                   SELECT ticker, volume_24h, yes_bid, last_price,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY ticker ORDER BY snapshot_at DESC, id DESC
+                          ) AS rn
+                   FROM market_snapshots
+                   WHERE ticker IN ({placeholders})
+               ) WHERE rn = 2""",
+            chunk,
+        ).fetchall()
+        for r in rows:
+            out[r["ticker"]] = dict(r)
+    return out
+
+
 
 
 def get_unresolved_alerts(conn, days: int = 30) -> list:
@@ -914,9 +967,14 @@ def log_event(
 
 
 def count_open_bot_positions(conn, env: str | None = None) -> int:
+    # Excludes signal_source='external' (positions imported from Kalshi, incl.
+    # 15m-crypto fills and manual trades) — the main engine's max_open_positions
+    # cap governs how many positions IT manages, so externals must not eat its
+    # slots. Dollar exposure is still capped separately by current exposure.
     sql = (
         "SELECT COUNT(*) FROM bot_positions "
-        "WHERE status IN ('submitted','partial','filled') AND resolved=0"
+        "WHERE status IN ('submitted','partial','filled') AND resolved=0 "
+        "AND COALESCE(signal_source,'') != 'external'"
     )
     args: tuple = ()
     if env:
@@ -925,17 +983,38 @@ def count_open_bot_positions(conn, env: str | None = None) -> int:
     return conn.execute(sql, args).fetchone()[0]
 
 
-def count_new_positions_today(conn, env: str | None = None) -> int:
+def get_market_quotes(conn, tickers) -> dict[str, dict]:
+    """Latest stored quote (yes_bid/yes_ask/last_price, in dollars 0..1) per
+    ticker, from the markets table. Used to mark open positions to market."""
+    out: dict[str, dict] = {}
+    for t in {x for x in tickers if x}:
+        row = conn.execute(
+            "SELECT yes_bid, yes_ask, last_price FROM markets WHERE ticker=?",
+            (t,),
+        ).fetchone()
+        if row:
+            out[t] = {
+                "yes_bid": float(row["yes_bid"] or 0),
+                "yes_ask": float(row["yes_ask"] or 0),
+                "last_price": float(row["last_price"] or 0),
+            }
+    return out
+
+
+def count_new_positions_today(conn, env: str | None = None, offset_min: int = 0) -> int:
+    # offset_min shifts the day boundary to the user's local day (matches the
+    # trading-hours gate); default 0 = UTC, unchanged.
+    mod = f"{int(offset_min):+d} minutes"
     sql = (
         "SELECT COUNT(*) FROM bot_positions "
-        "WHERE date(created_at)=date('now') "
+        "WHERE date(created_at, ?)=date('now', ?) "
         "AND status != 'dry_run' "
         "AND COALESCE(signal_source,'') != 'external'"
     )
-    args: tuple = ()
+    args: tuple = (mod, mod)
     if env:
         sql += " AND kalshi_env = ?"
-        args = (env,)
+        args = (mod, mod, env)
     return conn.execute(sql, args).fetchone()[0]
 
 
@@ -985,9 +1064,49 @@ def exists_position_in_market(
 
 
 def current_total_exposure_usd(conn, env: str) -> float:
+    # Count COMMITTED capital, not just settled cost. A resting/in-flight order
+    # (status submitted/partial) is inserted with cost_usd=0 and only gets a real
+    # cost on a later reconcile, so summing cost_usd alone undercounts exposure
+    # and lets a single scan cycle over-deploy past max_total_exposure_fraction.
+    # Value non-filled rows at their committed notional (target_contracts ×
+    # limit_price_cents); Kalshi holds the cash for these, so this is the real
+    # capital tied up in open positions.
+    row = conn.execute(
+        """SELECT COALESCE(SUM(
+              CASE WHEN status='filled' THEN COALESCE(cost_usd, 0)
+                   ELSE MAX(COALESCE(cost_usd, 0),
+                            COALESCE(target_contracts, 0) * COALESCE(limit_price_cents, 0) / 100.0)
+              END
+           ), 0) FROM bot_positions
+           WHERE resolved=0 AND status IN ('submitted','partial','filled') AND kalshi_env=?""",
+        (env,),
+    ).fetchone()
+    return float(row[0] or 0.0)
+
+
+def open_filled_cost_usd(conn, env: str) -> float:
+    """Cost basis of currently-open FILLED contracts only. Unlike
+    current_total_exposure_usd (which counts committed notional of resting orders
+    for risk capping), this EXCLUDES unfilled/resting orders, whose cash is still
+    sitting in Kalshi's `balance` (it isn't held). This is the correct value of
+    open positions for the account total / P&L: cash + filled-cost reconstructs
+    the account with no double-count, and opening a position is P&L-neutral."""
     row = conn.execute(
         """SELECT COALESCE(SUM(cost_usd), 0) FROM bot_positions
-           WHERE resolved=0 AND status IN ('submitted','partial','filled') AND kalshi_env=?""",
+           WHERE resolved=0 AND status IN ('filled','partial') AND kalshi_env=?""",
+        (env,),
+    ).fetchone()
+    return float(row[0] or 0.0)
+
+
+def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
+    """Cost basis of currently-held 15m-crypto positions (its own table). Added
+    to the account total because those positions are excluded from the main
+    bot_positions reconcile import — without this the total would under-count by
+    the crypto cash that's already been spent."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(cost_usd), 0) FROM crypto15m_positions
+           WHERE resolved=0 AND filled_contracts > 0 AND kalshi_env=?""",
         (env,),
     ).fetchone()
     return float(row[0] or 0.0)
@@ -1167,14 +1286,17 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
         """INSERT OR IGNORE INTO crypto15m_signals (
               ticker, asset, series, close_time, mins_left, favorite,
               favorite_price, entry_cost, up_prob, delta_pct, open_spot,
-              obs_spot, kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              obs_spot, macd, macd_signal, macd_hist, macd_cross, rsi,
+              kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("series", ""),
             row.get("close_time", ""), row.get("mins_left"),
             row.get("favorite"), row.get("favorite_price"),
             row.get("entry_cost"), row.get("up_prob"), row.get("delta_pct"),
             row.get("open_spot"), row.get("obs_spot"),
+            row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
+            row.get("macd_cross"), row.get("rsi"),
             row.get("kalshi_env", "demo"),
         ),
     )
@@ -1223,19 +1345,22 @@ def crypto15m_signal_counts(conn) -> dict:
     }
 
 
-_C15_TICKS_KEEP_DAYS = 45
+_C15_TICKS_KEEP_DAYS = 14
 
 
 def insert_crypto15m_tick(conn, row: dict) -> None:
     conn.execute(
         """INSERT INTO crypto15m_ticks (
               ticker, asset, mins_left, yes_bid, yes_ask, up_prob,
-              spot, open_spot, delta_pct, kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              spot, open_spot, delta_pct, macd, macd_signal, macd_hist,
+              macd_cross, rsi, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("mins_left"),
             row.get("yes_bid"), row.get("yes_ask"), row.get("up_prob"),
             row.get("spot"), row.get("open_spot"), row.get("delta_pct"),
+            row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
+            row.get("macd_cross"), row.get("rsi"),
             row.get("kalshi_env", "demo"),
         ),
     )
@@ -1277,9 +1402,10 @@ def insert_pnl_snapshot(
 
 
 def earliest_pnl_total(conn, env: str) -> float | None:
+    # Ignore any $0/unknown-balance rows so they can never become a baseline.
     row = conn.execute(
         """SELECT total_usd FROM pnl_snapshots
-           WHERE kalshi_env = ?
+           WHERE kalshi_env = ? AND total_usd > 0
            ORDER BY at ASC LIMIT 1""",
         (env,),
     ).fetchone()
@@ -1291,12 +1417,15 @@ def earliest_pnl_total(conn, env: str) -> float | None:
         return None
 
 
-def first_snapshot_of_today(conn, env: str) -> dict | None:
+def first_snapshot_of_today(conn, env: str, offset_min: int = 0) -> dict | None:
+    # Ignore any $0/unknown-balance rows so they can never become today's baseline.
+    # offset_min shifts the day boundary to the user's local day (default 0 = UTC).
+    mod = f"{int(offset_min):+d} minutes"
     row = conn.execute(
         """SELECT * FROM pnl_snapshots
-           WHERE kalshi_env = ? AND date(at) = date('now')
+           WHERE kalshi_env = ? AND date(at, ?) = date('now', ?) AND total_usd > 0
            ORDER BY at ASC LIMIT 1""",
-        (env,),
+        (env, mod, mod),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1479,6 +1608,7 @@ def _delete_batched(
 def cleanup_old_data(
     conn=None, *, trade_hours: int = 48, alert_days: int = 45,
     snapshot_hours: int = 6, pnl_days: int = 120,
+    event_days: int = 30, c15_signal_days: int = 60,
 ) -> int:
     now = datetime.now(timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1487,6 +1617,8 @@ def cleanup_old_data(
     snap_cutoff = (now - timedelta(hours=snapshot_hours)).strftime("%Y-%m-%d %H:%M:%S")
     pnl_cutoff = (now - timedelta(days=pnl_days)).strftime("%Y-%m-%d %H:%M:%S")
     settled_cutoff = (now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    event_cutoff = (now - timedelta(days=event_days)).strftime("%Y-%m-%d %H:%M:%S")
+    c15sig_cutoff = (now - timedelta(days=c15_signal_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     ticks_cutoff = (now - timedelta(days=_C15_TICKS_KEEP_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1494,6 +1626,10 @@ def cleanup_old_data(
     deleted += _delete_batched("created_time < ?", (trade_cutoff,), "trades")
     deleted += _delete_batched("snapshot_at < ?", (snap_cutoff,), "market_snapshots")
     deleted += _delete_batched("observed_at < ?", (ticks_cutoff,), "crypto15m_ticks")
+    # order_events + resolved 15m signals were never swept → unbounded growth.
+    deleted += _delete_batched("created_at < ?", (event_cutoff,), "order_events")
+    deleted += _delete_batched(
+        "resolved = 1 AND observed_at < ?", (c15sig_cutoff,), "crypto15m_signals")
     deleted += _delete_batched(
         "status NOT IN ('active','open') AND last_updated < ?", (settled_cutoff,), "markets")
     deleted += _delete_batched(
@@ -1533,7 +1669,7 @@ def vacuum() -> None:
         conn.close()
 
 
-def run_maintenance(*, vacuum_min_free_mb: float = 200.0, force_vacuum: bool = False) -> dict:
+def run_maintenance(*, vacuum_min_free_mb: float = 50.0, force_vacuum: bool = False) -> dict:
     deleted = cleanup_old_data()
     free_mb = _reclaimable_mb()
     vacuumed = False

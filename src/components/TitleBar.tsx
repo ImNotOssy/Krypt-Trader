@@ -4,7 +4,7 @@ import { useApp } from '../state/AppStateProvider';
 import { cls } from '../utils/format';
 
 export function TitleBar() {
-  const { backend } = useApp();
+  const { backend, appVersion } = useApp();
   const [maxed, setMaxed] = useState(false);
 
   useEffect(() => {
@@ -32,6 +32,9 @@ export function TitleBar() {
           <div className="h-5 w-5 rounded-md bg-krypt-glow" />
           <span className="font-pixel text-[10px] uppercase tracking-[0.2em] text-white/90">
             Krypt Trader
+          </span>
+          <span className="rounded bg-krypt-purple/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-krypt-purple">
+            v{appVersion || '2.0.0'}
           </span>
         </div>
         <div className="hidden items-center gap-2 text-[11px] text-krypt-muted lg:flex">

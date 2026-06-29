@@ -574,3 +574,126 @@ def test_hours_ok_overnight_wrap(cfg):
     assert crypto15m.hours_ok(cfg, hour=2) is True
     assert crypto15m.hours_ok(cfg, hour=6) is False
     assert crypto15m.hours_ok(cfg, hour=12) is False
+
+
+# ───────── stop-loss exit chase (the "stop-loss didn't fill" fix) ──────────
+
+
+def _exiting_position(cur_limit: int, *, oid: str = "OLD") -> dict:
+    """A filled position that has placed a resting stop-loss SELL @ cur_limit."""
+    with db.get_db() as conn:
+        pid = db.insert_crypto15m_position(conn, {
+            "asset": "BTC", "series": "KXBTC15M", "ticker": "KXBTC15M-T1",
+            "side": "yes", "direction": "yes", "target_contracts": 10,
+            "filled_contracts": 10, "entry_limit_cents": 70, "avg_entry_cents": 70,
+            "cost_usd": 6.0, "client_order_id": f"c-{oid}", "kalshi_order_id": "E1",
+            "status": "filled", "close_time": "", "confidence": 0,
+            "entry_delta_usd": 0, "kalshi_env": "production", "dry_run": 0, "error": None,
+        })
+        db.update_crypto15m_position(
+            conn, pid, status="exiting", exit_reason="stop_loss",
+            exit_kalshi_order_id=oid, exit_limit_cents=cur_limit, exit_filled_contracts=0,
+        )
+        return db.fetch_crypto15m_by_id(conn, pid)
+
+
+def _stub_order(monkeypatch, *, filled: int, cost_dollars: float = 0.0):
+    async def _get(_oid):
+        return {"order": {
+            "fill_count_fp": filled, "remaining_count_fp": 10 - filled,
+            "initial_count_fp": 10, "taker_fill_cost_dollars": cost_dollars,
+            "maker_fill_cost_dollars": 0, "status": "canceled",
+        }}
+    monkeypatch.setattr(kalshi_api, "get_order", _get)
+
+    async def _cancel(_oid):
+        return {"ok": True}
+    monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
+
+
+def test_stop_loss_chases_stale_resting_sell(fresh_db, env_prod, cfg, monkeypatch):
+    # Bid has dropped to 50¢, below our 60¢ resting sell, which is unfilled.
+    async def _book(_t):
+        return {"yes": [[50, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    _stub_order(monkeypatch, filled=0)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._chase_exit(_exiting_position(60), cfg))
+
+    # Re-priced down to the live bid so it actually fills, full size, as a SELL.
+    assert len(calls) == 1
+    assert calls[0]["action"] == "sell"
+    assert calls[0]["price_cents"] == 50
+    assert calls[0]["count"] == 10
+    assert row["exit_limit_cents"] == 50
+
+
+def test_chase_exit_never_double_sells_on_race(fresh_db, env_prod, cfg, monkeypatch):
+    # Same stale book, but the cancelled order actually filled in the race.
+    async def _book(_t):
+        return {"yes": [[50, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    _stub_order(monkeypatch, filled=10, cost_dollars=5.0)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._chase_exit(_exiting_position(60), cfg))
+
+    # No second sell placed; the position resolves from the race fill.
+    assert calls == []
+    assert row["status"] == "exited"
+    assert row["resolved"]
+
+
+def test_chase_exit_holds_when_still_marketable(fresh_db, env_prod, cfg, monkeypatch):
+    # Bid (65¢) is still at/above our 60¢ sell → it's marketable, don't churn it.
+    async def _book(_t):
+        return {"yes": [[65, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._chase_exit(_exiting_position(60), cfg))
+
+    assert calls == []
+    assert row is None
+
+
+def test_place_stop_loss_applies_slippage(fresh_db, env_prod, cfg, monkeypatch):
+    cfg["crypto15m_stop_slippage_cents"] = 4
+    async def _book(_t):
+        return {"yes": [[55, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    calls = _capture_orders(monkeypatch)
+    with db.get_db() as conn:
+        pid = db.insert_crypto15m_position(conn, {
+            "asset": "BTC", "series": "KXBTC15M", "ticker": "KXBTC15M-T1",
+            "side": "yes", "direction": "yes", "target_contracts": 10,
+            "filled_contracts": 10, "entry_limit_cents": 70, "avg_entry_cents": 70,
+            "cost_usd": 6.0, "client_order_id": "sl-c", "kalshi_order_id": "E1",
+            "status": "filled", "close_time": "", "confidence": 0,
+            "entry_delta_usd": 0, "kalshi_env": "production", "dry_run": 0, "error": None,
+        })
+        pos = db.fetch_crypto15m_by_id(conn, pid)
+
+    row = run_async(ct._place_stop_loss(pos, None, cfg))
+
+    assert len(calls) == 1
+    assert calls[0]["action"] == "sell"
+    assert calls[0]["price_cents"] == 51  # 55 bid − 4 slippage
+    assert row["status"] == "exiting"
+    assert row["exit_limit_cents"] == 51
+
+
+def test_stop_slippage_prices_chase_through_the_bid(fresh_db, env_prod, cfg, monkeypatch):
+    cfg["crypto15m_stop_slippage_cents"] = 3
+    async def _book(_t):
+        return {"yes": [[50, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    _stub_order(monkeypatch, filled=0)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._chase_exit(_exiting_position(60), cfg))
+
+    assert len(calls) == 1
+    assert calls[0]["price_cents"] == 47  # 50 bid − 3 slippage
+    assert row["exit_limit_cents"] == 47

@@ -8,12 +8,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import crypto15m
 import db
 from kalshi_api import (
     KalshiAPIError, cancel_order, fetch_market, get_balance,
     get_fills_for_order, get_order, get_orderbook, get_positions,
     place_limit_order,
 )
+
+# Series the 15m-crypto executor owns; the main reconcile must not import these
+# as "external" (it tracks them in its own table — see reconcile import branch).
+_CRYPTO15M_SERIES = {s["series"] for s in crypto15m.SERIES}
 from kalshi_auth import ENV_LOCK, get_env
 
 logger = logging.getLogger(__name__)
@@ -21,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 _balance_cache: dict[str, dict] = {}
+# One-time diagnostic: log the real /portfolio/balance response shape on first
+# success so we can confirm it's cash-only (no portfolio_value) and whether a
+# resting order reduces it — the assumptions the account total / P&L rest on.
+_balance_shape_logged = False
 
 
 async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
@@ -38,6 +47,15 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
             return cached["cents"], cached["portfolio_cents"]
         try:
             data = await get_balance()
+            # A malformed/empty response (no 'balance' key) must NOT be cached as
+            # $0 — that poisons the cache and makes the displayed balance flash to
+            # zero. Treat it like a failed fetch and keep the last-known value.
+            if not isinstance(data, dict) or "balance" not in data:
+                raise ValueError("balance missing from response")
+            global _balance_shape_logged
+            if not _balance_shape_logged:
+                _balance_shape_logged = True
+                logger.info(f"Kalshi /portfolio/balance response shape: {dict(data)}")
             cents = int(data.get("balance", 0))
             port = int(data.get("portfolio_value", 0))
             _balance_cache[env] = {"cents": cents, "portfolio_cents": port, "at": now}
@@ -46,6 +64,14 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
             logger.warning(f"balance fetch failed: {e}")
             cached = _balance_cache.get(env)
             return (cached["cents"], cached["portfolio_cents"]) if cached else (0, 0)
+
+
+def cached_balance(env: str | None = None) -> dict | None:
+    """Last successfully-fetched balance for `env` (or the active env) as
+    {cents, portfolio_cents, at}, or None if none has succeeded yet this session.
+    Display code reads this so a transient failed poll (or a cold cache right
+    after an env switch / backend restart) can't flash the balance to $0."""
+    return _balance_cache.get(env or get_env())
 
 
 
@@ -91,7 +117,10 @@ async def _compute_limit_price_cents(
     direction = direction.lower()
     style = cfg.get("order_style", "limit_cross")
     if style == "market":
-        return 99 if direction == "yes" else 99
+        # Cross at the user's max entry price, not a hardcoded 99¢. Returning 99
+        # made every market-style order fail the entry-price band check below
+        # (and risked overpaying) whenever max_entry_price_cents < 99.
+        return max(1, min(99, int(cfg.get("max_entry_price_cents", 99) or 99)))
     try:
         book = await get_orderbook(ticker)
         cross = _best_cross_price_cents(book, direction)
@@ -211,9 +240,9 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
 
 
 
-def _today_pnl_balance_delta(env: str) -> float | None:
+def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
     with db.get_db() as conn:
-        first_today = db.first_snapshot_of_today(conn, env)
+        first_today = db.first_snapshot_of_today(conn, env, offset_min)
         if not first_today:
             return None
         latest = db.latest_snapshot(conn, env)
@@ -225,7 +254,7 @@ def _today_pnl_balance_delta(env: str) -> float | None:
 
 
 def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
-    pnl = _today_pnl_balance_delta(env)
+    pnl = _today_pnl_balance_delta(env, int(cfg.get("trading_timezone_offset_min", 0) or 0))
     if pnl is None:
         return False, ""
     sl = float(cfg.get("stop_loss_on_day", 0))
@@ -289,7 +318,8 @@ async def execute_signal(
             )
             return None
         if not cfg.get("unlimited_daily_new_positions"):
-            today_count = db.count_new_positions_today(conn, env)
+            today_count = db.count_new_positions_today(
+                conn, env, int(cfg.get("trading_timezone_offset_min", 0) or 0))
             daily_cap = int(cfg["max_daily_new_positions"])
             if today_count >= daily_cap:
                 logger.info(
@@ -308,12 +338,20 @@ async def execute_signal(
             logger.info(f"[skip] {signal['ticker']}: market/side already open")
             return None
         exposure = db.current_total_exposure_usd(conn, env)
+        filled_cost = db.open_filled_cost_usd(conn, env)
 
+    # Account value = cash + cost basis of FILLED positions. Kalshi's `balance`
+    # still includes the cash for resting/unfilled orders (it isn't held), so we
+    # must NOT add committed notional into the bankroll — that double-counts and
+    # inflates the cap (which would over-deploy). `exposure` (committed incl.
+    # resting orders) is the RISK we limit to a fraction of that account, so each
+    # in-flight order still consumes headroom and the cap binds within one cycle.
+    total_bankroll = max(0.0, balance_usd) + max(0.0, filled_cost)
     target_usd = _compute_position_usd(balance_usd, edge_pts, cfg)
-    max_exposure = balance_usd * float(cfg["max_total_exposure_fraction"])
+    max_exposure = total_bankroll * float(cfg["max_total_exposure_fraction"])
     target_usd = min(target_usd, max(0.0, max_exposure - exposure))
-    reserve = balance_usd * float(cfg["min_cash_reserve_fraction"])
-    target_usd = min(target_usd, max(0.0, balance_usd - reserve - exposure))
+    reserve = total_bankroll * float(cfg["min_cash_reserve_fraction"])
+    target_usd = min(target_usd, max(0.0, balance_usd - reserve))
 
     if target_usd < 1.0:
         logger.info(f"[skip] {signal['ticker']}: size ${target_usd:.2f} < $1")
@@ -519,6 +557,10 @@ _last_scan_skip_log: dict[str, float] = {}
 _last_filter_log: dict[tuple[int, str], float] = {}
 
 _last_skip_import_log: dict[tuple[str, str], float] = {}
+# Consecutive reconciles a filled position has been absent from Kalshi's
+# /portfolio/positions. Used to debounce orphan-closing against transient API
+# blips and fresh-fill lag before declaring a position truly gone.
+_orphan_miss_streak: dict[int, int] = {}
 
 
 
@@ -878,6 +920,30 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
     return updated
 
 
+
+
+def _side_mark_cents(quote: dict | None, side: str) -> Optional[float]:
+    """Current price of the held side, in cents, from a stored market quote.
+    Mid of yes_bid/yes_ask when both are present, else last_price, else a single
+    quote — clamped to [0, 100]. None when there's no usable quote yet."""
+    if not quote:
+        return None
+    yb = float(quote.get("yes_bid") or 0)
+    ya = float(quote.get("yes_ask") or 0)
+    lp = float(quote.get("last_price") or 0)
+    if yb > 0 and ya > 0:
+        yes = (yb + ya) / 2.0
+    elif lp > 0:
+        yes = lp
+    elif yb > 0:
+        yes = yb
+    elif ya > 0:
+        yes = ya
+    else:
+        return None
+    yes = max(0.0, min(1.0, yes))
+    side_price = yes if side == "yes" else (1.0 - yes)
+    return round(side_price * 100.0, 2)
 
 
 def _market_yes_payout(market: dict | None) -> Optional[float]:
@@ -1284,6 +1350,13 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             (pos["ticker"], pos["direction"]), [],
         ).append(pos)
 
+    # Current per-ticker quotes (markets table is refreshed each cycle by the
+    # resolution pass) → drives live mark-to-market P&L on open positions.
+    with db.get_db() as conn:
+        quote_by_ticker = db.get_market_quotes(
+            conn, {t for (t, _s) in local_by_key},
+        )
+
     for (ticker, side), live_p in live_by_key.items():
         rows = local_by_key.get((ticker, side), [])
         qty = abs(_signed_qty(live_p))
@@ -1311,13 +1384,25 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             )
             new_filled = int(round(qty))
 
+            # Live mark (held side's current price, in cents) → unrealized P&L.
+            cur_mark = _side_mark_cents(quote_by_ticker.get(ticker), side)
+            prev_mark = target.get("mark_price_cents")
+            mark_moved = (
+                cur_mark is not None
+                and (prev_mark is None or abs(float(prev_mark) - cur_mark) >= 1.0)
+            )
+
             cur_filled = int(target.get("filled_contracts") or 0)
             cur_cost_usd = float(target.get("cost_usd") or 0.0)
+            # Skip a no-op write so the renderer isn't flooded with
+            # position:update for unchanged rows — but DO write when the mark
+            # moved ≥1c, so live P&L stays current.
             if (
                 not was_terminal
                 and target.get("status") == "filled"
                 and cur_filled == new_filled
                 and abs(cur_cost_usd - new_cost_usd) < 0.005
+                and not mark_moved
             ):
                 continue
 
@@ -1328,6 +1413,8 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     cost_usd=new_cost_usd,
                     avg_fill_price_cents=new_avg_cents,
                     error=None if was_terminal else target.get("error"),
+                    **({"mark_price_cents": cur_mark}
+                       if cur_mark is not None else {}),
                 )
                 db.log_event(
                     conn, target["id"], "reconcile",
@@ -1349,6 +1436,12 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             else:
                 summary["rescued"] += 1
         else:
+            # Skip positions owned by the 15m-crypto executor — it tracks them in
+            # its own table. Importing them as "external" here would burn the main
+            # engine's open-position slots and contaminate its win/loss/P&L stats.
+            # Their cost is added to the account total in _build_account_snapshot.
+            if ticker.split("-")[0] in _CRYPTO15M_SERIES:
+                continue
             with db.get_db() as conn:
                 if db.recent_resolved_position_exists(
                     conn, ticker, side, env,
@@ -1408,6 +1501,110 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             except Exception as e:
                 logger.warning(
                     f"[reconcile] import failed for {ticker} {side}: {e}",
+                )
+
+    # --- Orphan-closing: local "open" positions Kalshi no longer reports ---
+    # A filled position absent from /portfolio/positions has settled or been
+    # sold/closed outside our tracking. Without closing it, it lingers as "open"
+    # forever — burning concurrency slots, inflating the open-count, and
+    # double-counting its cost in the account total. (This is the 7-shown-vs-
+    # 3-held drift, and why a manual Refresh appeared to do nothing.)
+    healthy = nonzero_count > 0
+    field_change_suspected = bool(live) and nonzero_count == 0
+    if not field_change_suspected:
+        for (ticker, side), rows in local_by_key.items():
+            still_held = (ticker, side) in live_by_key
+            for r in rows:
+                pid = r["id"]
+                if still_held:
+                    _orphan_miss_streak.pop(pid, None)
+                    continue
+                if r["status"] != "filled":
+                    # resting/submitted orders aren't positions yet — leave them
+                    # to poll_open_orders, which tracks the order lifecycle.
+                    continue
+                streak = _orphan_miss_streak.get(pid, 0) + 1
+                _orphan_miss_streak[pid] = streak
+                with db.get_db() as conn:
+                    age_row = conn.execute(
+                        "SELECT (strftime('%s','now') - strftime('%s', created_at))"
+                        " AS age FROM bot_positions WHERE id=?",
+                        (pid,),
+                    ).fetchone()
+                age_s = age_row["age"] if age_row and age_row["age"] is not None else 1e9
+                recent = age_s < 180
+                # Stale position + trustworthy data → close on first miss (so a
+                # single Refresh fixes it). Recent fill, or a zero-position
+                # response, needs a confirming second miss.
+                need = 1 if (healthy and not recent) else 2
+                if streak < need:
+                    continue
+
+                filled = int(r["filled_contracts"] or 0)
+                cost_usd = float(r["cost_usd"] or 0.0)
+                is_c15 = ticker.split("-")[0] in _CRYPTO15M_SERIES
+                # crypto15m externals carry their real P&L in their own table;
+                # close them flat to avoid double-counting. Everything else
+                # honors a market settlement if one has posted.
+                yes_payout = None
+                if not is_c15:
+                    try:
+                        market = await fetch_market(ticker)
+                    except Exception:
+                        market = None
+                    yes_payout = _market_yes_payout(market)
+                    if yes_payout is None and market is not None:
+                        mstatus = (market.get("status") or "").lower()
+                        if mstatus in ("closed", "settling", "pending", "determined"):
+                            # Trading ended but the settlement value hasn't posted
+                            # yet — Kalshi drops the position from the book first.
+                            # Defer so the resolution pass assigns the real
+                            # win/loss instead of closing a winner flat.
+                            continue
+                _orphan_miss_streak.pop(pid, None)
+
+                if yes_payout is not None:
+                    our_payout = yes_payout if side == "yes" else (1.0 - yes_payout)
+                    settlement_usd = filled * our_payout
+                    pnl_usd = settlement_usd - cost_usd
+                    pnl_usd = max(-cost_usd, min(float(filled) - cost_usd, pnl_usd))
+                    settlement_usd = pnl_usd + cost_usd
+                    if our_payout >= 0.99:
+                        correct: Optional[int] = 1
+                    elif our_payout <= 0.01:
+                        correct = 0
+                    elif pnl_usd > 0.05:
+                        correct = 1
+                    elif pnl_usd < -0.05:
+                        correct = 0
+                    else:
+                        correct = None
+                    label = "WIN" if correct == 1 else ("LOSS" if correct == 0 else "FLAT")
+                    note = f"orphan-resolved {label} pnl=${pnl_usd:+.2f} (gone from Kalshi)"
+                else:
+                    settlement_usd = 0.0
+                    pnl_usd = 0.0
+                    correct = None
+                    note = "orphan-closed: no longer held on Kalshi"
+
+                with db.get_db() as conn:
+                    db.update_bot_position(
+                        conn, pid, status="gone", resolved=1,
+                        outcome_correct=correct,
+                        settlement_usd=settlement_usd, pnl_usd=pnl_usd,
+                    )
+                    conn.execute(
+                        "UPDATE bot_positions SET resolved_at=datetime('now') WHERE id=?",
+                        (pid,),
+                    )
+                    db.log_event(conn, pid, "reconcile", note=note)
+                    row = db.fetch_position_by_id(conn, pid)
+                if row:
+                    changed.append(row)
+                summary["closed_orphans"] += 1
+                logger.info(
+                    f"[reconcile] CLOSED ORPHAN #{pid} {ticker} {side} "
+                    f"({filled}c cost=${cost_usd:.2f}) — {note}"
                 )
 
     return summary, changed
