@@ -29,12 +29,15 @@ run(VENV_PY, [
   '--hidden-import', 'categorize',
   '--hidden-import', 'config',
   '--hidden-import', 'webhook',
+  '--hidden-import', 'leaderboard',
+  '--hidden-import', 'kalshi_ws',
   '--hidden-import', 'crypto15m',
   '--hidden-import', 'crypto15m_trader',
   '--hidden-import', 'crypto15m_record',
   '--hidden-import', 'backtest',
   '--collect-submodules', 'cryptography',
   '--collect-submodules', 'httpx',
+  '--collect-submodules', 'websockets',
   'service.py',
 ]);
 

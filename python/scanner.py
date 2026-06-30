@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import db
 import kalshi_api
+import kalshi_ws
 from categorize import (
     CATEGORY_EDGE, KALSHI_CATEGORY_MAP, categorize_by_keywords, is_micro_market,
 )
@@ -248,7 +249,11 @@ async def sync_events() -> int:
 
 
 async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
-    raw = await kalshi_api.fetch_recent_trades(limit=1000)
+    # Prefer the real-time WS tape (complete, no 1000-row REST cap / missed
+    # bursts); fall back to the REST snapshot when the socket is cold.
+    raw = kalshi_ws.recent_trades(limit=1000)
+    if raw is None:
+        raw = await kalshi_api.fetch_recent_trades(limit=1000)
     if not raw:
         return 0, []
 
@@ -401,7 +406,9 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
     if not markets:
         return 0, []
 
-    recent_trades = await kalshi_api.fetch_recent_trades(limit=1000)
+    recent_trades = kalshi_ws.recent_trades(limit=1000)
+    if recent_trades is None:
+        recent_trades = await kalshi_api.fetch_recent_trades(limit=1000)
     trades_by_ticker: dict[str, list[dict]] = defaultdict(list)
     for t in recent_trades:
         ticker = t.get("ticker", "")

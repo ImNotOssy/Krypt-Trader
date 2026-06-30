@@ -158,6 +158,13 @@ export function Crypto15mPage() {
             />
           </div>
         </div>
+        {enabled && status?.takeProfitHalted && (
+          <div className="mt-2 text-[11px] text-krypt-win">
+            🎯 Session take-profit reached ({fmtUsd(status.sessionPnlUsd, { sign: true })} ≥ {fmtUsd(status.sessionTakeProfitUsd)}).
+            Not opening new 15-minute bets; open positions are still managed.
+            Restart the app or raise “Stop at profit” to resume.
+          </div>
+        )}
         {enabled && !liveSupported && (
           <div className="mt-2 text-[11px] text-krypt-warn">
             Kalshi's <span className="text-krypt-muted">demo</span> exchange doesn't carry the 15-minute crypto
@@ -300,6 +307,10 @@ const C15_DEFAULTS = {
   entryMax: 0.98,
   exitThreshold: 0.4,
   stopSlippageCents: 0,
+  takeProfitCents: 0,
+  sessionTakeProfitUsd: 0,
+  minRsi: 0,
+  minMacdHist: 0,
   minDeltaPct: 0,
   entryDiff: 0.02,
   entryStyle: 'maker' as 'maker' | 'taker',
@@ -409,6 +420,10 @@ function StrategySettings({
     crypto15mEntryMax: C15_DEFAULTS.entryMax,
     crypto15mExitThreshold: C15_DEFAULTS.exitThreshold,
     crypto15mStopSlippageCents: C15_DEFAULTS.stopSlippageCents,
+    crypto15mTakeProfitCents: C15_DEFAULTS.takeProfitCents,
+    crypto15mSessionTakeProfitUsd: C15_DEFAULTS.sessionTakeProfitUsd,
+    crypto15mMinRsi: C15_DEFAULTS.minRsi,
+    crypto15mMinMacdHist: C15_DEFAULTS.minMacdHist,
     crypto15mMinDeltaPct: C15_DEFAULTS.minDeltaPct,
     crypto15mEntryDiff: C15_DEFAULTS.entryDiff,
     crypto15mEntryStyle: C15_DEFAULTS.entryStyle,
@@ -502,6 +517,18 @@ function StrategySettings({
           onCommit={(v) => void update({ crypto15mMinDeltaPct: v / 100 })}
         />
         <NumField
+          label="Min RSI" suffix="0–100" min={0} max={100} step={1}
+          value={num('crypto15mMinRsi', C15_DEFAULTS.minRsi)}
+          hint="Direction-aware momentum gate: an up-bet needs RSI ≥ this; a down-bet needs RSI ≤ (100 − this). Pair with a wide Entry window to enter early only on strong momentum. Needs Detect MACD/RSI (auto-enabled). 0 = off."
+          onCommit={(v) => void update({ crypto15mMinRsi: Math.round(v), ...(v > 0 ? { crypto15mIndicatorDetect: true } : {}) })}
+        />
+        <NumField
+          label="Min MACD" suffix="|hist|" min={0} max={100000} step={0.5}
+          value={num('crypto15mMinMacdHist', C15_DEFAULTS.minMacdHist)}
+          hint="Direction-aware: an up-bet needs MACD histogram ≥ this; a down-bet needs ≤ −this. Raw price units, so the right value differs per asset (larger for BTC than DOGE — watch the MACD chip on each card). Needs Detect MACD/RSI (auto-enabled). 0 = off."
+          onCommit={(v) => void update({ crypto15mMinMacdHist: v, ...(v > 0 ? { crypto15mIndicatorDetect: true } : {}) })}
+        />
+        <NumField
           label="Stop-loss" suffix="¢" min={0} max={99} step={1}
           value={Math.round(num('crypto15mExitThreshold', C15_DEFAULTS.exitThreshold) * 100)}
           hint="Executor sells if the held side falls to this price. 0 = hold to settlement."
@@ -512,6 +539,18 @@ function StrategySettings({
           value={num('crypto15mStopSlippageCents', C15_DEFAULTS.stopSlippageCents)}
           hint="When the stop-loss sells, price this many cents BELOW the bid so it sweeps the book and fills fast in a drop instead of resting unfilled. 0 = sell at the bid."
           onCommit={(v) => void update({ crypto15mStopSlippageCents: Math.round(v) })}
+        />
+        <NumField
+          label="Take-profit" suffix="¢" min={0} max={99} step={1}
+          value={num('crypto15mTakeProfitCents', C15_DEFAULTS.takeProfitCents)}
+          hint="Sell a winning position once the held side reaches this price. Set it ABOVE your entry price, or it sells the instant a position fills. 0 = off (hold to settlement)."
+          onCommit={(v) => void update({ crypto15mTakeProfitCents: Math.round(v) })}
+        />
+        <NumField
+          label="Stop at profit" suffix="$ / session" min={0} max={1000000} step={5}
+          value={num('crypto15mSessionTakeProfitUsd', C15_DEFAULTS.sessionTakeProfitUsd)}
+          hint="Once this session's realized 15m profit reaches this many dollars, stop opening new 15m bets (open positions keep being managed). Resets when the app restarts. 0 = off."
+          onCommit={(v) => void update({ crypto15mSessionTakeProfitUsd: v })}
         />
         <SelectField
           label="Entry style" value={entryStyle}
@@ -1020,7 +1059,7 @@ function PositionRow({ p }: { p: Crypto15mPosition }) {
         </span>
       </td>
       <td className="text-xs text-krypt-muted">
-        {p.status}{p.exitReason === 'stop_loss' ? ' · stop' : ''}
+        {p.status}{p.exitReason === 'stop_loss' ? ' · stop' : p.exitReason === 'take_profit' ? ' · profit' : ''}
       </td>
       <td className="font-mono text-xs">{p.filledContracts}/{p.targetContracts}</td>
       <td className="font-mono text-xs">{entryC ? `${Math.round(entryC)}¢` : '—'}</td>

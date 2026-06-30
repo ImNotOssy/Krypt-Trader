@@ -8,6 +8,7 @@ import uuid
 
 import httpx
 
+import kalshi_ws
 from kalshi_auth import sign_headers, get_env, sync_server_time, ENV_LOCK
 
 logger = logging.getLogger(__name__)
@@ -440,6 +441,13 @@ def _normalize_orderbook(raw: Any) -> dict:
 
 
 async def get_orderbook(ticker: str) -> dict:
+    # Prefer the real-time WebSocket book when it's live + validated for this
+    # market — it's effectively current vs the ~seconds-stale REST snapshot, and
+    # is what the 15m stop-loss/TP chase reads. Returns None (→ REST) when the
+    # socket is down, the market isn't subscribed, or a seq gap invalidated it.
+    wb = kalshi_ws.orderbook(ticker)
+    if wb is not None and (wb["yes"] or wb["no"]):
+        return wb
     try:
         book = _normalize_orderbook(await _signed_request("GET", f"/markets/{ticker}/orderbook"))
         if book["yes"] or book["no"]:

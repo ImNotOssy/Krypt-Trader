@@ -6,6 +6,7 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -86,6 +87,8 @@ import trader  # noqa: E402
 import crypto15m_trader  # noqa: E402
 import crypto15m_record  # noqa: E402
 import webhook  # noqa: E402
+import leaderboard  # noqa: E402
+import kalshi_ws  # noqa: E402
 from config import DEFAULT_CONFIG, merge_with_defaults  # noqa: E402
 
 
@@ -113,6 +116,10 @@ class State:
     last_trade_scan_at: str | None = None
     started_at: str = ""
     active_run_id: int = 0
+    # Set by the kalshi_ws callbacks to wake an immediate poll/resolve instead of
+    # waiting for the timer (WS pushes the event; REST stays the source of truth).
+    ws_fill_pending: bool = False
+    ws_resolve_pending: bool = False
 
 
 STATE = State()
@@ -468,6 +475,37 @@ def _should_fire_event_webhook(pos_id: int, kind: str) -> bool:
     return True
 
 
+def _on_ws_fill(_msg: dict) -> None:
+    """A WebSocket fill arrived — wake the order poll on the next loop tick
+    instead of waiting out the 30s timer. REST poll remains the accounting
+    truth; this only removes the detection latency."""
+    STATE.ws_fill_pending = True
+
+
+def _on_ws_lifecycle(msg: dict) -> None:
+    """A market was determined/settled — wake the resolution check immediately."""
+    if (msg or {}).get("event_type") in ("determined", "settled"):
+        STATE.ws_resolve_pending = True
+
+
+def _ws_held_tickers() -> set[str]:
+    """Tickers we currently hold/work (open bot positions + open 15m positions),
+    for the env in play — the set the WS subscribes orderbook/ticker/lifecycle to."""
+    env = kalshi_auth.get_env()
+    out: set[str] = set()
+    try:
+        with db.get_db() as conn:
+            for r in db.get_open_bot_positions(conn):
+                if r.get("kalshi_env") == env and r.get("ticker"):
+                    out.add(r["ticker"])
+            for r in db.get_open_crypto15m(conn, env):
+                if r.get("ticker"):
+                    out.add(r["ticker"])
+    except Exception:
+        pass
+    return out
+
+
 async def _scanner_and_trader_loop() -> None:
     last_whale = 0.0
     last_momentum = 0.0
@@ -480,8 +518,22 @@ async def _scanner_and_trader_loop() -> None:
     last_reconcile = 0.0
     last_crypto15m = 0.0
     last_crypto15m_record = 0.0
+    last_ws_subs = 0.0
     last_cleanup = 0.0
     last_stats_push = asyncio.get_event_loop().time()
+    # Anonymous community leaderboard. Base cadence defaults to 30 min and is
+    # overridable for testing via KRYPT_LEADERBOARD_INTERVAL (seconds). A
+    # proportional jitter de-syncs a large user base so they don't all post on
+    # the same minute and overrun the shared webhook. Anchored a full interval
+    # in the past so the first ELIGIBLE report fires promptly once a session is
+    # green — thereafter it's every `leaderboard_interval`.
+    try:
+        _lb_base = float(os.environ.get("KRYPT_LEADERBOARD_INTERVAL", "1800") or 1800)
+    except (TypeError, ValueError):
+        _lb_base = 1800.0
+    _lb_base = max(10.0, _lb_base)
+    leaderboard_interval = _lb_base + random.uniform(0.0, _lb_base * 0.2)
+    last_leaderboard = asyncio.get_event_loop().time() - leaderboard_interval
 
     try:
         cnt = await scanner.sync_markets(max_pages=10)
@@ -493,6 +545,9 @@ async def _scanner_and_trader_loop() -> None:
     while not (_loop_stop and _loop_stop.is_set()):
         now = asyncio.get_event_loop().time()
         cfg = STATE.cfg
+
+        # Keep the WS pointed at the live env (no-op unless it changed).
+        kalshi_ws.set_env(kalshi_auth.get_env())
 
         if STATE.paused:
             await asyncio.sleep(1)
@@ -584,8 +639,10 @@ async def _scanner_and_trader_loop() -> None:
         try:
             if (
                 STATE.auth_ok
-                and now - last_poll >= float(cfg.get("position_poll_interval", 30))
+                and (now - last_poll >= float(cfg.get("position_poll_interval", 30))
+                     or STATE.ws_fill_pending)
             ):
+                STATE.ws_fill_pending = False
                 updated = await trader.poll_open_orders(cfg)
                 last_poll = now
                 for row in updated:
@@ -626,8 +683,10 @@ async def _scanner_and_trader_loop() -> None:
         try:
             if (
                 STATE.auth_ok
-                and now - last_resolve >= float(cfg.get("resolution_check_interval", 300))
+                and (now - last_resolve >= float(cfg.get("resolution_check_interval", 300))
+                     or STATE.ws_resolve_pending)
             ):
+                STATE.ws_resolve_pending = False
                 resolved_pos = await trader.mark_resolved_positions(cfg)
                 await scanner.resolve_alerts_from_markets()
                 await scanner.resolve_whales_from_markets()
@@ -657,7 +716,9 @@ async def _scanner_and_trader_loop() -> None:
                 cfg.get("crypto15m_enabled")
                 and now - last_crypto15m >= float(cfg.get("crypto15m_poll_sec", 4))
             ):
-                await crypto15m_trader.run_tick(cfg, authed=STATE.auth_ok)
+                await crypto15m_trader.run_tick(
+                    cfg, authed=STATE.auth_ok, session_start=STATE.started_at
+                )
                 last_crypto15m = now
         except Exception as e:
             logger.error(f"crypto15m tick error: {e}", exc_info=True)
@@ -686,6 +747,18 @@ async def _scanner_and_trader_loop() -> None:
                 last_cleanup = now
         except Exception as e:
             logger.warning(f"db maintenance failed: {e}")
+
+        # Keep the WS subscribed to exactly the markets we hold/work, so the
+        # stop-loss chase reads a live local book and resolution fires instantly.
+        try:
+            if kalshi_ws.is_connected() and now - last_ws_subs >= 5:
+                held = _ws_held_tickers()
+                kalshi_ws.set_orderbook_markets(held)
+                kalshi_ws.set_ticker_markets(held)
+                kalshi_ws.set_lifecycle_markets(held)
+                last_ws_subs = now
+        except Exception as e:
+            logger.debug(f"ws subscription reconcile error: {e}")
 
         try:
             if now - last_account_emit >= 15:
@@ -744,6 +817,32 @@ async def _scanner_and_trader_loop() -> None:
                 last_stats_push = now
         except Exception as e:
             logger.debug(f"stats webhook scheduler error: {e}")
+
+        # ── anonymous community leaderboard (~30 min) ────────────
+        # Post an ANONYMOUS snapshot (P&L + secret-stripped profile, NO
+        # per-install id) to the Krypt community leaderboard webhooks. Disclosed
+        # in About → Risk & disclosure and the Disclaimer; opt out with
+        # KRYPT_LEADERBOARD=0. Independent of the in-app `enable_discord` toggle
+        # + user webhook URLs (those are for the user's own webhooks). PRODUCTION
+        # only (demo is paper money), and profitable-session-only — maybe_report
+        # sends solely when session P&L > 0 (no startup/always-send report). Re-
+        # jitter the interval after each fire so the population stays de-synced.
+        # Gated on auth_ok so we never report a credential-less instance.
+        try:
+            if (
+                not leaderboard.DISABLED
+                and STATE.auth_ok
+                and kalshi_auth.get_env() == "production"
+                and now - last_leaderboard >= leaderboard_interval
+            ):
+                snap_for_lb = await _build_account_snapshot()
+                await leaderboard.maybe_report(
+                    snap_for_lb, cfg, kalshi_auth.get_env(), STATE.auth_ok,
+                )
+                last_leaderboard = now
+                leaderboard_interval = _lb_base + random.uniform(0.0, _lb_base * 0.2)
+        except Exception as e:
+            logger.debug(f"leaderboard scheduler error: {e}")
 
         await asyncio.sleep(1)
 
@@ -1188,7 +1287,9 @@ async def _h_crypto15m(_p: dict) -> dict:
 
 
 async def _h_crypto15mStatus(_p: dict) -> dict:
-    return await crypto15m_trader.status(STATE.cfg, authed=STATE.auth_ok)
+    return await crypto15m_trader.status(
+        STATE.cfg, authed=STATE.auth_ok, session_start=STATE.started_at
+    )
 
 
 async def _h_kalshiMarketUrl(p: dict) -> dict:
@@ -1300,6 +1401,10 @@ async def _shutdown() -> None:
         await crypto15m.close_clients()
     except Exception:
         pass
+    try:
+        await kalshi_ws.stop()
+    except Exception:
+        pass
     await emit_event("backend:shutdown", {})
     sys.stdout.flush()
     await asyncio.sleep(0.1)
@@ -1364,6 +1469,17 @@ async def _main() -> None:
             await _start_run_if_balance_known(kalshi_auth.get_env(), cents)
         except Exception as e:
             logger.warning(f"could not open bot_run: {e}")
+
+    # Start the real-time WebSocket feed (orderbook/ticker/trade/fill/lifecycle).
+    # Self-gates on credentials and auto-reconnects; a no-op if KRYPT_KALSHI_WS=0
+    # or `websockets` isn't installed. REST polling stays as the fallback.
+    try:
+        kalshi_ws.start(
+            kalshi_auth.get_env(),
+            on_fill=_on_ws_fill, on_lifecycle=_on_ws_lifecycle,
+        )
+    except Exception as e:
+        logger.warning(f"kalshi_ws start failed (staying on REST): {e}")
 
     await _start_loop()
     try:

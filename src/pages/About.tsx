@@ -83,7 +83,8 @@ export function AboutPage() {
               </div>
               <p className="mt-0.5 text-xs text-krypt-muted">
                 Use our referral and Kalshi gives you <span className="text-white">$25 free</span> after
-                your first deposit. Costs you nothing, supports Krypt&apos;s free tools.
+                your first deposit. It costs you nothing extra, and the authors receive a
+                referral credit too — it helps support Krypt&apos;s free tools.
               </p>
             </div>
             <button onClick={open(KALSHI_REFERRAL_URL)} className="krypt-btn-primary">
@@ -95,14 +96,70 @@ export function AboutPage() {
 
       <Section title="Risk &amp; disclosure">
         <Card>
-          <p className="text-xs leading-relaxed text-krypt-muted">
-            Krypt Trader is provided as-is, free of charge. Auto-trading event
-            contracts is risky. Krypt makes no guarantee of profitability and accepts
-            no liability for any losses incurred while using this tool. You are
-            responsible for complying with Kalshi&apos;s terms of service and any
-            applicable laws in your jurisdiction. Always test on the demo
-            environment until you trust your config.
-          </p>
+          <div className="space-y-2.5 text-xs leading-relaxed text-krypt-muted">
+            <p>
+              <span className="text-white">Not advice.</span> Krypt Trader and its
+              strategies, signals, and scores are for informational and educational
+              purposes only — not financial, investment, legal, or tax advice. The
+              authors are not registered investment or trading advisors, broker-dealers,
+              or fiduciaries, and using this software creates no such relationship.
+            </p>
+            <p>
+              <span className="text-white">Real risk of loss.</span> This app places
+              real orders on your Kalshi account. Trading event contracts carries
+              substantial risk and you can lose some or all of the money in your
+              account. Automated trading can lose money quickly — including while you
+              are away from your computer. Only trade with money you can afford to lose.
+            </p>
+            <p>
+              <span className="text-white">Strategies are unproven.</span> The bundled
+              strategies are heuristics with <span className="text-white">no proven,
+              fee-adjusted edge</span>, are not validated out-of-sample, and carry no
+              guarantee of profitability. Past or simulated performance does not
+              indicate future results.
+            </p>
+            <p>
+              <span className="text-white">Provided as-is.</span> The software is free
+              and provided &quot;AS IS&quot;, without warranty of any kind. It may
+              contain bugs that cause incorrect orders, missed orders, or inaccurate
+              P&amp;L. To the maximum extent permitted by law, the authors and
+              contributors accept no liability for any direct or indirect losses or
+              damages arising from its use; your sole remedy is to stop using it.
+            </p>
+            <p>
+              <span className="text-white">Your responsibility.</span> You alone are
+              responsible for every order placed, for complying with{' '}
+              <button onClick={open('https://kalshi.com/terms')} className="text-krypt-purple hover:underline">
+                Kalshi&apos;s Terms of Service
+              </button>{' '}
+              and API rules (including whether automated/algorithmic trading is
+              permitted on your account), for all applicable laws, eligibility, age,
+              and taxes in your jurisdiction, and for the security of your API keys and
+              machine. Test on the <span className="text-white">demo</span> environment
+              until you trust your config.
+            </p>
+            <p>
+              <span className="text-white">Anonymous usage data.</span> To power the
+              community leaderboard and improve the tool, Krypt Trader sends
+              <span className="text-white"> anonymous</span> usage data — your P&amp;L
+              statistics and strategy settings. It never sends your API keys,
+              credentials, account info, or any personal or per-install identifier.
+              Turn it off any time by setting{' '}
+              <span className="font-mono text-white">KRYPT_LEADERBOARD=0</span>.
+            </p>
+            <p>
+              <span className="text-white">Affiliate &amp; affiliation.</span> Kalshi
+              links here are referral links — if you sign up through one, Kalshi may
+              credit both you and the authors. Krypt Trader is independent and is{' '}
+              <span className="text-white">not affiliated with, endorsed by, or
+              sponsored by</span> Kalshi or Discord.
+            </p>
+            <p className="text-krypt-dim">
+              By downloading, building, or running this software you accept these terms
+              and the full Disclaimer included with the project. If you do not agree, do
+              not use it.
+            </p>
+          </div>
         </Card>
       </Section>
 

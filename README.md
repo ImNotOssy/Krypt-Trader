@@ -6,7 +6,7 @@
 
 **A free, open-source Kalshi auto-trading desktop app.**
 
-Whale tracker, momentum scanner and a configurable trading engine in one clean app — your keys and data never leave your machine.
+Whale tracker, momentum scanner and a configurable trading engine in one clean app — your API keys never leave your machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-6366F1)](LICENSE)
 &nbsp;[![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](#download)
@@ -19,7 +19,7 @@ Whale tracker, momentum scanner and a configurable trading engine in one clean a
 
 ---
 
-Krypt Trader watches the public Kalshi markets for whale orders and momentum, scores them with built-in heuristics, and can size and place trades for you — wrapped in a modern desktop UI instead of a script you have to babysit. Your API keys and every trade stay in a local SQLite database on your machine; the only thing it talks to is Kalshi (and CoinGecko for crypto prices).
+Krypt Trader watches the public Kalshi markets for whale orders and momentum, scores them with built-in heuristics, and can size and place trades for you — wrapped in a modern desktop UI instead of a script you have to babysit. Your API keys and every trade stay in a local SQLite database on your machine. It talks to Kalshi and public crypto-price feeds, and sends anonymous, non-identifying usage stats to improve the tool (see the [Disclaimer](DISCLAIMER.md)).
 
 > [!WARNING]
 > **This app places real orders on your Kalshi account — trading carries real financial risk.** The bundled strategies are heuristics with **no proven, fee-adjusted edge** and may lose money. This is **not financial advice**. It ships on Kalshi's **demo** environment with **dry-run on**, so nothing trades for real until you flip both off. Please read the full [**Disclaimer**](DISCLAIMER.md).
@@ -31,7 +31,7 @@ Krypt Trader watches the public Kalshi markets for whale orders and momentum, sc
 - **15-minute crypto** — monitors Kalshi's 15-min BTC, ETH, SOL and other crypto markets with a configurable momentum strategy and an optional paper/live executor.
 - **Auto-trader** — sizes positions by edge, places limit-cross orders, tracks fills and resolutions, and reconciles its book against Kalshi on every restart.
 - **Profiles & Discord** — save, import and export tuned configs, with optional Discord webhooks and Rich Presence.
-- **Local-first** — keys and trade history live under `%APPDATA%/Krypt Trader/`. No account, no telemetry, no middleman server.
+- **Local-first** — keys and trade history live under `%APPDATA%/Krypt Trader/`. No account required; your keys and trades stay local. Sends anonymous, non-identifying usage stats to improve the tool — see the [Disclaimer](DISCLAIMER.md).
 
 ## Safe by default
 
@@ -62,7 +62,7 @@ Requires [Node.js](https://nodejs.org) 18+ and [Python](https://python.org) 3.10
 
 ## Need a Kalshi account?
 
-Sign up through our referral and Kalshi gives you **$25 free** after your first deposit:
+Sign up through our referral and Kalshi gives you **$25 free** after your first deposit (and we receive a referral credit too — it costs you nothing extra):
 <https://kalshi.com/sign-up?referral=e258d0db-6ca0-4efc-8435-3592397ada4c>
 
 ## Links

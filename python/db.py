@@ -1291,6 +1291,30 @@ def crypto15m_stats(conn, env: str) -> dict:
     }
 
 
+def crypto15m_session_realized_pnl(conn, env: str, since: str | None) -> float:
+    """Realized P&L of resolved 15m positions settled at/after `since` — an
+    ISO/SQLite UTC datetime, typically the backend start time. Powers the 15m
+    session take-profit. `since` falsy = the whole history for the env.
+    `datetime(?)` normalises the ISO start to the 'YYYY-MM-DD HH:MM:SS' form
+    that resolved_at is stored in, so the string comparison is valid."""
+    if since:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(pnl_usd), 0) AS pnl
+                 FROM crypto15m_positions
+                WHERE kalshi_env=? AND resolved=1 AND pnl_usd IS NOT NULL
+                  AND resolved_at IS NOT NULL AND resolved_at >= datetime(?)""",
+            (env, since),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(pnl_usd), 0) AS pnl
+                 FROM crypto15m_positions
+                WHERE kalshi_env=? AND resolved=1 AND pnl_usd IS NOT NULL""",
+            (env,),
+        ).fetchone()
+    return float(row["pnl"] or 0.0)
+
+
 
 
 def insert_crypto15m_signal(conn, row: dict) -> bool:

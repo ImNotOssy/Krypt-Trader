@@ -107,6 +107,10 @@ export interface TraderConfig {
   crypto15mEntryMax?: number;
   crypto15mExitThreshold?: number;
   crypto15mStopSlippageCents?: number;
+  crypto15mTakeProfitCents?: number;             // per-bet: sell when the held side reaches this price (¢); 0 = off
+  crypto15mSessionTakeProfitUsd?: number;        // halt new 15m entries once this session's realized 15m P&L hits $this; 0 = off
+  crypto15mMinRsi?: number;                      // direction-aware RSI confirmation (0–100); 0 = off
+  crypto15mMinMacdHist?: number;                 // direction-aware MACD-histogram confirmation (magnitude); 0 = off
   crypto15mMinDeltaPct?: number;
   crypto15mEntryDiff?: number;
   crypto15mEntryStyle?: 'maker' | 'taker';
@@ -491,6 +495,10 @@ export interface Crypto15mStatus {
   authed: boolean;
   orderSize: number;
   maxConcurrent: number;
+  takeProfitCents: number;          // per-bet take-profit price (¢); 0 = off
+  sessionTakeProfitUsd: number;     // session take-profit target ($); 0 = off
+  sessionPnlUsd: number;            // realized 15m P&L since the backend started
+  takeProfitHalted: boolean;        // new entries halted because the session target was reached
   sizing: Crypto15mSizing;
   env: KalshiEnv;
   stats: Crypto15mStats;

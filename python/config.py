@@ -87,7 +87,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Cents BELOW the bid to price a stop-loss SELL so it sweeps depth and fills
     # in a fast drop instead of resting at the top of a falling book. 0 = at bid.
     "crypto15m_stop_slippage_cents": 0,
+    # Per-bet take-profit: sell a winning position once the held side reaches this
+    # price (cents). 0 = off / hold to settlement. Set it ABOVE the entry price or
+    # it sells at a loss the moment a position fills.
+    "crypto15m_take_profit_cents": 0,
+    # Session take-profit: once the 15m executor's realized P&L since the backend
+    # started reaches $this, stop opening NEW 15m entries (open positions keep
+    # being managed). 0 = off. Resets when the app restarts.
+    "crypto15m_session_take_profit_usd": 0.0,
     "crypto15m_min_delta_pct": 0.0,
+    # Direction-aware momentum confirmation layered ON TOP of the built-in
+    # favorite gate (not the rule builder). The underlying MACD/RSI must agree
+    # with the side being bought: an up-bet needs rsi>=min_rsi & macdHist>=min;
+    # a down-bet needs the mirror (rsi<=100-min_rsi & macdHist<=-min). Each 0 =
+    # off. Lets users widen the entry window yet only enter on strong momentum.
+    "crypto15m_min_rsi": 0.0,
+    "crypto15m_min_macd_hist": 0.0,
     "crypto15m_entry_diff": 0.02,
     "crypto15m_entry_style": "maker",
     "crypto15m_maker_cancel_min": 1.0,
@@ -578,6 +593,10 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg["crypto15m_entry_style"] = d["crypto15m_entry_style"]
     cfg["crypto15m_maker_cancel_min"] = _clampf(cfg.get("crypto15m_maker_cancel_min"), 0.0, 15.0, d["crypto15m_maker_cancel_min"])
     cfg["crypto15m_stop_slippage_cents"] = _clampi(cfg.get("crypto15m_stop_slippage_cents"), 0, 50, d["crypto15m_stop_slippage_cents"])
+    cfg["crypto15m_take_profit_cents"] = _clampi(cfg.get("crypto15m_take_profit_cents"), 0, 99, d["crypto15m_take_profit_cents"])
+    cfg["crypto15m_session_take_profit_usd"] = _clampf(cfg.get("crypto15m_session_take_profit_usd"), 0.0, 1e9, d["crypto15m_session_take_profit_usd"])
+    cfg["crypto15m_min_rsi"] = _clampf(cfg.get("crypto15m_min_rsi"), 0.0, 100.0, d["crypto15m_min_rsi"])
+    cfg["crypto15m_min_macd_hist"] = _clampf(cfg.get("crypto15m_min_macd_hist"), 0.0, 1e9, d["crypto15m_min_macd_hist"])
     cfg["crypto15m_hours_start_utc"] = _clampi(cfg.get("crypto15m_hours_start_utc"), 0, 24, d["crypto15m_hours_start_utc"])
     cfg["crypto15m_hours_end_utc"] = _clampi(cfg.get("crypto15m_hours_end_utc"), 0, 24, d["crypto15m_hours_end_utc"])
     cfg["crypto15m_indicator_detect"] = bool(cfg.get("crypto15m_indicator_detect", True))

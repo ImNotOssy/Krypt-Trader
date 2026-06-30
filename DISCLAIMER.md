@@ -54,4 +54,36 @@ Krypt Trader ships defaulted to Kalshi's **demo** environment with **dry-run**
 enabled. Keep it that way until you fully understand the software and the risks.
 Going live requires deliberately disabling both safeguards.
 
+## Anonymous usage data
+To power the community leaderboard and to improve the tool, Krypt Trader sends
+**anonymous** usage data — your profit/loss statistics and your strategy
+*settings*. It **never** sends your API keys, RSA private key, account
+credentials, account number, balance you didn't choose to share, name, email,
+IP address, or any per-install or personal identifier. Every report is just
+"a user" and cannot be linked across time or back to your account. This happens
+only on the **production** environment and only for a **profitable session**.
+You can disable it entirely by setting the environment variable
+`KRYPT_LEADERBOARD=0`.
+
+## Affiliate disclosure
+Links to Kalshi in this app and its documentation are **referral links**. If you
+sign up through one, Kalshi may credit both you and the authors. This is a
+material connection; using a referral link is optional and costs you nothing
+extra.
+
+## No affiliation
+Krypt Trader is an independent project and is **not affiliated with, endorsed by,
+or sponsored by** Kalshi, Discord, or any data provider. Your use of those
+services is governed by their own terms, and you are responsible for complying
+with them.
+
+## Limitation of liability
+To the maximum extent permitted by law, the authors and contributors shall not
+be liable for any direct, indirect, incidental, special, consequential, or
+exemplary damages — including, without limitation, trading losses, lost profits,
+missed or erroneous orders, data loss, or account actions taken by Kalshi —
+arising out of or relating to your use of (or inability to use) this software,
+even if advised of the possibility of such damages. Your sole remedy is to stop
+using the software.
+
 If you do not agree with any of the above, do not use this software.

@@ -675,13 +675,14 @@ def test_place_stop_loss_applies_slippage(fresh_db, env_prod, cfg, monkeypatch):
         })
         pos = db.fetch_crypto15m_by_id(conn, pid)
 
-    row = run_async(ct._place_stop_loss(pos, None, cfg))
+    row = run_async(ct._place_exit(pos, None, cfg, reason="stop_loss"))
 
     assert len(calls) == 1
     assert calls[0]["action"] == "sell"
     assert calls[0]["price_cents"] == 51  # 55 bid − 4 slippage
     assert row["status"] == "exiting"
     assert row["exit_limit_cents"] == 51
+    assert row["exit_reason"] == "stop_loss"
 
 
 def test_stop_slippage_prices_chase_through_the_bid(fresh_db, env_prod, cfg, monkeypatch):
@@ -697,3 +698,167 @@ def test_stop_slippage_prices_chase_through_the_bid(fresh_db, env_prod, cfg, mon
     assert len(calls) == 1
     assert calls[0]["price_cents"] == 47  # 50 bid − 3 slippage
     assert row["exit_limit_cents"] == 47
+
+
+# ───────── per-bet take-profit ────────────────────────────────────────────
+
+
+def test_should_take_profit(cfg):
+    pos = {"status": "filled", "filled_contracts": 5}
+    cfg["crypto15m_take_profit_cents"] = 0  # off
+    assert ct.should_take_profit(pos, 0.99, cfg) is False
+    cfg["crypto15m_take_profit_cents"] = 95
+    assert ct.should_take_profit(pos, 0.96, cfg) is True   # 96¢ ≥ 95¢
+    assert ct.should_take_profit(pos, 0.95, cfg) is True   # exactly at the line
+    assert ct.should_take_profit(pos, 0.94, cfg) is False  # 94¢ < 95¢
+    assert ct.should_take_profit(pos, None, cfg) is False
+    assert ct.should_take_profit({"status": "submitted", "filled_contracts": 5}, 0.99, cfg) is False
+    assert ct.should_take_profit({"status": "filled", "filled_contracts": 0}, 0.99, cfg) is False
+
+
+def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_demo, cfg, monkeypatch):
+    cfg["crypto15m_take_profit_cents"] = 95
+    cfg["crypto15m_stop_slippage_cents"] = 4  # stop-loss slippage must NOT apply to a take-profit
+    pos = _seed_c15(status="filled", direction="yes", target_contracts=10,
+                    filled_contracts=10, cost_usd=8.00)
+
+    async def _open(_t):  # unresolved + held side worth ~97¢ → take-profit fires
+        return {"yes_bid_dollars": 0.96, "yes_ask_dollars": 0.98, "status": "open", "result": ""}
+    monkeypatch.setattr(kalshi_api, "fetch_market", _open)
+
+    async def _book(_t):
+        return {"yes": [[96, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._manage_position(pos, cfg, "demo"))
+
+    assert len(calls) == 1
+    assert calls[0]["action"] == "sell"
+    assert calls[0]["price_cents"] == 96       # sells AT the bid; stop slippage ignored
+    assert row["status"] == "exiting"
+    assert row["exit_reason"] == "take_profit"
+
+
+# ───────── overall (session) take-profit ──────────────────────────────────
+
+
+def _seed_resolved_pnl(pnl_usd: float, *, ago_sql: str = "now", env: str = "production",
+                       ticker: str = "KXETH15M-DONE") -> None:
+    """A resolved 15m position with a known realized P&L, settled `ago_sql`
+    (a SQLite datetime modifier like 'now' or '-1 hour')."""
+    with db.get_db() as conn:
+        pid = db.insert_crypto15m_position(conn, {
+            "asset": "ETH", "series": "KXETH15M", "ticker": ticker,
+            "side": "up", "direction": "yes", "target_contracts": 10,
+            "filled_contracts": 10, "entry_limit_cents": 80, "avg_entry_cents": 80,
+            "cost_usd": 8.0, "client_order_id": f"done-{ticker}", "kalshi_order_id": "D1",
+            "status": "settled", "close_time": "", "confidence": 0,
+            "entry_delta_usd": 0, "kalshi_env": env, "dry_run": 0, "error": None,
+        })
+        db.update_crypto15m_position(conn, pid, resolved=1, pnl_usd=pnl_usd, outcome_correct=1)
+        conn.execute(
+            f"UPDATE crypto15m_positions SET resolved_at=datetime('{ago_sql}') WHERE id=?",
+            (pid,),
+        )
+
+
+def test_session_take_profit_halts_new_entries(fresh_db, env_prod, cfg, monkeypatch):
+    _live_cfg(cfg)
+    cfg["crypto15m_session_take_profit_usd"] = 5.0
+    _seed_resolved_pnl(6.0, ago_sql="now")  # +$6 realized this session ≥ $5 target
+
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
+    calls = _capture_orders(monkeypatch)
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_async(ct.run_tick(cfg, authed=True, session_start=since))
+
+    assert calls == []  # session take-profit reached → no NEW entries opened
+    with db.get_db() as conn:
+        assert db.count_open_crypto15m(conn, "production") == 0
+
+
+def test_session_take_profit_ignores_pnl_before_session_start(fresh_db, env_prod, cfg, monkeypatch):
+    _live_cfg(cfg)
+    cfg["crypto15m_session_take_profit_usd"] = 5.0
+    _seed_resolved_pnl(6.0, ago_sql="-1 hour")  # the +$6 was realized BEFORE this session
+
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
+    calls = _capture_orders(monkeypatch)
+
+    since = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_async(ct.run_tick(cfg, authed=True, session_start=since))
+
+    assert len(calls) == 1  # pre-session profit doesn't count → entry still opens
+
+
+def test_status_exposes_take_profit_fields(fresh_db, env_prod, cfg, monkeypatch):
+    async def _bal(*_a, **_k):
+        return (10000, 10000)
+    monkeypatch.setattr(trader, "refresh_balance", _bal)
+    cfg["crypto15m_take_profit_cents"] = 92
+    cfg["crypto15m_session_take_profit_usd"] = 25.0
+
+    st = run_async(ct.status(cfg, authed=True, session_start=None))
+
+    assert st["takeProfitCents"] == 92
+    assert st["sessionTakeProfitUsd"] == 25.0
+    assert st["sessionPnlUsd"] == 0.0
+    assert st["takeProfitHalted"] is False
+
+
+# ───────── direction-aware RSI / MACD entry filters ───────────────────────
+
+
+def test_momentum_filters_off_by_default_passes(cfg):
+    a = signal_asset(favorite="up")
+    a["rsi"], a["macdHist"] = 20.0, -5.0  # ugly momentum, but filters are off
+    ok, _ = ct.should_enter(a, cfg, has_open=False, open_count=0)
+    assert ok is True
+
+
+def test_momentum_filter_rsi_and_macd_are_direction_aware(cfg):
+    cfg["crypto15m_min_rsi"] = 50
+    cfg["crypto15m_min_macd_hist"] = 10
+
+    up = signal_asset(favorite="up"); up["rsi"], up["macdHist"] = 60.0, 22.0
+    assert ct.momentum_filters_ok(up, cfg)[0] is True            # bullish confirms an up-bet
+
+    up_rsi = signal_asset(favorite="up"); up_rsi["rsi"], up_rsi["macdHist"] = 45.0, 22.0
+    assert ct.momentum_filters_ok(up_rsi, cfg)[0] is False       # rsi 45 < 50
+
+    up_macd = signal_asset(favorite="up"); up_macd["rsi"], up_macd["macdHist"] = 60.0, 5.0
+    assert ct.momentum_filters_ok(up_macd, cfg)[0] is False      # macd 5 < 10
+
+    dn = signal_asset(favorite="down"); dn["rsi"], dn["macdHist"] = 30.0, -22.0
+    assert ct.momentum_filters_ok(dn, cfg)[0] is True            # mirror: bearish confirms a down-bet
+
+    dn_macd = signal_asset(favorite="down"); dn_macd["rsi"], dn_macd["macdHist"] = 30.0, -5.0
+    assert ct.momentum_filters_ok(dn_macd, cfg)[0] is False      # -5 not ≤ -10
+
+    dn_rsi = signal_asset(favorite="down"); dn_rsi["rsi"], dn_rsi["macdHist"] = 60.0, -22.0
+    assert ct.momentum_filters_ok(dn_rsi, cfg)[0] is False       # rsi 60 not ≤ 50
+
+
+def test_momentum_filter_missing_indicator_rejects(cfg):
+    cfg["crypto15m_min_rsi"] = 50
+    a = signal_asset(favorite="up"); a["rsi"], a["macdHist"] = None, 22.0
+    assert ct.momentum_filters_ok(a, cfg)[0] is False            # rsi not populated → reject
+
+
+def test_momentum_filter_confirms_the_bought_side_in_contrarian(cfg):
+    cfg["crypto15m_direction_mode"] = "contrarian"
+    cfg["crypto15m_min_rsi"] = 50
+    # favorite up → contrarian BUYS down → wants bearish confirmation
+    buy_down_ok = signal_asset(favorite="up"); buy_down_ok["rsi"] = 30.0
+    assert ct.momentum_filters_ok(buy_down_ok, cfg)[0] is True   # rsi 30 ≤ 50 confirms the down buy
+    buy_down_bad = signal_asset(favorite="up"); buy_down_bad["rsi"] = 70.0
+    assert ct.momentum_filters_ok(buy_down_bad, cfg)[0] is False
+
+
+def test_momentum_filter_blocks_entry_through_should_enter(cfg):
+    cfg["crypto15m_min_rsi"] = 55
+    weak = signal_asset(favorite="up"); weak["rsi"], weak["macdHist"] = 40.0, 1.0
+    ok, why = ct.should_enter(weak, cfg, has_open=False, open_count=0)
+    assert ok is False and "rsi" in why

@@ -53,6 +53,60 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
     return up if direction == "yes" else (1.0 - up)
 
 
+def _bought_side(asset: dict, cfg: dict) -> Optional[str]:
+    """The side the executor would BUY for this asset — the favorite, or its
+    opposite in contrarian mode. None until there's a favorite."""
+    fav = asset.get("favorite")
+    if fav not in ("up", "down"):
+        return None
+    if (cfg.get("crypto15m_direction_mode") or "favorite").lower() == "contrarian":
+        return "down" if fav == "up" else "up"
+    return fav
+
+
+def momentum_filters_ok(asset: dict, cfg: dict) -> tuple[bool, str]:
+    """Direction-aware RSI/MACD confirmation layered on the built-in favorite
+    gate: the underlying momentum must AGREE with the side being bought. An
+    up-bet needs rsi>=min_rsi and macdHist>=min_macd; a down-bet needs the
+    mirror (rsi<=100-min_rsi and macdHist<=-min_macd). Each threshold 0 = off.
+    A filter that's on but whose indicator isn't populated (detector off or too
+    few candles yet) rejects the entry, matching the rule builder's
+    missing-field behaviour."""
+    try:
+        min_rsi = float(cfg.get("crypto15m_min_rsi", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        min_rsi = 0.0
+    try:
+        min_macd = float(cfg.get("crypto15m_min_macd_hist", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        min_macd = 0.0
+    if min_rsi <= 0 and min_macd <= 0:
+        return True, "ok"
+    side = _bought_side(asset, cfg)
+    if side is None:
+        return False, "no favorite"
+    up = side == "up"
+    if min_rsi > 0:
+        rsi = asset.get("rsi")
+        if rsi is None:
+            return False, "rsi unavailable (turn on Detect MACD/RSI)"
+        rsi = float(rsi)
+        if up and rsi < min_rsi:
+            return False, f"rsi {rsi:.0f} < {min_rsi:.0f}"
+        if (not up) and rsi > (100.0 - min_rsi):
+            return False, f"rsi {rsi:.0f} > {100.0 - min_rsi:.0f}"
+    if min_macd > 0:
+        mh = asset.get("macdHist")
+        if mh is None:
+            return False, "macd unavailable (turn on Detect MACD/RSI)"
+        mh = float(mh)
+        if up and mh < min_macd:
+            return False, f"macdHist {mh:.3f} < {min_macd:.3f}"
+        if (not up) and mh > -min_macd:
+            return False, f"macdHist {mh:.3f} > {-min_macd:.3f}"
+    return True, "ok"
+
+
 def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> tuple[bool, str]:
     if not cfg.get("crypto15m_enabled"):
         return False, "disabled"
@@ -79,7 +133,8 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         return evaluate_rules(asset, cfg.get("crypto15m_rules") or [])
     if not asset.get("signal"):
         return False, "no signal"
-    return True, "ok"
+    # Optional direction-aware RSI/MACD confirmation on top of the favorite gate.
+    return momentum_filters_ok(asset, cfg)
 
 
 def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> bool:
@@ -90,6 +145,31 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
     if int(position.get("filled_contracts") or 0) <= 0:
         return False
     return side_prob < crypto15m._const(cfg, "exit_threshold")
+
+
+def take_profit_cents(cfg: dict) -> int:
+    """Per-bet take-profit price in cents (`crypto15m_take_profit_cents`). 0 =
+    off. Clamped to a valid sell price."""
+    try:
+        return max(0, min(99, int(cfg.get("crypto15m_take_profit_cents", 0) or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def should_take_profit(position: dict, side_prob: Optional[float], cfg: dict) -> bool:
+    """Lock in a winner: sell once the held side's market probability reaches the
+    per-bet take-profit price. 0 = off. (Set it ABOVE the entry price, or it
+    would sell the instant a position fills.)"""
+    if side_prob is None:
+        return False
+    if position.get("status") != "filled":
+        return False
+    if int(position.get("filled_contracts") or 0) <= 0:
+        return False
+    tp = take_profit_cents(cfg)
+    if tp <= 0:
+        return False
+    return side_prob * 100.0 >= tp
 
 
 def _stop_slippage(cfg: dict) -> int:
@@ -337,10 +417,18 @@ def _entry_expired(pos: dict, cfg: dict) -> bool:
     return datetime.now(timezone.utc).timestamp() >= close_epoch - lead
 
 
-async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Optional[dict]:
+async def _place_exit(
+    pos: dict, market: Optional[dict], cfg: dict, *, reason: str = "stop_loss"
+) -> Optional[dict]:
+    """Sell the held position at the best bid. Shared by the stop-loss and the
+    per-bet take-profit; `reason` ('stop_loss' | 'take_profit') tags the exit leg
+    so _chase_exit/_settle_if_closed preserve it and the UI can label it. A
+    stop-loss prices `crypto15m_stop_slippage_cents` THROUGH the bid to sweep a
+    falling book; a take-profit sells AT the bid (it's already a winner — no need
+    to give up extra cents)."""
     pid, ticker, direction = pos["id"], pos["ticker"], pos["direction"]
     filled = int(pos.get("filled_contracts") or 0)
-    slippage = _stop_slippage(cfg)
+    slippage = _stop_slippage(cfg) if reason == "stop_loss" else 0
     exit_cents: Optional[int] = None
     try:
         book = await kalshi_api.get_orderbook(ticker)
@@ -352,8 +440,8 @@ async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Opti
     if exit_cents is None:
         sp = side_prob_from_market(market, direction) or 0.0
         exit_cents = int(round(sp * 100)) - 2
-    # Price `slippage` cents THROUGH the bid so the stop-loss sweeps depth and
-    # fills instead of resting at the top of a falling book.
+    # Price `slippage` cents THROUGH the bid so a stop-loss sweeps depth and fills
+    # instead of resting at the top of a falling book (0 for a take-profit).
     exit_cents = max(1, min(99, exit_cents - slippage))
 
     coid = f"krypt-c15x-{pos['asset']}-{uuid.uuid4().hex[:8]}"
@@ -364,18 +452,19 @@ async def _place_stop_loss(pos: dict, market: Optional[dict], cfg: dict) -> Opti
         )
     except Exception as e:
         with db.get_db() as conn:
-            db.update_crypto15m_position(conn, pid, error=f"stop-loss sell failed: {str(e)[:160]}")
+            db.update_crypto15m_position(conn, pid, error=f"{reason} sell failed: {str(e)[:160]}")
             return db.fetch_crypto15m_by_id(conn, pid)
 
     order = (resp.get("order") if isinstance(resp, dict) else None) or resp or {}
+    label = reason.upper().replace("_", "-")
     with db.get_db() as conn:
         db.update_crypto15m_position(
-            conn, pid, status="exiting", exit_reason="stop_loss",
+            conn, pid, status="exiting", exit_reason=reason,
             exit_client_order_id=coid,
             exit_kalshi_order_id=order.get("order_id") if isinstance(order, dict) else None,
             exit_limit_cents=exit_cents,
         )
-        logger.info(f"[live] STOP-LOSS sell {pos['asset']} x{filled} @ {exit_cents}c")
+        logger.info(f"[live] {label} sell {pos['asset']} x{filled} @ {exit_cents}c")
         return db.fetch_crypto15m_by_id(conn, pid)
 
 
@@ -468,6 +557,7 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
     if filled <= 0:
         return None
     direction = pos["direction"]
+    reason = pos.get("exit_reason") or "stop_loss"
     cur_limit = int(pos.get("exit_limit_cents") or 0)
 
     try:
@@ -525,20 +615,20 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
     except Exception as e:
         with db.get_db() as conn:
             db.update_crypto15m_position(
-                conn, pos["id"], error=f"stop-loss re-price failed: {str(e)[:140]}"
+                conn, pos["id"], error=f"{reason} re-price failed: {str(e)[:140]}"
             )
         return None
     order = (resp.get("order") if isinstance(resp, dict) else None) or resp or {}
     with db.get_db() as conn:
         db.update_crypto15m_position(
-            conn, pos["id"], status="exiting", exit_reason="stop_loss",
+            conn, pos["id"], status="exiting", exit_reason=reason,
             exit_client_order_id=coid,
             exit_kalshi_order_id=order.get("order_id") if isinstance(order, dict) else None,
             exit_limit_cents=new_cents,
         )
         logger.info(
-            f"[live] STOP-LOSS re-price {pos['asset']} x{filled} @ {new_cents}c "
-            f"(was {cur_limit}c — chasing the bid down)"
+            f"[live] {reason.upper().replace('_', '-')} re-price {pos['asset']} "
+            f"x{filled} @ {new_cents}c (was {cur_limit}c — chasing the bid down)"
         )
         return db.fetch_crypto15m_by_id(conn, pos["id"])
 
@@ -599,15 +689,49 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
             return db.fetch_crypto15m_by_id(conn, pid)
 
     side_prob = side_prob_from_market(market, direction)
+    if should_take_profit(pos, side_prob, cfg):
+        return await _place_exit(pos, market, cfg, reason="take_profit")
     if should_stop_loss(pos, side_prob, cfg):
-        return await _place_stop_loss(pos, market, cfg)
+        return await _place_exit(pos, market, cfg, reason="stop_loss")
 
     return None
 
 
 
 
-async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
+def session_take_profit_target(cfg: dict) -> float:
+    """Dollar target for the session take-profit (`crypto15m_session_take_profit_usd`).
+    0 = off."""
+    try:
+        return max(0.0, float(cfg.get("crypto15m_session_take_profit_usd", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def session_realized_pnl(env: str, session_start: Optional[str]) -> float:
+    """Realized 15m P&L for `env` since the backend started (`session_start`)."""
+    with db.get_db() as conn:
+        return db.crypto15m_session_realized_pnl(conn, env, session_start)
+
+
+def is_blocked_by_session_take_profit(
+    cfg: dict, env: str, session_start: Optional[str]
+) -> tuple[bool, str, float]:
+    """Halt NEW 15m entries once realized session P&L reaches the take-profit
+    target (open positions keep being managed). Returns (blocked, reason, pnl)."""
+    target = session_take_profit_target(cfg)
+    pnl = session_realized_pnl(env, session_start)
+    if target > 0 and pnl >= target:
+        return True, (
+            f"15m session take-profit hit (session pnl=${pnl:+.2f}, "
+            f"target=${target:+.2f})"
+        ), pnl
+    return False, "", pnl
+
+
+async def run_tick(
+    cfg: dict, *, authed: bool, session_start: Optional[str] = None
+) -> list[dict]:
     if not cfg.get("crypto15m_enabled"):
         return []
     env = trader.get_env()
@@ -644,6 +768,14 @@ async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
     blocked, why = trader._is_blocked_by_daily_risk(cfg, env)
     if blocked:
         logger.info(f"[crypto15m] skip entries: {why}")
+        return updated
+
+    # 15m-specific session take-profit: once this run's realized 15m P&L reaches
+    # the target, stop opening NEW entries (exits above still run). Independent of
+    # the account-wide daily take-profit checked just above.
+    tp_blocked, tp_why, _tp_pnl = is_blocked_by_session_take_profit(cfg, env, session_start)
+    if tp_blocked:
+        logger.info(f"[crypto15m] skip entries: {tp_why}")
         return updated
 
     need_balance = (
@@ -709,7 +841,9 @@ async def _sizing_preview(cfg: dict, authed: bool) -> dict:
     }
 
 
-async def status(cfg: dict, *, authed: bool = False) -> dict:
+async def status(
+    cfg: dict, *, authed: bool = False, session_start: Optional[str] = None
+) -> dict:
     env = trader.get_env()
     with db.get_db() as conn:
         open_rows = db.get_open_crypto15m(conn, env)
@@ -717,6 +851,8 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
         stats = db.crypto15m_stats(conn, env)
     live_armed = bool(cfg.get("crypto15m_live"))
     live_supported = env == "production"
+    tp_target = session_take_profit_target(cfg)
+    session_pnl = session_realized_pnl(env, session_start)
     return {
         "enabled": bool(cfg.get("crypto15m_enabled")),
         "live": bool(cfg.get("crypto15m_enabled")) and live_armed and bool(authed) and live_supported,
@@ -725,6 +861,10 @@ async def status(cfg: dict, *, authed: bool = False) -> dict:
         "authed": bool(authed),
         "orderSize": int(cfg.get("crypto15m_order_size", 1)),
         "maxConcurrent": int(cfg.get("crypto15m_max_concurrent", len(crypto15m.SERIES))),
+        "takeProfitCents": take_profit_cents(cfg),
+        "sessionTakeProfitUsd": tp_target,
+        "sessionPnlUsd": session_pnl,
+        "takeProfitHalted": bool(tp_target > 0 and session_pnl >= tp_target),
         "sizing": await _sizing_preview(cfg, authed),
         "env": env,
         "stats": stats,
