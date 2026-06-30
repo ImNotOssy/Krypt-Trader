@@ -5,7 +5,9 @@ import { ensureVenv, run, VENV_PY, PY_DIR } from './python-utils.mjs';
 ensureVenv();
 
 console.log('>> Installing PyInstaller');
-run(VENV_PY, ['-m', 'pip', 'install', 'pyinstaller==6.6.0', '--disable-pip-version-check']);
+// Range, not an exact pin: an exact pin (==6.6.0) rotted out of PyPI for the CI
+// runners' Python, failing the build. Any 6.x works for our usage.
+run(VENV_PY, ['-m', 'pip', 'install', 'pyinstaller>=6.6,<7', '--disable-pip-version-check']);
 
 console.log('>> Cleaning previous build');
 for (const d of ['build', 'dist']) {
