@@ -4,10 +4,26 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Webhooks may be set by importing a shared profile, so only allow https POSTs to
+# real Discord webhook hosts. A fixed allowlist also blocks SSRF to internal /
+# loopback targets (they can never match) and exfiltration to an attacker host.
+_ALLOWED_WEBHOOK_HOSTS = frozenset({
+    "discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com",
+})
+
+
+def _is_allowed_webhook(url: str) -> bool:
+    try:
+        u = urlparse(url)
+    except (ValueError, TypeError):
+        return False
+    return u.scheme == "https" and (u.hostname or "").lower() in _ALLOWED_WEBHOOK_HOSTS
 
 COLOR = {
     "placed":   0x6366F1,
@@ -52,6 +68,12 @@ def _fmt_cents(v) -> str:
 
 async def _post(url: str, payload: dict) -> None:
     if not url:
+        return
+    if not _is_allowed_webhook(url):
+        logger.warning(
+            "Refusing to send webhook to non-Discord/insecure URL "
+            f"({urlparse(url).hostname or url!r}); only https Discord webhooks are allowed."
+        )
         return
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:

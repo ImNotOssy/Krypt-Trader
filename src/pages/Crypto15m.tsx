@@ -6,7 +6,7 @@ import type {
 } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
-import { Empty, NameDialog, Page, Switch } from '../components/common';
+import { Empty, NameDialog, Page, Switch, useOptimisticValue } from '../components/common';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtUsd } from '../utils/format';
 
@@ -228,12 +228,18 @@ function AssetTradeToggles({
   onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
 }) {
   // null/undefined crypto15mAssets = all enabled. Toggling builds an explicit
-  // list; the executor only opens NEW positions on enabled assets.
-  const enabled = config?.crypto15mAssets ?? C15_ALL_ASSETS;
+  // list; the executor only opens NEW positions on enabled assets. Optimistic
+  // local copy so two quick toggles don't both build on a stale config and
+  // revert each other.
+  const [local, apply] = useOptimisticValue<string[] | null>(
+    config?.crypto15mAssets ?? null,
+    (next) => onPatch({ crypto15mAssets: next ?? [] }),
+  );
+  const enabled = local ?? C15_ALL_ASSETS;
   const toggle = (s: string): void => {
-    const cur = config?.crypto15mAssets ?? [...C15_ALL_ASSETS];
+    const cur = local ?? [...C15_ALL_ASSETS];
     const next = cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s];
-    void onPatch({ crypto15mAssets: next });
+    apply(next);
   };
   return (
     <div className="mb-3 flex flex-wrap items-center gap-1.5 rounded-xl border border-krypt-border bg-krypt-surface p-3">
@@ -619,9 +625,12 @@ function RuleBuilder({
   update: (patch: Partial<TraderConfig>) => void | Promise<void>;
 }) {
   const useRules = !!config?.crypto15mUseRules;
-  const rules = config?.crypto15mRules ?? [];
-
-  const setRules = (next: RuleCondition[]) => void update({ crypto15mRules: next });
+  // Optimistic local copy — add/edit/remove on a rule list otherwise rebuilt
+  // each call from a stale config round-trip, so fast edits clobbered earlier ones.
+  const [rules, setRules] = useOptimisticValue<RuleCondition[]>(
+    config?.crypto15mRules ?? [],
+    (next) => update({ crypto15mRules: next }),
+  );
   const addRule = () => setRules([...rules, { field: 'rsi', op: '<', value: 30 }]);
   const removeRule = (i: number) => setRules(rules.filter((_, idx) => idx !== i));
   const patchRule = (i: number, patch: Partial<RuleCondition>) =>

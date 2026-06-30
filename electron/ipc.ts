@@ -29,7 +29,13 @@ const err = (message: string): ActionResult => ({ ok: false, message });
 // Profiles store a full config snapshot, but applying one only patches the
 // slice for its engine — so a main profile never disturbs the 15m crypto
 // settings and vice-versa, and neither re-arms the env / live switches.
-const MAIN_EXCLUDE = new Set(['kalshiEnv', 'enableTrading']);
+// Webhook URLs are excluded too: profiles can be exported/imported and shared,
+// so applying one must never silently redirect (or inject) a Discord webhook
+// that exfiltrates balance/P&L/positions.
+const MAIN_EXCLUDE = new Set([
+  'kalshiEnv', 'enableTrading',
+  'eventWebhookUrl', 'statsWebhookUrl', 'whaleWebhookUrl', 'momentumWebhookUrl',
+]);
 const CRYPTO_ARM_EXCLUDE = new Set(['crypto15mEnabled', 'crypto15mLive']);
 
 const isCrypto15mKey = (k: string): boolean => k.startsWith('crypto15m');

@@ -43,6 +43,12 @@ class PythonBackend {
     this.requestedStop = false;
     this.gaveUp = false;
     this.restartAttempts = 0;
+    // Cancel any pending auto-restart so it can't fire AFTER we spawn here and
+    // bring up a second backend (two live backends both place real orders).
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     this.startChild();
   }
 
@@ -214,6 +220,21 @@ class PythonBackend {
   }
 
   private startChild(): void {
+    // Exclusive spawn: never allow two backends. If a child somehow still exists
+    // (restart race), detach its listeners and hard-kill it BEFORE spawning —
+    // otherwise an orphaned backend keeps trading and both feed the shared
+    // stdout buffer, corrupting JSON-RPC framing.
+    if (this.child) {
+      const stale = this.child;
+      this.child = null;
+      try {
+        stale.stdout?.removeAllListeners();
+        stale.stderr?.removeAllListeners();
+        stale.removeAllListeners();
+        stale.kill('SIGKILL');
+      } catch {
+      }
+    }
     this.setStatus('starting');
     const userData = app.getPath('userData');
     for (const sub of ['logs', 'data', 'credentials']) {
@@ -317,6 +338,9 @@ class PythonBackend {
     const delay = Math.min(2000 * this.restartAttempts, 20_000);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
+      // A stop()/start() may have raced in during the backoff window — don't
+      // resurrect a backend that was asked to stop or already respawned.
+      if (this.requestedStop || this.gaveUp || this.child) return;
       this.startChild();
     }, delay);
   }

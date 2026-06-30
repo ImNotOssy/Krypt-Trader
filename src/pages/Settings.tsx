@@ -6,7 +6,9 @@ import {
 import type { TraderConfig } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
-import { Card, NameDialog, NumberInput, Page, PercentInput, Section, Switch } from '../components/common';
+import {
+  Card, NameDialog, NumberInput, Page, PercentInput, Section, Switch, useOptimisticValue,
+} from '../components/common';
 import { cls } from '../utils/format';
 import { computeTradeWarnings } from '../utils/warnings';
 
@@ -148,10 +150,15 @@ export function SettingsPage() {
             <div className="flex flex-col gap-2">
               <Switch
                 label="Auto-trading enabled"
-                description="Master kill switch. When off, signals stream in but no orders are placed. To test risk-free, run on the Demo environment above."
+                description="Controls the main signal bot (whales/momentum). When off, signals still stream in but the main bot places no orders. The 15-minute crypto executor is separate and has its own arm switch on the 15m Crypto page — this toggle does not stop it. To test risk-free, run on the Demo environment above."
                 checked={config.enableTrading}
                 onChange={(v) => void update('enableTrading', v)}
               />
+              {config.crypto15mEnabled && config.crypto15mLive && config.kalshiEnv === 'production' && (
+                <p className="krypt-help text-krypt-warn">
+                  Heads up: the 15-minute crypto executor is armed LIVE and trades independently of this switch.
+                </p>
+              )}
             </div>
           </div>
         </Card>
@@ -727,26 +734,25 @@ function Field({
 function CategoryPicker({
   value, onChange,
 }: { value: string[] | null; onChange: (v: string[] | null) => void }) {
-  const allEnabled = value === null;
-  const selected = new Set(value ?? []);
+  // Optimistic local copy so rapid toggles build on each other instead of on a
+  // stale `config` round-trip (which silently reverted earlier clicks).
+  const [local, apply] = useOptimisticValue(value, onChange);
+  const allEnabled = local === null;
+  const selected = new Set(local ?? []);
 
   const toggleAll = (): void => {
-    onChange(allEnabled ? [] : null);
+    apply(allEnabled ? [] : null);
   };
 
   const toggleOne = (id: string): void => {
     if (allEnabled) {
-      onChange([id]);
+      apply([id]);
       return;
     }
     const next = new Set(selected);
     if (next.has(id)) next.delete(id);
     else next.add(id);
-    if (next.size === KRYPT_CATEGORIES.length) {
-      onChange(null);
-    } else {
-      onChange(Array.from(next));
-    }
+    apply(next.size === KRYPT_CATEGORIES.length ? null : Array.from(next));
   };
 
   return (
@@ -817,12 +823,13 @@ const DAYS = [
 function DayPicker({
   value, onChange,
 }: { value: string[]; onChange: (v: string[]) => void }) {
-  const set = new Set(value);
+  const [local, apply] = useOptimisticValue(value, onChange);
+  const set = new Set(local);
   const toggle = (id: string) => {
     const next = new Set(set);
     if (next.has(id)) next.delete(id);
     else next.add(id);
-    onChange(DAYS.filter((d) => next.has(d.id)).map((d) => d.id));
+    apply(DAYS.filter((d) => next.has(d.id)).map((d) => d.id));
   };
   return (
     <div className="flex flex-wrap gap-1.5">

@@ -637,6 +637,15 @@ async def run_tick(cfg: dict, *, authed: bool) -> list[dict]:
     if not live:
         return updated
 
+    # The daily stop-loss / take-profit is an account-wide loss limit, so it must
+    # cover the 15m executor too — otherwise it keeps opening live positions after
+    # the main bot has halted for the day. Exits above already ran; only block
+    # NEW entries here.
+    blocked, why = trader._is_blocked_by_daily_risk(cfg, env)
+    if blocked:
+        logger.info(f"[crypto15m] skip entries: {why}")
+        return updated
+
     need_balance = (
         (cfg.get("crypto15m_sizing_mode") or "fixed").lower() == "balance_pct"
         or float(cfg.get("crypto15m_max_loss_pct") or 0.0) > 0.0

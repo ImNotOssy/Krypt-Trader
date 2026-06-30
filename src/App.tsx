@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { TitleBar } from './components/TitleBar';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
+import { Crypto15mLiveBanner } from './components/Crypto15mLiveBanner';
 import { AppStateProvider, useApp } from './state/AppStateProvider';
 import { ToastProvider } from './state/ToastProvider';
 import { OnboardingModal } from './pages/Onboarding';
@@ -52,6 +53,7 @@ function Shell() {
         <Sidebar page={page} setPage={setPage} />
         <main className="relative flex flex-1 flex-col overflow-hidden">
           <TopBar />
+          <Crypto15mLiveBanner />
           <div className="flex-1 overflow-hidden bg-krypt-radial-r">
             <PageRouter page={page} setPage={setPage} />
           </div>

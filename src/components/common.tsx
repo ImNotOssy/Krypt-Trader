@@ -282,6 +282,37 @@ export function Switch({
   );
 }
 
+/**
+ * Local-optimistic mirror of a config-backed value, for multi-step editors
+ * (multi-selects, day/category pickers, list builders).
+ *
+ * Without this, every edit recomputes the whole value from the last-broadcast
+ * `config` prop — but `config.update` is an async IPC round-trip, so two quick
+ * edits both build on the pre-first-edit snapshot and the first silently
+ * reverts ("I unchecked two boxes but the first re-checked itself"). Editing
+ * `local` makes each step build on the previous one. We re-seed from the prop
+ * only when the external value genuinely changes (compared by JSON), so the
+ * backend echoing our own write back is a no-op and never snaps a pending edit
+ * away — the same self-snap-back this file's scalar inputs already guard for.
+ */
+export function useOptimisticValue<T>(
+  value: T,
+  onCommit: (next: T) => void | Promise<void>,
+): [T, (next: T) => void] {
+  const [local, setLocal] = useState<T>(value);
+  // Keyed on the serialized value, not `value` itself: arrays/objects get a
+  // fresh reference every render, which would clobber an in-flight optimistic
+  // edit on each render. Only a real external change should re-seed.
+  const key = JSON.stringify(value ?? null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setLocal(value); }, [key]);
+  const apply = (next: T): void => {
+    setLocal(next);
+    void onCommit(next);
+  };
+  return [local, apply];
+}
+
 export function NumberInput({
   value, onChange, min, max, suffix, prefix, disabled,
 }: {

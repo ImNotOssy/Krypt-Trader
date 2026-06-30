@@ -14,7 +14,7 @@ export default defineConfig({
         vite: {
           build: {
             outDir: 'dist-electron',
-            sourcemap: true,
+            sourcemap: false,
             rollupOptions: {
               external: ['discord-rpc'],
             },
@@ -26,7 +26,7 @@ export default defineConfig({
         onstart(options) {
           options.reload();
         },
-        vite: { build: { outDir: 'dist-electron', sourcemap: true } },
+        vite: { build: { outDir: 'dist-electron', sourcemap: false } },
       },
     ]),
     rendererPlugin(),

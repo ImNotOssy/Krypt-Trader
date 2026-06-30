@@ -329,10 +329,14 @@ async def execute_signal(
                     f"Concurrency to disable this cap."
                 )
                 return None
-        if cfg["max_positions_per_event"] == 1 and db.exists_position_in_event(
+        max_per_event = int(cfg["max_positions_per_event"])
+        if db.count_positions_in_event(
             conn, signal.get("event_ticker") or "", env
-        ):
-            logger.info(f"[skip] {signal['ticker']}: event already has a position")
+        ) >= max_per_event:
+            logger.info(
+                f"[skip] {signal['ticker']}: per-event cap reached "
+                f"({max_per_event} on {signal.get('event_ticker') or '?'})"
+            )
             return None
         if db.exists_position_in_market(conn, signal["ticker"], direction, env):
             logger.info(f"[skip] {signal['ticker']}: market/side already open")
@@ -1313,12 +1317,19 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                 pass
         return 0.0
 
+    def _has_qty_key(p: dict) -> bool:
+        return "position_fp" in p or "position" in p
+
     nonzero_count = sum(1 for p in live if _signed_qty(p) != 0)
-    if live and nonzero_count == 0:
+    # A genuine field rename means NONE of the rows even expose a known qty key.
+    # All-zero qty WITH the keys present is just a flat account (Kalshi returns a
+    # zero-qty row for every market ever traded) — not a rename.
+    qty_key_present = any(_has_qty_key(p) for p in live)
+    if live and nonzero_count == 0 and not qty_key_present:
         sample_keys = list(live[0].keys())
         logger.warning(
-            f"reconcile: Kalshi returned {len(live)} positions but ZERO "
-            f"have non-zero qty — likely a field-name change. "
+            f"reconcile: Kalshi returned {len(live)} positions but NONE expose a "
+            f"known qty field (position_fp/position) — likely a field-name change. "
             f"sample keys = {sample_keys}"
         )
     elif live:
@@ -1510,7 +1521,11 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
     # double-counting its cost in the account total. (This is the 7-shown-vs-
     # 3-held drift, and why a manual Refresh appeared to do nothing.)
     healthy = nonzero_count > 0
-    field_change_suspected = bool(live) and nonzero_count == 0
+    # Only a real rename (no known qty key on any row) trips the fail-safe. A
+    # flat account (keys present, all zero) must NOT skip orphan-closing, or
+    # locally-"filled" positions sold/closed outside our tracking linger forever
+    # — burning concurrency slots and skewing the daily-stop baseline.
+    field_change_suspected = bool(live) and nonzero_count == 0 and not qty_key_present
     if not field_change_suspected:
         for (ticker, side), rows in local_by_key.items():
             still_held = (ticker, side) in live_by_key

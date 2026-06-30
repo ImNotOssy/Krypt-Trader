@@ -5,6 +5,7 @@ import { appendLog, broadcastState, registerIpc } from './ipc';
 import { setStartWithWindows } from './system/autostart';
 import { startDiscordRpc, stopDiscordRpc } from './system/discord';
 import { pythonBackend } from './system/python-backend';
+import { runVersionMaintenance, sleepSync, takeOverOtherInstances } from './system/fresh-install';
 import * as store from './system/settings-store';
 import { destroyTray, installTray, rebuild as rebuildTray } from './system/tray';
 
@@ -153,7 +154,20 @@ function createMainWindow(): BrowserWindow {
 
 let quitting = false;
 
-const gotLock = app.requestSingleInstanceLock();
+// Try to become the primary instance first. On the common path (fresh launch,
+// nothing else running) the lock is free and we proceed WITHOUT paying the
+// PowerShell process scan. Only when the lock is contended do we evict an
+// OLDER-install instance holding it and retry — so a newly-opened version still
+// takes over from an old one, but a normal launch and a same-install
+// double-click-to-focus don't run the scan.
+let gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  const evicted = takeOverOtherInstances();
+  if (evicted > 0) {
+    sleepSync(900); // let the killed instance release the lock
+    gotLock = app.requestSingleInstanceLock();
+  }
+}
 if (!gotLock) {
   app.quit();
 } else {
@@ -186,6 +200,11 @@ function installCsp(): void {
 }
 
 async function bootstrap(): Promise<void> {
+  // Wipe stale history/settings from an older version (keeping API keys) BEFORE
+  // anything reads settings or the Python backend opens the DB, so the app and
+  // backend both come up on a clean slate.
+  runVersionMaintenance();
+
   registerIpc();
   installCsp();
 

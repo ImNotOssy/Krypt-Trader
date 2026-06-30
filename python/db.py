@@ -1050,6 +1050,18 @@ def exists_position_in_event(conn, event_ticker: str, env: str) -> bool:
     return row is not None
 
 
+def count_positions_in_event(conn, event_ticker: str, env: str) -> int:
+    if not event_ticker:
+        return 0
+    row = conn.execute(
+        """SELECT COUNT(*) AS c FROM bot_positions
+           WHERE event_ticker=? AND resolved=0 AND kalshi_env=?
+             AND status IN ('submitted','partial','filled')""",
+        (event_ticker, env),
+    ).fetchone()
+    return int(row["c"]) if row and row["c"] is not None else 0
+
+
 def exists_position_in_market(
     conn, ticker: str, direction: str, env: str
 ) -> bool:

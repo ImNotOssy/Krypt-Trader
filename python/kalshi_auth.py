@@ -71,22 +71,62 @@ else:  # pragma: no cover - non-Windows fallback
         raise OSError("DPAPI not available")
 
 
+def _restrict_dir(d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def _atomic_write_0600(path: Path, data: bytes) -> None:
+    # Create the temp file with mode 0600 from the start (no world-readable
+    # window), then atomically replace. POSIX honours the mode; on Windows it's a
+    # no-op but DPAPI already protects the contents there. This guards the RSA
+    # private key that signs real-money orders against other local users.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    # O_BINARY is required on Windows — without it os.open uses TEXT mode and
+    # rewrites \n -> \r\n, corrupting the DPAPI marker and the RSA PEM. (No-op on
+    # POSIX, where O_BINARY doesn't exist.)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        mv = memoryview(data)
+        while mv:
+            mv = mv[os.write(fd, mv):]
+    finally:
+        os.close(fd)
+    if sys.platform != "win32":
+        for p in (tmp, path):
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+    os.replace(str(tmp), str(path))
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def _write_secret_bytes(path: Path, data: bytes) -> None:
     global _warned_plaintext
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    _restrict_dir(path.parent)
     if _dpapi_available():
         try:
-            tmp.write_bytes(_DPAPI_MARKER + base64.b64encode(_dpapi_encrypt(data)))
-            tmp.replace(path)
+            _atomic_write_0600(path, _DPAPI_MARKER + base64.b64encode(_dpapi_encrypt(data)))
             return
         except Exception as e:
-            logger.warning(f"DPAPI encrypt failed, storing plaintext: {e}")
+            logger.warning(f"DPAPI encrypt failed, storing plaintext (0600): {e}")
     if not _warned_plaintext:
-        logger.warning("Credentials stored UNENCRYPTED (DPAPI unavailable on this platform).")
+        logger.warning(
+            "Credentials stored UNENCRYPTED (no OS keystore on this platform); "
+            "files restricted to your user (0600). Use a single-user machine."
+        )
         _warned_plaintext = True
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    _atomic_write_0600(path, data)
 
 
 def _read_secret_bytes(path: Path, upgrade: bool = True) -> bytes:
@@ -288,7 +328,7 @@ def credentials_status_all() -> dict:
 def save_credentials(api_key: str, rsa_pem: str, env: Optional[str] = None) -> None:
     e = env or _current_env
     d = _credentials_dir()
-    d.mkdir(parents=True, exist_ok=True)
+    _restrict_dir(d)
     api_key = api_key.strip()
     if not api_key:
         raise ValueError("API key is empty")
