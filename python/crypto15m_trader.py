@@ -137,6 +137,16 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
     return momentum_filters_ok(asset, cfg)
 
 
+def stop_loss_pct(cfg: dict) -> float:
+    """Per-bet stop-loss as a FRACTION of the entry cost (`crypto15m_stop_loss_pct`,
+    stored 0..1). 0 = off. E.g. 0.20 stops out once a position is down 20% from
+    what it cost. Independent of the cents/price stop (`exit_threshold`)."""
+    try:
+        return max(0.0, min(1.0, float(cfg.get("crypto15m_stop_loss_pct", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> bool:
     if side_prob is None:
         return False
@@ -144,7 +154,21 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
         return False
     if int(position.get("filled_contracts") or 0) <= 0:
         return False
-    return side_prob < crypto15m._const(cfg, "exit_threshold")
+    # Cents/price stop: the held side has fallen to (or below) the exit price.
+    if side_prob < crypto15m._const(cfg, "exit_threshold"):
+        return True
+    # Percent-of-entry stop: the position is down >= X% from its entry cost. 0=off.
+    # A binary contract's current mark ≈ side_prob dollars, so current value is
+    # filled*side_prob vs the cost_usd we paid.
+    slp = stop_loss_pct(cfg)
+    if slp > 0:
+        filled = int(position.get("filled_contracts") or 0)
+        cost = float(position.get("cost_usd") or 0.0)
+        if cost > 0 and filled > 0:
+            cur_value = filled * float(side_prob)
+            if (cost - cur_value) / cost >= slp:
+                return True
+    return False
 
 
 def take_profit_cents(cfg: dict) -> int:
@@ -480,7 +504,11 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
         return None
     sold = int(parsed.get("filled") or 0)
     remaining = int(parsed.get("remaining") or 0)
-    proceeds = parsed["cost_cents"] / 100.0
+    # Kalshi reports a SELL's taker/maker_fill_cost as the OFFSETTING-leg cost
+    # basis (sold*(100-sell_price)), NOT the cash received. Actual cash proceeds =
+    # face value (sold contracts * $1) minus that complement. (A BUY's cost_cents
+    # IS the cost paid, so the entry path is unaffected — this is exit-only.)
+    proceeds = sold - parsed["cost_cents"] / 100.0
 
     if sold > 0 and remaining <= 0:
         pnl = proceeds - float(pos.get("cost_usd") or 0.0)
@@ -588,7 +616,9 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
             )
             sold = int(parsed.get("filled") or 0)
             if sold > 0:
-                proceeds = parsed["cost_cents"] / 100.0
+                # SELL fill_cost is the offsetting-leg cost; cash proceeds =
+                # face value (sold * $1) minus that complement (see _poll_exit).
+                proceeds = sold - parsed["cost_cents"] / 100.0
                 with db.get_db() as conn:
                     if sold >= filled:
                         pnl = proceeds - float(pos.get("cost_usd") or 0.0)

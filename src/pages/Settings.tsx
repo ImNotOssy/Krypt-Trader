@@ -239,6 +239,11 @@ export function SettingsPage() {
               <NumberInput value={config.maxSignalAgeSec} step={10} suffix="s"
                 onChange={(v) => void update('maxSignalAgeSec', v)} />
             </Field>
+            <Field label="Max resolution time"
+              hint="Skip markets that won't resolve for longer than this (e.g. long-dated politics bets that tie up capital for months). 0 = no limit.">
+              <NumberInput value={config.maxResolutionDays ?? 0} step={1} min={0} suffix="days"
+                onChange={(v) => void update('maxResolutionDays', v)} />
+            </Field>
             <Field label="Contrarian only (momentum)">
               <Switch
                 checked={config.contrarianOnly}

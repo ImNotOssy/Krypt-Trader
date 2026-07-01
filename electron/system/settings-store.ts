@@ -22,6 +22,7 @@ export const DEFAULT_CONFIG: TraderConfig = {
   minConfidenceMomentum: 55.0,
   minEntryPriceCents: 15,
   maxEntryPriceCents: 85,
+  maxResolutionDays: 0,
   allowedMomentumSignalTypes: ['trade_cluster'],
   allowedCategories: null,
   allowedWhaleCategories: null,

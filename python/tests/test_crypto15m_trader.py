@@ -115,6 +115,40 @@ def test_should_stop_loss(cfg):
     assert ct.should_stop_loss({"status": "submitted", "filled_contracts": 1}, 0.1, cfg) is False
 
 
+def test_should_stop_loss_pct(cfg):
+    # Entry: 10 contracts for $8.00 -> 80c/contract cost basis. Keep side_prob
+    # ABOVE the default cents stop (exit_threshold 0.40) so we isolate the % stop.
+    pos = {"status": "filled", "filled_contracts": 10, "cost_usd": 8.00}
+
+    cfg["crypto15m_stop_loss_pct"] = 0.0                    # off
+    assert ct.should_stop_loss(pos, 0.45, cfg) is False     # down 43.75% but % stop OFF
+
+    cfg["crypto15m_stop_loss_pct"] = 0.20                   # stop at -20% of entry
+    assert ct.should_stop_loss(pos, 0.65, cfg) is False     # -18.75% -> not yet
+    assert ct.should_stop_loss(pos, 0.63, cfg) is True      # -21.25% -> past the line
+    assert ct.should_stop_loss(pos, 0.60, cfg) is True      # -25% -> stop
+
+    # The cents/price stop still fires independently of the % stop.
+    cfg["crypto15m_stop_loss_pct"] = 0.0
+    assert ct.should_stop_loss(pos, 0.30, cfg) is True      # 30c < exit_threshold 40c
+
+    # Guards.
+    cfg["crypto15m_stop_loss_pct"] = 0.20
+    assert ct.should_stop_loss(pos, None, cfg) is False
+    assert ct.should_stop_loss(
+        {"status": "filled", "filled_contracts": 0, "cost_usd": 8.0}, 0.60, cfg) is False
+
+
+def test_stop_loss_pct_helper_and_clamp():
+    assert ct.stop_loss_pct({"crypto15m_stop_loss_pct": 0.2}) == 0.2
+    assert ct.stop_loss_pct({"crypto15m_stop_loss_pct": 5.0}) == 1.0     # clamp high
+    assert ct.stop_loss_pct({"crypto15m_stop_loss_pct": -1}) == 0.0      # clamp low
+    assert ct.stop_loss_pct({"crypto15m_stop_loss_pct": "abc"}) == 0.0   # garbage -> off
+    assert ct.stop_loss_pct({}) == 0.0                                    # missing -> off
+    # merge_with_defaults clamps the raw config value into 0..1 too.
+    assert merge_with_defaults({"crypto15m_stop_loss_pct": 9})["crypto15m_stop_loss_pct"] == 1.0
+
+
 def test_compute_entry_contracts_fixed(cfg):
     cfg["crypto15m_sizing_mode"] = "fixed"
     cfg["crypto15m_order_size"] = 3
@@ -532,7 +566,29 @@ def test_partial_stop_loss_sell_stays_exiting(fresh_db, env_demo, cfg, monkeypat
         r = db.fetch_crypto15m_by_id(conn, pos["id"])
     assert r["status"] == "exiting" and r["resolved"] == 0
     assert r["exit_filled_contracts"] == 3
-    assert r["proceeds_usd"] == pytest.approx(0.93)
+    # proceeds = cash received = sold(3) - offsetting fill_cost(0.93) = 2.07
+    assert r["proceeds_usd"] == pytest.approx(2.07)
+
+
+def test_stop_loss_exit_books_cash_not_offsetting_cost(fresh_db, env_demo, cfg, monkeypatch):
+    # Regression: bought 1 @ 71c (cost $0.71); stop-loss SELLS into a 12c bid.
+    # Kalshi reports a SELL's fill_cost as the OFFSETTING-leg cost basis
+    # = 1*(100-12) = $0.88, NOT the $0.12 cash received. Proceeds must be booked as
+    # the cash ($0.12) -> a real LOSS, not the +$0.17 "win" the old complement math
+    # produced (the source of the fabricated all-wins 15m track record).
+    pos = _seed_c15(status="exiting", direction="yes", target_contracts=1,
+                    filled_contracts=1, cost_usd=0.71,
+                    exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
+
+    async def _get(_kid):
+        return _order(1, 0, 0.88)   # Kalshi sell fill_cost = complement of a 12c sale
+    monkeypatch.setattr(kalshi_api, "get_order", _get)
+
+    out = run_async(ct._poll_exit(pos))
+    assert out["status"] == "exited"
+    assert out["proceeds_usd"] == pytest.approx(0.12)   # cash received, NOT 0.88
+    assert out["pnl_usd"] == pytest.approx(-0.59)        # 0.12 - 0.71
+    assert out["outcome_correct"] == 0                    # booked as a LOSS, not a win
 
 
 def test_partial_stop_then_settlement_accounts_for_sold_portion(fresh_db, env_demo, cfg, monkeypatch):

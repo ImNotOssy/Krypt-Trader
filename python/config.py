@@ -18,6 +18,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_confidence_momentum": 55.0,
     "min_entry_price_cents": 15,
     "max_entry_price_cents": 85,
+    # Skip any market whose resolution (close time) is more than this many days
+    # out — e.g. 30 means don't take bets that won't resolve for a month+ (long-
+    # dated politics markets tie up capital for months). 0 = off (no time limit).
+    "max_resolution_days": 0,
     "allowed_momentum_signal_types": ["trade_cluster"],
     "allowed_categories": None,
     "allowed_whale_categories": None,
@@ -91,6 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # price (cents). 0 = off / hold to settlement. Set it ABOVE the entry price or
     # it sells at a loss the moment a position fills.
     "crypto15m_take_profit_cents": 0,
+    # Per-bet stop-loss as a FRACTION of the entry cost (stored 0..1; the UI shows
+    # it as a %). Sell once a position is down >= this share of what it cost. 0 =
+    # off. Works alongside the cents/price stop (crypto15m_exit_threshold) —
+    # whichever triggers first exits.
+    "crypto15m_stop_loss_pct": 0.0,
     # Session take-profit: once the 15m executor's realized P&L since the backend
     # started reaches $this, stop opening NEW 15m entries (open positions keep
     # being managed). 0 = off. Resets when the app restarts.
@@ -560,6 +569,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             cfg["max_entry_price_cents"], cfg["min_entry_price_cents"],
         )
     cfg["max_open_positions"] = _clampi(cfg.get("max_open_positions"), 0, 100_000, d["max_open_positions"])
+    cfg["max_resolution_days"] = _clampi(cfg.get("max_resolution_days"), 0, 100_000, d["max_resolution_days"])
     cfg["max_daily_new_positions"] = _clampi(cfg.get("max_daily_new_positions"), 0, 100_000, d["max_daily_new_positions"])
     cfg["max_positions_per_event"] = _clampi(cfg.get("max_positions_per_event"), 1, 100_000, d["max_positions_per_event"])
     cfg["stop_loss_on_day"] = _clampf(cfg.get("stop_loss_on_day"), -1e9, 0.0, d["stop_loss_on_day"])
@@ -594,6 +604,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_maker_cancel_min"] = _clampf(cfg.get("crypto15m_maker_cancel_min"), 0.0, 15.0, d["crypto15m_maker_cancel_min"])
     cfg["crypto15m_stop_slippage_cents"] = _clampi(cfg.get("crypto15m_stop_slippage_cents"), 0, 50, d["crypto15m_stop_slippage_cents"])
     cfg["crypto15m_take_profit_cents"] = _clampi(cfg.get("crypto15m_take_profit_cents"), 0, 99, d["crypto15m_take_profit_cents"])
+    cfg["crypto15m_stop_loss_pct"] = _clampf(cfg.get("crypto15m_stop_loss_pct"), 0.0, 1.0, d["crypto15m_stop_loss_pct"])
     cfg["crypto15m_session_take_profit_usd"] = _clampf(cfg.get("crypto15m_session_take_profit_usd"), 0.0, 1e9, d["crypto15m_session_take_profit_usd"])
     cfg["crypto15m_min_rsi"] = _clampf(cfg.get("crypto15m_min_rsi"), 0.0, 100.0, d["crypto15m_min_rsi"])
     cfg["crypto15m_min_macd_hist"] = _clampf(cfg.get("crypto15m_min_macd_hist"), 0.0, 1e9, d["crypto15m_min_macd_hist"])

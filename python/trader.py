@@ -173,6 +173,34 @@ def _compute_edge(signal: dict, source: str) -> float:
     return conf - implied
 
 
+def _days_until_close(close_time: str) -> Optional[float]:
+    """Days from now until a market's close/resolution time (ISO8601). Returns None
+    when the time is missing or unparseable, which callers treat as 'unknown' and
+    do NOT gate on."""
+    if not close_time:
+        return None
+    from datetime import datetime, timezone
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            ct = datetime.strptime(close_time, fmt)
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            return (ct - datetime.now(timezone.utc)).total_seconds() / 86400.0
+        except ValueError:
+            continue
+    return None
+
+
+def _enrich_close_time(conn, sig: dict) -> None:
+    """Attach the market's close_time to a signal for the resolution-horizon gate.
+    Whale/momentum signal rows don't carry it; the markets table does."""
+    if sig.get("close_time"):
+        return
+    m = db.get_market(conn, sig.get("ticker") or "")
+    if m:
+        sig["close_time"] = m.get("close_time") or ""
+
+
 def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
     # "Secret Strategy" — pure gambling. Ignore every gate (confidence, edge,
     # category, price); each fresh signal just gets a flat random roll.
@@ -235,6 +263,16 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
         return False, f"entry {cost_cents}c < {cfg['min_entry_price_cents']}c"
     if cost_cents > cfg["max_entry_price_cents"]:
         return False, f"entry {cost_cents}c > {cfg['max_entry_price_cents']}c"
+
+    # Resolution-horizon cap: skip markets that won't resolve for a long time
+    # (e.g. multi-month politics markets tie up capital). 0 = off. close_time is
+    # enriched onto the signal in scan_for_trades; if it's missing/unparseable we
+    # don't gate (fail-open — we'd rather trade than wrongly block on bad data).
+    max_res_days = int(cfg.get("max_resolution_days", 0) or 0)
+    if max_res_days > 0:
+        days = _days_until_close(signal.get("close_time") or "")
+        if days is not None and days > max_res_days:
+            return False, f"resolves in ~{days:.0f}d > max {max_res_days}d"
     return True, "ok"
 
 
@@ -481,6 +519,9 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
 
     candidates: list[tuple[dict, str]] = []
     fetched_w = fetched_m = 0
+    # Only pay for the per-signal market lookup (close_time) when the resolution
+    # cap is actually enabled.
+    gate_resolution = int(cfg.get("max_resolution_days", 0) or 0) > 0
     with db.get_db() as conn:
         if cfg.get("trade_whales"):
             seen = db.already_traded_signal_ids(conn, "whale", env)
@@ -491,6 +532,8 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
                 seen_ids=seen,
             ):
                 fetched_w += 1
+                if gate_resolution:
+                    _enrich_close_time(conn, sig)
                 candidates.append((sig, "whale"))
         if cfg.get("trade_momentum"):
             seen = db.already_traded_signal_ids(conn, "momentum", env)
@@ -502,6 +545,8 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
                 seen_ids=seen,
             ):
                 fetched_m += 1
+                if gate_resolution:
+                    _enrich_close_time(conn, sig)
                 candidates.append((sig, "momentum"))
 
     if not candidates:

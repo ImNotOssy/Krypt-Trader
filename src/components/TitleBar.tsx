@@ -34,7 +34,7 @@ export function TitleBar() {
             Krypt Trader
           </span>
           <span className="rounded bg-krypt-purple/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-krypt-purple">
-            v{appVersion || '2.5.0'}
+            v{appVersion || '2.6.0'}
           </span>
         </div>
         <div className="hidden items-center gap-2 text-[11px] text-krypt-muted lg:flex">

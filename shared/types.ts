@@ -28,6 +28,7 @@ export interface TraderConfig {
   minConfidenceMomentum: number;
   minEntryPriceCents: number;
   maxEntryPriceCents: number;
+  maxResolutionDays?: number; // skip markets resolving more than N days out; 0 = off
   allowedMomentumSignalTypes: string[];
   allowedCategories: string[] | null;
   allowedWhaleCategories: string[] | null;
@@ -108,6 +109,7 @@ export interface TraderConfig {
   crypto15mExitThreshold?: number;
   crypto15mStopSlippageCents?: number;
   crypto15mTakeProfitCents?: number;             // per-bet: sell when the held side reaches this price (¢); 0 = off
+  crypto15mStopLossPct?: number;                 // per-bet: sell when down >= this fraction of entry cost (0..1); 0 = off
   crypto15mSessionTakeProfitUsd?: number;        // halt new 15m entries once this session's realized 15m P&L hits $this; 0 = off
   crypto15mMinRsi?: number;                      // direction-aware RSI confirmation (0–100); 0 = off
   crypto15mMinMacdHist?: number;                 // direction-aware MACD-histogram confirmation (magnitude); 0 = off

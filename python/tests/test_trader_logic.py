@@ -93,6 +93,35 @@ def test_should_trade_blocks_entry_above_max(cfg):
     assert ok is False and reason == "entry 90c > 85c"
 
 
+def _iso_in_days(days: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_should_trade_resolution_days_gate(cfg):
+    base = {"ticker": "X", "price": 0.60, "confidence": 70.0,
+            "taker_side": "yes", "category": "sports"}
+
+    # Default (0) = off: a far-out market still passes.
+    assert trader.should_trade({**base, "close_time": _iso_in_days(120)}, "whale", cfg)[0] is True
+
+    cfg["max_resolution_days"] = 30
+    ok, reason = trader.should_trade({**base, "close_time": _iso_in_days(120)}, "whale", cfg)
+    assert ok is False and "resolves" in reason                       # ~120d > 30d -> blocked
+    assert trader.should_trade({**base, "close_time": _iso_in_days(10)}, "whale", cfg)[0] is True   # 10d < 30d
+    # Fail-open when the close time is missing/unparseable — don't wrongly block.
+    assert trader.should_trade({**base, "close_time": ""}, "whale", cfg)[0] is True
+    assert trader.should_trade({**base, "close_time": "garbage"}, "whale", cfg)[0] is True
+    assert trader.should_trade(base, "whale", cfg)[0] is True          # no close_time key at all
+
+
+def test_days_until_close_parses_and_fails_soft():
+    assert trader._days_until_close("") is None
+    assert trader._days_until_close("nonsense") is None
+    d = trader._days_until_close(_iso_in_days(10))
+    assert d is not None and 9.8 < d < 10.1
+
+
 def test_should_trade_category_filter_excludes(cfg):
     cfg["allowed_categories"] = ["politics"]
     ok, reason = trader.should_trade(

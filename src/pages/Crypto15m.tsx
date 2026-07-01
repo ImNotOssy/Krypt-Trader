@@ -151,11 +151,6 @@ export function Crypto15mPage() {
             <KV label="Max open" value={`${status?.maxConcurrent ?? 7}`} />
             <KV label="Open" value={`${status?.stats.openCount ?? 0}`} />
             <KV label="W / L" value={`${status?.stats.wins ?? 0} / ${status?.stats.losses ?? 0}`} />
-            <KV
-              label="Realized"
-              value={fmtUsd(status?.stats.realizedPnlUsd ?? 0, { sign: true })}
-              accent={(status?.stats.realizedPnlUsd ?? 0) >= 0 ? 'good' : 'bad'}
-            />
           </div>
         </div>
         {enabled && status?.takeProfitHalted && (
@@ -308,6 +303,7 @@ const C15_DEFAULTS = {
   exitThreshold: 0.4,
   stopSlippageCents: 0,
   takeProfitCents: 0,
+  stopLossPct: 0,
   sessionTakeProfitUsd: 0,
   minRsi: 0,
   minMacdHist: 0,
@@ -421,6 +417,7 @@ function StrategySettings({
     crypto15mExitThreshold: C15_DEFAULTS.exitThreshold,
     crypto15mStopSlippageCents: C15_DEFAULTS.stopSlippageCents,
     crypto15mTakeProfitCents: C15_DEFAULTS.takeProfitCents,
+    crypto15mStopLossPct: C15_DEFAULTS.stopLossPct,
     crypto15mSessionTakeProfitUsd: C15_DEFAULTS.sessionTakeProfitUsd,
     crypto15mMinRsi: C15_DEFAULTS.minRsi,
     crypto15mMinMacdHist: C15_DEFAULTS.minMacdHist,
@@ -545,6 +542,12 @@ function StrategySettings({
           value={num('crypto15mTakeProfitCents', C15_DEFAULTS.takeProfitCents)}
           hint="Sell a winning position once the held side reaches this price. Set it ABOVE your entry price, or it sells the instant a position fills. 0 = off (hold to settlement)."
           onCommit={(v) => void update({ crypto15mTakeProfitCents: Math.round(v) })}
+        />
+        <NumField
+          label="Stop-loss %" suffix="%" min={0} max={100} step={1}
+          value={Math.round(num('crypto15mStopLossPct', C15_DEFAULTS.stopLossPct) * 100)}
+          hint="Sell once a position is down this % from what it cost (e.g. 20 = exit at −20%). Works alongside the cents Stop-loss above — whichever hits first exits. 0 = off."
+          onCommit={(v) => void update({ crypto15mStopLossPct: Math.max(0, Math.min(100, Math.round(v))) / 100 })}
         />
         <NumField
           label="Stop at profit" suffix="$ / session" min={0} max={1000000} step={5}
