@@ -6,8 +6,33 @@ instance with the message dicts Kalshi would send.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+
 import kalshi_ws
 from kalshi_ws import _Client, _cents
+
+
+def _trade(ticker="M", tid="a", ts=1):
+    return {"type": "trade", "msg": {
+        "market_ticker": ticker, "trade_id": tid, "count_fp": "5.00",
+        "yes_price_dollars": "0.30", "no_price_dollars": "0.70",
+        "taker_side": "yes", "ts_ms": ts,
+    }}
+
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+def _subs_for(ws, channel):
+    return [m for m in ws.sent
+            if m.get("cmd") == "subscribe"
+            and channel in (m.get("params") or {}).get("channels", [])]
 
 
 def _snapshot(ticker="T1", seq=5):
@@ -131,6 +156,72 @@ def test_trade_buffer_matches_rest_shape_newest_first():
     assert rt[0]["count_fp"] == "5.00"
     assert rt[0]["yes_price_dollars"] == "0.30"
     assert rt[0]["taker_side"] == "no"
+
+
+def test_recent_trades_goes_stale_then_recovers():
+    # Freshness gate: a 'connected' socket whose trade channel has gone quiet
+    # (dropped/NAK'd sub) must not serve its stale buffer — recent_trades returns
+    # None so the scanner REST-falls-back, then recovers when trades resume.
+    c = _Client()
+    c.connected = True
+    clock = {"t": 1000.0}
+    c._loop_time = lambda: clock["t"]
+    c._handle(_trade(tid="a"))
+    assert c.recent_trades() is not None                     # fresh
+    clock["t"] += kalshi_ws._TRADE_STALE_SEC + 1             # channel silent
+    assert c.recent_trades() is None                         # stale → REST fallback
+    c._handle(_trade(tid="b"))                                # trades resume
+    assert c.recent_trades() is not None
+
+
+def test_reset_sub_state_clears_trade_buffer():
+    # A pre-reconnect trade must not be served as "recent" after reconnect.
+    c = _Client()
+    c.connected = True
+    c._handle(_trade(tid="a"))
+    assert c.recent_trades() is not None
+    c._reset_sub_state()
+    assert len(c.trades) == 0
+    assert c.recent_trades() is None                         # cold until fresh WS trades
+
+
+def test_account_sub_acked_once_is_not_retried():
+    c = _Client()
+    clock = {"t": 0.0}
+    c._loop_time = lambda: clock["t"]
+    ws = _FakeWS()
+    asyncio.run(c._subscribe_account(ws))
+    assert len(_subs_for(ws, "trade")) == 1                  # first attempt
+    trade_cid = next(m["id"] for m in ws.sent
+                     if "trade" in m["params"]["channels"])
+    c._on_subscribed({"id": trade_cid, "msg": {}})           # server ACK (no sid)
+    assert "trade" in c._account_subbed
+    clock["t"] += kalshi_ws._ACCOUNT_RESUB_THROTTLE_SEC + 1
+    asyncio.run(c._subscribe_account(ws))
+    assert len(_subs_for(ws, "trade")) == 1                  # acked → never re-sent
+
+
+def test_account_sub_retries_then_gives_up_when_never_acked():
+    # A NAK'd/dropped subscribe (never ACKed) is retried, throttled, up to the cap.
+    c = _Client()
+    clock = {"t": 0.0}
+    c._loop_time = lambda: clock["t"]
+    ws = _FakeWS()
+    for _ in range(kalshi_ws._ACCOUNT_RESUB_MAX_TRIES + 3):
+        asyncio.run(c._subscribe_account(ws))
+        clock["t"] += kalshi_ws._ACCOUNT_RESUB_THROTTLE_SEC + 1
+    assert len(_subs_for(ws, "trade")) == kalshi_ws._ACCOUNT_RESUB_MAX_TRIES
+    assert "trade" not in c._account_subbed
+
+
+def test_account_sub_throttled_within_window():
+    c = _Client()
+    clock = {"t": 0.0}
+    c._loop_time = lambda: clock["t"]
+    ws = _FakeWS()
+    asyncio.run(c._subscribe_account(ws))
+    asyncio.run(c._subscribe_account(ws))                    # immediate → throttled
+    assert len(_subs_for(ws, "trade")) == 1
 
 
 def test_set_market_sets_filter_blanks():

@@ -1004,11 +1004,22 @@ def get_market_quotes(conn, tickers) -> dict[str, dict]:
 def count_new_positions_today(conn, env: str | None = None, offset_min: int = 0) -> int:
     # offset_min shifts the day boundary to the user's local day (matches the
     # trading-hours gate); default 0 = UTC, unchanged.
+    #
+    # Count ONLY rows that actually became (or are still working toward) a real
+    # position — 'submitted'/'partial'/'filled', matching count_open_bot_positions.
+    # Terminal non-position rows ('canceled','error','gone','expired','dry_run')
+    # must NOT burn a daily slot: a run of unfilled maker auto-cancels or Kalshi
+    # order rejections would otherwise saturate max_daily_new_positions while zero
+    # contracts are actually held, silently halting all new entries until the day
+    # boundary ("runs for hours then stops trading, empty portfolio, full balance,
+    # works next day"). No resolved=0 filter here on purpose: a position opened
+    # AND resolved today keeps status='filled', so it still counts as taken-today,
+    # which is the cap's intent.
     mod = f"{int(offset_min):+d} minutes"
     sql = (
         "SELECT COUNT(*) FROM bot_positions "
         "WHERE date(created_at, ?)=date('now', ?) "
-        "AND status != 'dry_run' "
+        "AND status IN ('submitted','partial','filled') "
         "AND COALESCE(signal_source,'') != 'external'"
     )
     args: tuple = (mod, mod)

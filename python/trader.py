@@ -912,6 +912,15 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
                 "status": db_status,
                 "filled_contracts": parsed["filled"],
             }
+            # A partial fill whose remainder Kalshi CANCELED frees the unfilled
+            # cash: collapse target_contracts to the filled qty so
+            # current_total_exposure_usd stops valuing the dead remainder's
+            # notional (target × limit) as committed capital — otherwise exposure
+            # over-counts and needlessly blocks new entries until the position
+            # resolves. A still-RESTING partial (kalshi status 'resting') keeps
+            # its target, so its genuinely-held remainder stays counted.
+            if db_status == "partial" and parsed["status"] in ("canceled", "cancelled"):
+                fields["target_contracts"] = parsed["filled"]
             if parsed["avg_cents"] is not None:
                 fields["avg_fill_price_cents"] = parsed["avg_cents"]
             if parsed["cost_cents"]:

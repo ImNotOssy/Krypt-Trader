@@ -74,6 +74,21 @@ _MULTI_CHANNELS = ("ticker", "market_lifecycle_v2")
 _TRADE_BUF_MAX = 8000
 _RECONNECT_MAX_SEC = 60.0
 _SILENT_TIMEOUT_SEC = 30.0  # no message for this long → force a reconnect
+# Trade ring-buffer freshness. If no `trade` message has arrived on the socket
+# for this long, recent_trades() returns None so the scanner REST-falls-back
+# rather than serving a stale buffer. This guards the case where the account
+# `trade` subscribe was dropped/NAK'd (or the channel half-dies) while ticker/
+# orderbook traffic keeps the 30s silent-link watchdog from firing: the socket
+# still looks "connected" yet no new trades arrive, silently starving the
+# whale/momentum scanner. Generous vs. active-market trade rates.
+_TRADE_STALE_SEC = 120.0
+# Account-channel (re)subscribe retry. A channel counts as live only once the
+# server ACKs it; until then _reconcile re-attempts it — at most
+# _ACCOUNT_RESUB_MAX_TRIES times, spaced _ACCOUNT_RESUB_THROTTLE_SEC apart — so a
+# dropped/NAK'd subscribe self-heals within the connection instead of leaving the
+# feed dead until the next physical reconnect, without spamming the server.
+_ACCOUNT_RESUB_THROTTLE_SEC = 10.0
+_ACCOUNT_RESUB_MAX_TRIES = 4
 
 FillCb = Callable[[dict], Optional[Awaitable]]
 LifecycleCb = Callable[[dict], Optional[Awaitable]]
@@ -104,6 +119,7 @@ class _Client:
         self._id: int = 0
         self._loop_time: Callable[[], float] = lambda: 0.0
         self.last_msg_t: float = 0.0
+        self.last_trade_msg_t: float = 0.0  # last `trade` frame (freshness gate)
 
         # desired vs live subscription state
         self.want_orderbook: set[str] = set()      # tickers needing a live book
@@ -112,7 +128,9 @@ class _Client:
         self._ob_sids: dict[str, int] = {}          # ticker -> sid (one sub each)
         self._multi_sids: dict[str, int] = {}       # channel -> sid
         self._multi_have: dict[str, set[str]] = {c: set() for c in _MULTI_CHANNELS}
-        self._account_subbed: set[str] = set()
+        self._account_subbed: set[str] = set()      # ACKed account channels
+        self._account_attempt: dict[str, float] = {}  # channel -> last subscribe t
+        self._account_tries: dict[str, int] = {}     # channel -> attempts this conn
         self._inflight: dict[int, tuple] = {}       # cmd id -> (kind, key)
 
         # market-data state
@@ -245,10 +263,18 @@ class _Client:
         for c in _MULTI_CHANNELS:
             self._multi_have[c] = set()
         self._account_subbed.clear()
+        self._account_attempt.clear()
+        self._account_tries.clear()
         self._inflight.clear()
         for t in list(self._book_valid):
             self._book_valid[t] = False
         self._resnap.clear()
+        # Drop the trade buffer too: a pre-reconnect trade must not be served as
+        # "recent" after we reconnect (it would suppress the REST fallback while
+        # the new connection's trade sub is still cold). recent_trades() returns
+        # None until fresh WS trades arrive.
+        self.trades.clear()
+        self.last_trade_msg_t = 0.0
 
     # ───────── outbound commands ──────────────────────────────────────
 
@@ -260,17 +286,35 @@ class _Client:
         await ws.send(json.dumps(obj))
 
     async def _subscribe_account(self, ws) -> None:
+        # Subscribe (and RETRY) the account-wide channels. A channel is live only
+        # once the server ACKs it (_on_subscribed adds it to _account_subbed);
+        # until then this re-attempts it — called on connect and again from every
+        # _reconcile idle tick — throttled and attempt-capped so a dropped/NAK'd
+        # subscribe (e.g. transient rate-limit on a reconnect) can't leave the
+        # `trade` feed silently dead for the whole connection.
+        now = self._loop_time()
         for ch in _ACCOUNT_CHANNELS:
             if ch in self._account_subbed:
-                continue
+                continue  # already ACKed / live
+            last = self._account_attempt.get(ch)
+            if last is not None and (now - last) < _ACCOUNT_RESUB_THROTTLE_SEC:
+                continue  # an attempt is still in flight; give it time to ACK
+            if self._account_tries.get(ch, 0) >= _ACCOUNT_RESUB_MAX_TRIES:
+                continue  # gave up for this connection; freshness gate + REST cover it
+            # Drop any stale in-flight record for this channel before re-sending.
+            for cid in [c for c, kk in self._inflight.items() if kk == ("account", ch)]:
+                self._inflight.pop(cid, None)
             cid = self._next_id()
             self._inflight[cid] = ("account", ch)
+            self._account_attempt[ch] = now
+            self._account_tries[ch] = self._account_tries.get(ch, 0) + 1
             await self._send(ws, {"id": cid, "cmd": "subscribe",
                                   "params": {"channels": [ch]}})
-            self._account_subbed.add(ch)
 
     async def _reconcile(self, ws) -> None:
         """Bring live subscriptions in line with the desired market sets."""
+        # Re-attempt any account channel that hasn't ACKed yet (throttled/capped).
+        await self._subscribe_account(ws)
         # orderbook_delta: one subscription per ticker (clean per-sid seq).
         for t in self.want_orderbook - set(self._ob_sids):
             cid = self._next_id()
@@ -362,11 +406,18 @@ class _Client:
 
     def _on_subscribed(self, m: dict) -> None:
         cid = m.get("id")
-        sid = (m.get("msg") or {}).get("sid")
         kind_key = self._inflight.pop(cid, None) if cid is not None else None
-        if not kind_key or sid is None:
+        if not kind_key:
             return
         kind, key = kind_key
+        if kind == "account":
+            # Matched by our own echoed command id, so mark live regardless of
+            # whether an account ack carries a sid (market subs need the sid).
+            self._account_subbed.add(key)
+            return
+        sid = (m.get("msg") or {}).get("sid")
+        if sid is None:
+            return
         if kind == "ob":
             self._ob_sids[key] = sid
         elif kind == "multi":
@@ -438,6 +489,8 @@ class _Client:
         t = msg.get("market_ticker")
         if not t:
             return
+        # Stamp trade-channel liveness (drives recent_trades' freshness gate).
+        self.last_trade_msg_t = self._loop_time()
         # Match the REST /markets/trades shape the scanner consumes (it already
         # reads count_fp / yes_price_dollars / taker_side). REST calls it `ticker`.
         self.trades.append({
@@ -510,8 +563,13 @@ class _Client:
 
     def recent_trades(self, limit: int = 1000) -> Optional[list]:
         """Newest-first recent trades in the REST /markets/trades shape, or None
-        when the buffer is cold so the scanner REST-falls-back on startup."""
+        when the buffer is cold OR stale — so the scanner REST-falls-back on
+        startup and whenever the `trade` channel has gone quiet on the socket
+        (dropped/NAK'd sub, half-dead channel) even though we're still
+        'connected'. Never serve a stale buffer as if it were live."""
         if not self.connected or not self.trades:
+            return None
+        if self._loop_time() - self.last_trade_msg_t > _TRADE_STALE_SEC:
             return None
         out = list(self.trades)[-limit:]
         out.reverse()

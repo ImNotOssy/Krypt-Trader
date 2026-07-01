@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -206,6 +207,10 @@ _cached_private_key: Optional[rsa.RSAPrivateKey] = None
 _server_offset_ms: int = 0
 _last_sync: float = 0.0
 _RESYNC_INTERVAL_SEC = 300
+# Guards the background clock-resync so the interval-triggered HEAD never runs on
+# the asyncio event loop (see now_ms). A single in-flight sync at a time.
+_sync_lock = threading.Lock()
+_sync_in_progress: bool = False
 
 _current_env: str = "production"
 
@@ -399,9 +404,34 @@ def sync_server_time(force: bool = False) -> int:
     return _server_offset_ms
 
 
+def _bg_sync() -> None:
+    global _sync_in_progress
+    try:
+        sync_server_time(force=True)
+    finally:
+        with _sync_lock:
+            _sync_in_progress = False
+
+
 def now_ms() -> int:
+    # sign_headers() -> now_ms() runs on the asyncio event loop for EVERY signed
+    # request and the WS handshake. When the 5-min resync interval elapses, do the
+    # blocking HTTP HEAD in a BACKGROUND THREAD instead of inline — otherwise it
+    # froze the whole loop (WS recv, order polling, the latency-critical 15m
+    # stop-loss/TP chase) for up to the 5s HEAD timeout every 5 minutes. The
+    # current offset (which drifts only slowly) is used until the sync lands; a
+    # single-flight guard prevents piling up threads.
+    global _sync_in_progress
     if (time.time() - _last_sync) >= _RESYNC_INTERVAL_SEC:
-        sync_server_time(force=False)
+        start = False
+        with _sync_lock:
+            if not _sync_in_progress:
+                _sync_in_progress = True
+                start = True
+        if start:
+            threading.Thread(
+                target=_bg_sync, name="kalshi-clocksync", daemon=True
+            ).start()
     return int(time.time() * 1000) + _server_offset_ms
 
 

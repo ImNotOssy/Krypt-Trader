@@ -506,9 +506,36 @@ def _ws_held_tickers() -> set[str]:
     return out
 
 
+async def _reverify_auth_if_needed() -> bool:
+    """Self-heal a latched-off auth state.
+
+    The one-shot startup verify in _main() sets STATE.auth_ok=False on a single
+    transient failure (network stack not ready when Electron spawns Python at cold
+    boot/resume, a Kalshi 5xx/429 burst that outlasts the in-call retry window).
+    Every live path — trade scan, order poll, reconcile, resolution — is gated on
+    STATE.auth_ok, and nothing else in the loop ever flips it back True, so one
+    boot blip silently disables trading for the whole session until the user
+    manually re-tests credentials. This re-primes and re-verifies against Kalshi;
+    on success it re-enables trading. Returns True iff it flipped auth_ok True.
+    """
+    if STATE.auth_ok:
+        return False
+    if not kalshi_auth.credentials_present(kalshi_auth.get_env()):
+        return False
+    # Serialize with credential/env changes exactly like _h_testCredentials.
+    async with kalshi_auth.ENV_LOCK:
+        kalshi_auth.prime_credentials(sync_time=True)
+        bal = await kalshi_api.get_balance()
+    int(bal.get("balance", 0))  # shape check; raises if the poll was malformed
+    STATE.auth_ok = True
+    await emit_event("backend:authChanged", {"authOk": True})
+    return True
+
+
 async def _scanner_and_trader_loop() -> None:
     last_whale = 0.0
     last_momentum = 0.0
+    last_auth_retry = 0.0
     last_trade = 0.0
     last_poll = 0.0
     last_resolve = 0.0
@@ -552,6 +579,18 @@ async def _scanner_and_trader_loop() -> None:
         if STATE.paused:
             await asyncio.sleep(1)
             continue
+
+        # Auth self-heal: recover from a boot-time verify blip that latched
+        # auth_ok False (see _reverify_auth_if_needed). Without this, a single
+        # transient failure at startup silently disables trading/poll/reconcile/
+        # resolution for the entire session. Retry ~every 60s while latched off.
+        try:
+            if not STATE.auth_ok and now - last_auth_retry >= 60:
+                last_auth_retry = now
+                if await _reverify_auth_if_needed():
+                    logger.info("auth re-verified — trading re-enabled")
+        except Exception as e:
+            logger.debug(f"auth re-verify failed (will retry): {e}")
 
         try:
             if now - last_market_sync >= float(cfg.get("market_refresh_interval", 300)):

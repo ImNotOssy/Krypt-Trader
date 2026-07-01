@@ -117,6 +117,48 @@ def test_execute_skips_when_daily_cap_hit(fresh_db, env_demo, cfg):
     assert count_rows() == 2
 
 
+def test_daily_cap_counts_only_real_positions(fresh_db, env_demo):
+    # Regression: the daily new-positions cap must count ONLY rows that became or
+    # are still working toward a real position (submitted/partial/filled).
+    # Terminal non-position rows (canceled/error/gone/expired/dry_run) previously
+    # counted too, so a run of unfilled maker auto-cancels or Kalshi order
+    # rejections silently saturated max_daily_new_positions while zero contracts
+    # were held — halting all new entries until the day boundary.
+    for st in ("submitted", "partial", "filled"):
+        seed_position(status=st)
+    for st in ("canceled", "error", "gone", "expired", "dry_run"):
+        seed_position(status=st)
+        seed_position(status=st)
+    with db.get_db() as conn:
+        assert db.count_new_positions_today(conn, "demo") == 3
+
+
+def test_daily_cap_excludes_external_and_prior_days(fresh_db, env_demo):
+    # Only today's own-engine positions count: externals (incl. 15m fills) and
+    # positions created on a prior day must be excluded.
+    seed_position(status="filled")                                   # counts
+    seed_position(status="filled", signal_source="external")         # external
+    seed_position(status="filled", created_at_offset_sec=-90000)     # ~yesterday
+    with db.get_db() as conn:
+        assert db.count_new_positions_today(conn, "demo") == 1
+
+
+def test_daily_cap_not_saturated_by_dead_rows(fresh_db, env_demo, cfg):
+    # End-to-end guard on the gate: with a cap of 2, five dead (canceled/error/
+    # gone) rows from today must NOT block a fresh signal on the daily-cap path.
+    # (It still gets skipped here for lack of a real order fill, but NOT with the
+    # MAX_DAILY_NEW_POSITIONS reason — asserted via the surviving daily count.)
+    cfg["max_open_positions"] = 100
+    cfg["unlimited_daily_new_positions"] = False
+    cfg["max_daily_new_positions"] = 2
+    for st in ("canceled", "error", "gone", "canceled", "error"):
+        seed_position(status=st)
+    with db.get_db() as conn:
+        today = db.count_new_positions_today(conn, "demo")
+    assert today == 0
+    assert today < cfg["max_daily_new_positions"]
+
+
 def test_execute_skips_second_position_in_same_event(fresh_db, env_demo, cfg):
     cfg["max_positions_per_event"] = 1
     seed_position(status="filled", event_ticker="EVT-A", ticker="A-1")
@@ -256,6 +298,69 @@ def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_demo, cfg, mo
     assert row["filled_contracts"] == 5
     assert row["cost_usd"] == pytest.approx(3.0)
     assert row["avg_fill_price_cents"] == pytest.approx(60.0)
+
+
+def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo, cfg, monkeypatch):
+    # Kalshi cancels an order that had a PARTIAL fill: the unfilled remainder's
+    # cash is released, so exposure must count only the filled notional. Before
+    # the fix, target_contracts stayed at 5 and current_total_exposure_usd valued
+    # the dead remainder (5 × 50c = $2.50) as committed capital, over-counting and
+    # needlessly blocking new entries until resolution.
+    trader._poll_failures.clear()
+    pid = seed_position(status="submitted", kalshi_order_id="OID-CP",
+                        target_contracts=5, limit_price_cents=50)
+
+    async def _no_positions(*_a, **_k):
+        return []
+
+    async def _canceled_partial(_oid):
+        return {"order": {
+            "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
+            "taker_fill_cost": 100, "maker_fill_cost": 0,   # 2 @ 50c = 100c = $1.00
+            "place_count": 5, "remaining_count": 3,
+        }}
+
+    monkeypatch.setattr(trader, "get_positions", _no_positions)
+    monkeypatch.setattr(trader, "get_order", _canceled_partial)
+
+    run_async(trader.poll_open_orders(cfg))
+    row = fetch(pid)
+    assert row["status"] == "partial"
+    assert row["filled_contracts"] == 2
+    assert row["target_contracts"] == 2          # collapsed to the filled qty
+    with db.get_db() as conn:
+        exposure = db.current_total_exposure_usd(conn, "demo")
+    assert exposure == pytest.approx(1.0)        # filled notional only, not $2.50
+
+
+def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, cfg, monkeypatch):
+    # A still-RESTING partial's remainder IS held by Kalshi, so exposure must keep
+    # counting the full committed notional (target × limit) — the collapse must
+    # NOT fire here (that would under-count exposure and let the bot over-deploy).
+    trader._poll_failures.clear()
+    pid = seed_position(status="submitted", kalshi_order_id="OID-RP",
+                        target_contracts=5, limit_price_cents=50)
+
+    async def _no_positions(*_a, **_k):
+        return []
+
+    async def _resting_partial(_oid):
+        return {"order": {
+            "status": "resting", "taker_fill_count": 2, "maker_fill_count": 0,
+            "taker_fill_cost": 100, "maker_fill_cost": 0,
+            "place_count": 5, "remaining_count": 3,
+        }}
+
+    monkeypatch.setattr(trader, "get_positions", _no_positions)
+    monkeypatch.setattr(trader, "get_order", _resting_partial)
+
+    run_async(trader.poll_open_orders(cfg))
+    row = fetch(pid)
+    assert row["status"] == "partial"
+    assert row["target_contracts"] == 5          # remainder still live → unchanged
+    with db.get_db() as conn:
+        exposure = db.current_total_exposure_usd(conn, "demo")
+    assert exposure == pytest.approx(2.5)        # full committed notional counted
 
 
 def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_demo, cfg, monkeypatch):
