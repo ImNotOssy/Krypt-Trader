@@ -1,4 +1,4 @@
-import { app, BrowserWindow, screen, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, screen, session, shell } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendLog, broadcastState, registerIpc } from './ipc';
@@ -86,6 +86,9 @@ function createMainWindow(): BrowserWindow {
       sandbox: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      // Hard-disable DevTools in shipped builds: openDevTools() and the default
+      // Ctrl+Shift+I accelerator both become no-ops. Kept on in dev.
+      devTools: !app.isPackaged,
     },
   });
 
@@ -200,6 +203,15 @@ function installCsp(): void {
 }
 
 async function bootstrap(): Promise<void> {
+  // Drop the default application menu (and its Ctrl+Shift+I "Toggle Developer
+  // Tools" accelerator) on Windows/Linux. NOT on macOS: nulling the menu there
+  // also removes the Edit-role Cmd+C/V/X and Cmd+Q accelerators, breaking
+  // clipboard + quit. DevTools is already hard-disabled in packaged builds via
+  // webPreferences.devTools, so the leftover mac menu item is an inert no-op.
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+  }
+
   // Wipe stale history/settings from an older version (keeping API keys) BEFORE
   // anything reads settings or the Python backend opens the DB, so the app and
   // backend both come up on a clean slate.
