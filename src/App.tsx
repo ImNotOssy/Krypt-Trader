@@ -19,11 +19,12 @@ import { AboutPage } from './pages/About';
 import { GuidePage } from './pages/Guide';
 import { VisualizerPage } from './pages/Visualizer';
 import { Crypto15mPage } from './pages/Crypto15m';
+import { BacktestPage } from './pages/Backtest';
 
 export type PageId =
   | 'dashboard' | 'strategies' | 'positions' | 'signals' | 'history'
   | 'profiles' | 'settings' | 'api' | 'logs' | 'guide' | 'about'
-  | 'visualizer' | 'crypto15m';
+  | 'visualizer' | 'crypto15m' | 'backtest';
 
 export default function App() {
   return (
@@ -79,6 +80,7 @@ function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => v
     case 'about': return <AboutPage />;
     case 'visualizer': return <VisualizerPage />;
     case 'crypto15m': return <Crypto15mPage />;
+    case 'backtest': return <BacktestPage />;
     default: return <DashboardPage onNav={setPage} />;
   }
 }

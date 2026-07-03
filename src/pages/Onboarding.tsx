@@ -59,7 +59,7 @@ export function OnboardingModal({ onDone }: { onDone: () => void }) {
               <ol className="list-decimal space-y-2 pl-4 text-sm text-krypt-muted">
                 <li>Create a Kalshi API key + RSA private key in your account settings.</li>
                 <li>Paste both into the API Keys page (we&apos;ll send you there).</li>
-                <li>Pick a strategy preset (start with <span className="text-white">Edge Stack</span>).</li>
+                <li>Start on the <span className="text-white">demo</span> environment and paper-test a strategy before risking money.</li>
                 <li>Verify the connection &amp; balance, then unpause trading.</li>
                 <li>Tweak knobs in Settings — everything is live-editable.</li>
               </ol>

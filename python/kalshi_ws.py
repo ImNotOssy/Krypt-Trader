@@ -40,9 +40,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 from collections import deque
 from typing import Awaitable, Callable, Optional
 
+import cf_ws
 import kalshi_auth
 
 logger = logging.getLogger("kalshi_ws")
@@ -67,6 +69,9 @@ _DISABLED = os.environ.get("KRYPT_KALSHI_WS", "1").strip().lower() in (
 
 # Account-wide channels carry no market filter — subscribed once on connect.
 _ACCOUNT_CHANNELS = ("trade", "fill", "market_positions")
+# cfbenchmarks_value is account-style too (no market filter; index_ids param
+# instead) but OPTIONAL — subscribed only when the 15m spot feed is enabled.
+_CF_CHANNEL = "cfbenchmarks_value"
 # Market-scoped channels managed as one shared subscription (no per-message book
 # to keep, so multi-market on a single sid is safe).
 _MULTI_CHANNELS = ("ticker", "market_lifecycle_v2")
@@ -92,6 +97,12 @@ _ACCOUNT_RESUB_MAX_TRIES = 4
 
 FillCb = Callable[[dict], Optional[Awaitable]]
 LifecycleCb = Callable[[dict], Optional[Awaitable]]
+TradeCb = Callable[[dict], None]  # sync, called per trade frame — must be cheap
+
+# Under steady message traffic recv() rarely times out, so the TimeoutError
+# branch's _reconcile could STARVE — a just-entered position's book subscribe
+# waited behind a busy tape. Reconcile at least this often regardless.
+_RECONCILE_MIN_INTERVAL_SEC = 1.0
 
 
 def _cents(price_dollars) -> Optional[int]:
@@ -143,10 +154,13 @@ class _Client:
 
         self.on_fill: Optional[FillCb] = None
         self.on_lifecycle: Optional[LifecycleCb] = None
+        self.on_trade: Optional[TradeCb] = None
+        # CF Benchmarks value channel (the exact settlement index) — desired?
+        self.want_cf: bool = False
 
     # ───────── lifecycle ─────────────────────────────────────────────
 
-    def start(self, env: str, *, on_fill=None, on_lifecycle=None) -> None:
+    def start(self, env: str, *, on_fill=None, on_lifecycle=None, on_trade=None) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
             if not _WS_IMPORT_OK and not _DISABLED:
                 logger.warning("kalshi_ws: `websockets` not installed — staying on REST")
@@ -154,6 +168,7 @@ class _Client:
         self.env = env if env in _WS_BASES else "production"
         self.on_fill = on_fill
         self.on_lifecycle = on_lifecycle
+        self.on_trade = on_trade
         self._stop = False
         loop = asyncio.get_event_loop()
         self._loop_time = loop.time
@@ -181,6 +196,24 @@ class _Client:
             self._gen += 1  # force reconnect to the new host
             logger.info(f"kalshi_ws: env → {env}, reconnecting")
 
+    def set_cf_enabled(self, enabled: bool) -> None:
+        """Toggle the cfbenchmarks_value channel (the exact settlement index
+        feed consumed by cf_ws). Retried by _subscribe_account when turned on
+        mid-connection; turning OFF forces a reconnect so the server stops
+        streaming ~1 msg/sec/index we'd just discard."""
+        enabled = bool(enabled)
+        if enabled == self.want_cf:
+            return
+        self.want_cf = enabled
+        logger.info(f"kalshi_ws: cfbenchmarks_value → {'on' if enabled else 'off'}")
+        if not enabled and self.connected:
+            self._gen += 1
+        elif enabled:
+            # A capped earlier attempt (before the flag flipped) must not block
+            # the fresh subscribe.
+            self._account_tries.pop(_CF_CHANNEL, None)
+            self._account_attempt.pop(_CF_CHANNEL, None)
+
     async def _close_ws(self) -> None:
         ws = self._ws
         self._ws = None
@@ -203,7 +236,10 @@ class _Client:
                 raise
             except Exception as e:
                 attempt += 1
+                # Jitter de-syncs the user base so a Kalshi blip doesn't make
+                # every installed bot reconnect on the same second.
                 backoff = min(2.0 ** attempt, _RECONNECT_MAX_SEC)
+                backoff *= random.uniform(0.75, 1.25)
                 logger.warning(
                     f"kalshi_ws: disconnected ({type(e).__name__}: {e}); "
                     f"reconnect in {backoff:.0f}s"
@@ -237,12 +273,14 @@ class _Client:
             logger.info(f"kalshi_ws: connected → {url}")
             await self._subscribe_account(ws)
             await self._reconcile(ws)
+            last_reconcile = self._loop_time()
             while not self._stop and gen == self._gen:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
                     # idle tick: reconcile desired subs + watchdog the link
                     await self._reconcile(ws)
+                    last_reconcile = self._loop_time()
                     if self._loop_time() - self.last_msg_t > _SILENT_TIMEOUT_SEC:
                         logger.warning("kalshi_ws: silent link — forcing reconnect")
                         return
@@ -252,6 +290,14 @@ class _Client:
                     self._handle(json.loads(raw))
                 except Exception as e:
                     logger.debug(f"kalshi_ws: handle error: {e}")
+                # Under a busy tape recv() never times out, so the idle-branch
+                # reconcile above could starve for minutes — leaving a freshly
+                # entered position without its orderbook subscription (every
+                # stop-loss chase then paid the REST fallback) and gapped books
+                # un-resnapshotted. Reconcile on a floor cadence regardless.
+                if self._loop_time() - last_reconcile >= _RECONCILE_MIN_INTERVAL_SEC:
+                    await self._reconcile(ws)
+                    last_reconcile = self._loop_time()
         self.connected = False
         self._ws = None
 
@@ -269,6 +315,11 @@ class _Client:
         for t in list(self._book_valid):
             self._book_valid[t] = False
         self._resnap.clear()
+        # Drop quotes for tickers we no longer care about (see _drop_book) —
+        # kept-ticker quotes stay so the 15m WS fast path isn't cold across a
+        # brief reconnect (they carry ts_ms; consumers gate on freshness).
+        for t in [q for q in self.quotes if q not in self.want_ticker]:
+            self.quotes.pop(t, None)
         # Drop the trade buffer too: a pre-reconnect trade must not be served as
         # "recent" after we reconnect (it would suppress the REST fallback while
         # the new connection's trade sub is still cold). recent_trades() returns
@@ -293,7 +344,8 @@ class _Client:
         # subscribe (e.g. transient rate-limit on a reconnect) can't leave the
         # `trade` feed silently dead for the whole connection.
         now = self._loop_time()
-        for ch in _ACCOUNT_CHANNELS:
+        chans = _ACCOUNT_CHANNELS + ((_CF_CHANNEL,) if self.want_cf else ())
+        for ch in chans:
             if ch in self._account_subbed:
                 continue  # already ACKed / live
             last = self._account_attempt.get(ch)
@@ -308,8 +360,13 @@ class _Client:
             self._inflight[cid] = ("account", ch)
             self._account_attempt[ch] = now
             self._account_tries[ch] = self._account_tries.get(ch, 0) + 1
+            params: dict = {"channels": [ch]}
+            if ch == _CF_CHANNEL:
+                # Index-filtered, not market-filtered; "all" and we map the
+                # index ids we recognize (BRTI, <SYM>USD_RTI) to assets.
+                params["index_ids"] = ["all"]
             await self._send(ws, {"id": cid, "cmd": "subscribe",
-                                  "params": {"channels": [ch]}})
+                                  "params": params})
 
     async def _reconcile(self, ws) -> None:
         """Bring live subscriptions in line with the desired market sets."""
@@ -397,11 +454,27 @@ class _Client:
             self._on_fill(m)
         elif t == "market_lifecycle_v2":
             self._on_lifecycle(m)
+        elif t == "cfbenchmarks_value":
+            cf_ws.handle_message(m)  # exact settlement index → 15m model state
+        elif t == "cfbenchmarks_value_indexlist":
+            pass  # discovery reply — we subscribe ["all"] and filter by id
         elif t == "market_position":
             pass  # position deltas — REST reconcile remains the source of truth
         elif t == "error":
             msg = m.get("msg") or {}
             logger.debug(f"kalshi_ws: server error {msg.get('code')}: {msg.get('msg')}")
+            # A NAK'd subscribe must release its reservation, or it is never
+            # retried for the connection's lifetime: an orderbook sub left a
+            # `-1` placeholder in _ob_sids that _reconcile treated as "already
+            # subscribed", so the chase silently paid the REST fallback forever.
+            cid = m.get("id")
+            kind_key = self._inflight.pop(cid, None) if cid is not None else None
+            if kind_key:
+                kind, key = kind_key
+                if kind == "ob" and self._ob_sids.get(key) == -1:
+                    self._ob_sids.pop(key, None)
+                elif kind == "multi":
+                    self._multi_have[key] = set()
         # subscribed/ok/unsubscribed acks without a type handled above are no-ops
 
     def _on_subscribed(self, m: dict) -> None:
@@ -427,6 +500,10 @@ class _Client:
         self.books.pop(t, None)
         self._book_seq.pop(t, None)
         self._book_valid.pop(t, None)
+        # The quote cache was never pruned: with 15m crypto that's a new ticker
+        # per asset per 15 minutes forever (~20k entries/month). A ticker being
+        # dropped from the book set is also done as a quote consumer.
+        self.quotes.pop(t, None)
 
     def _on_snapshot(self, m: dict) -> None:
         msg = m.get("msg") or {}
@@ -493,7 +570,7 @@ class _Client:
         self.last_trade_msg_t = self._loop_time()
         # Match the REST /markets/trades shape the scanner consumes (it already
         # reads count_fp / yes_price_dollars / taker_side). REST calls it `ticker`.
-        self.trades.append({
+        trade = {
             "trade_id": msg.get("trade_id", ""),
             "ticker": t,
             "count_fp": msg.get("count_fp", "0"),
@@ -501,7 +578,15 @@ class _Client:
             "no_price_dollars": msg.get("no_price_dollars", "0"),
             "taker_side": msg.get("taker_side", ""),
             "created_time": msg.get("ts_ms") or msg.get("ts") or "",
-        })
+        }
+        self.trades.append(trade)
+        # Event hook (whale-sized trades wake the scanner instead of waiting out
+        # its timer). Sync + cheap by contract; errors never poison the feed.
+        if self.on_trade is not None:
+            try:
+                self.on_trade(trade)
+            except Exception as e:
+                logger.debug(f"kalshi_ws: on_trade cb error: {e}")
 
     def _on_fill(self, m: dict) -> None:
         if self.on_fill is None:
@@ -592,8 +677,8 @@ class _Client:
 _client = _Client()
 
 # Module-level delegators (the rest of the bot imports these).
-def start(env: str, *, on_fill=None, on_lifecycle=None) -> None:
-    _client.start(env, on_fill=on_fill, on_lifecycle=on_lifecycle)
+def start(env: str, *, on_fill=None, on_lifecycle=None, on_trade=None) -> None:
+    _client.start(env, on_fill=on_fill, on_lifecycle=on_lifecycle, on_trade=on_trade)
 
 
 async def stop() -> None:
@@ -602,6 +687,10 @@ async def stop() -> None:
 
 def set_env(env: str) -> None:
     _client.set_env(env)
+
+
+def set_cf_enabled(enabled: bool) -> None:
+    _client.set_cf_enabled(enabled)
 
 
 def is_connected() -> bool:

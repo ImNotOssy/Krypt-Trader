@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 
+import cf_ws
 import kalshi_api
+import kalshi_auth
+import kalshi_ws
 import indicators
+import spot_ws
 
 logger = logging.getLogger(__name__)
 
@@ -181,25 +186,47 @@ _SPOT_SOURCES = [
 
 
 async def fetch_spots() -> tuple[dict[str, float], str]:
+    # Spot priority chain, best-first overlay:
+    #   1. cf_ws  — Kalshi's own CF Benchmarks value feed: the EXACT index the
+    #      markets settle on, pushed ~1/sec over the authed socket.
+    #   2. spot_ws — Coinbase (a BRTI constituent) as the keyless proxy.
+    #   3. REST chain (CryptoCompare → Coinbase → CoinGecko) for whatever the
+    #      sockets don't cover and whenever they're down.
+    # Strict accelerator: never worse than pure REST.
+    cf = cf_ws.fresh_spots()
+    cb = spot_ws.fresh_spots()
+
     loop = asyncio.get_event_loop()
     now = loop.time()
     if _spot_cache["spots"] and (now - _spot_cache["at"]) < _SPOT_CACHE_TTL:
-        return dict(_spot_cache["spots"]), _spot_cache["source"]
+        base, source = dict(_spot_cache["spots"]), _spot_cache["source"]
+    else:
+        base, source = {}, "unavailable"
+        client = _get_spot_client()
+        for name, fn in _SPOT_SOURCES:
+            try:
+                spots = await fn(client)
+            except Exception as e:
+                logger.debug(f"crypto15m spot source {name} failed: {e}")
+                continue
+            if spots:
+                _spot_cache.update(at=now, spots=dict(spots), source=name)
+                base, source = dict(spots), name
+                break
+        if not base and _spot_cache["spots"]:
+            base, source = dict(_spot_cache["spots"]), f"{_spot_cache['source']} (stale)"
 
-    client = _get_spot_client()
-    for name, fn in _SPOT_SOURCES:
-        try:
-            spots = await fn(client)
-        except Exception as e:
-            logger.debug(f"crypto15m spot source {name} failed: {e}")
-            continue
-        if spots:
-            _spot_cache.update(at=now, spots=dict(spots), source=name)
-            return spots, name
-
-    if _spot_cache["spots"]:
-        return dict(_spot_cache["spots"]), f"{_spot_cache['source']} (stale)"
-    return {}, "unavailable"
+    merged = {**base, **cb, **cf}
+    if not merged:
+        return base, source
+    parts = []
+    if cf:
+        parts.append("kalshi-cf")
+    if cb and (set(cb) - set(cf)):
+        parts.append("coinbase-ws")
+    if set(merged) - set(cf) - set(cb):
+        parts.append(source)
+    return merged, "+".join(parts) if parts else source
 
 
 # ───────── underlying technical indicators (detection-only) ───────────
@@ -288,6 +315,12 @@ def _blank_asset(entry: dict, spot: Optional[float], error: Optional[str] = None
         # underlying technical indicators (detection-only, optional rule fields).
         "macd": None, "macdSignal": None, "macdHist": None,
         "macdCross": None, "rsi": None,
+        # spot-vs-strike settlement model (detection-only rule fields).
+        "strikeUsd": None, "deltaSignedPct": None, "sigma1m": None,
+        "modelProb": None, "edgeNetCents": None,
+        # prints of the final-minute settlement average already observed via
+        # the Coinbase WS sampler (0 outside the final minute / feed cold).
+        "settlePrints": 0,
     }
 
 
@@ -305,6 +338,139 @@ def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
     if start < end:
         return start <= hour < end
     return hour >= start or hour < end
+
+
+def _market_strike(m: dict) -> Optional[float]:
+    """The market's strike / reference price — the level the underlying must be
+    above at close for YES/up to win. The self-tracked `open15m` (first cached
+    spot seen after the boundary) drifts from Kalshi's actual strike, and is
+    plain WRONG after a mid-window restart; the market object carries the real
+    number, so prefer it always."""
+    for k in ("floor_strike", "floor_strike_dollars", "cap_strike",
+              "strike", "strike_dollars"):
+        v = m.get(k)
+        if v in (None, ""):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            return f
+    return None
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def model_up_prob(
+    spot: Optional[float], strike: Optional[float],
+    sigma_1m: Optional[float], mins_left: Optional[float],
+) -> Optional[float]:
+    """Terminal-spot model P(up): probability the spot ends above the strike at
+    close, treating the remaining move as N(0, (σ√t·spot)²) with σ the realized
+    1-minute return vol. Kept as the simple fallback — settlement_up_prob is
+    the production model (Kalshi settles on a 60s AVERAGE, not the endpoint)."""
+    if spot is None or strike is None or sigma_1m is None or mins_left is None:
+        return None
+    if spot <= 0 or strike <= 0 or sigma_1m <= 0:
+        return None
+    t = max(0.05, float(mins_left))  # floor: at 3s left a 0-σ window divides by 0
+    sd_abs = sigma_1m * math.sqrt(t) * spot
+    if sd_abs <= 0:
+        return None
+    return max(0.0, min(1.0, _norm_cdf((spot - strike) / sd_abs)))
+
+
+# Kalshi settlement = the average of ~one print per second over the final
+# minute (CF Benchmarks Real-Time Index). 60 prints, fixed.
+_SETTLE_PRINTS = 60
+# Variance of the mean of a 60-print random walk, in "equivalent minutes" of
+# terminal diffusion: Σ_{i,j≤n} min(i,j) = n(n+1)(2n+1)/6 seconds² → for n=60,
+# (60·61·121/6)/60²/60 ≈ 0.342 min. The averaging makes settlement ~3× less
+# variable than the final-minute endpoint — a terminal model systematically
+# UNDERprices deep favorites near the close.
+_SETTLE_AVG_EQUIV_MIN = (60 * 61 * 121 / 6) / (60.0 ** 2) / 60.0
+
+
+def settlement_up_prob(
+    spot: Optional[float], strike: Optional[float],
+    sigma_1m: Optional[float], mins_left: Optional[float],
+    *, partial_sum: float = 0.0, partial_count: int = 0,
+) -> Optional[float]:
+    """P(up) under Kalshi's REAL settlement rule: the mean of ~60 one-second
+    index prints over the final minute, not the terminal spot.
+
+    Outside the final minute: diffusion to the window start plus the fixed
+    variance of the 60-print average (≈0.342 min equivalent — continuous with
+    the in-window branch at exactly 1 minute left).
+
+    Inside the final minute the settlement value is being REALIZED print by
+    print: `partial_sum/partial_count` are the prints already observed (from
+    spot_ws.window_partial); only the future prints are uncertain, so with 30
+    of 60 in, half the settlement is already locked. Elapsed-but-unobserved
+    prints (feed started late) are approximated at the current spot — a small
+    bias toward spot, zero variance, strictly better than ignoring them."""
+    if spot is None or strike is None or sigma_1m is None or mins_left is None:
+        return None
+    if spot <= 0 or strike <= 0 or sigma_1m <= 0:
+        return None
+
+    if mins_left > 1.0:
+        t_eff = (float(mins_left) - 1.0) + _SETTLE_AVG_EQUIV_MIN
+        sd = sigma_1m * math.sqrt(t_eff) * spot
+        if sd <= 0:
+            return None
+        return max(0.0, min(1.0, _norm_cdf((spot - strike) / sd)))
+
+    n_future = max(1, int(round(max(0.0, float(mins_left)) * 60.0)))
+    n_future = min(n_future, _SETTLE_PRINTS)
+    elapsed = _SETTLE_PRINTS - n_future
+    k = max(0, min(int(partial_count or 0), elapsed))
+    s = float(partial_sum or 0.0) if k > 0 else 0.0
+    if k > 0 and partial_count and k < int(partial_count):
+        # Clock skew put more observed prints than elapsed seconds — scale the
+        # sum down to the k we can attribute.
+        s = s * (k / float(partial_count))
+    missing = elapsed - k
+    mean = (s + (missing + n_future) * spot) / float(_SETTLE_PRINTS)
+    sigma_1s = sigma_1m / math.sqrt(60.0)
+    var = (
+        (spot * sigma_1s) ** 2
+        * (n_future * (n_future + 1) * (2 * n_future + 1) / 6.0)
+        / float(_SETTLE_PRINTS ** 2)
+    )
+    if var <= 0:
+        return None
+    return max(0.0, min(1.0, _norm_cdf((mean - strike) / math.sqrt(var))))
+
+
+def _fee_cents(price_cents: float) -> float:
+    p = max(1.0, min(99.0, price_cents)) / 100.0
+    return 7.0 * p * (1.0 - p)
+
+
+def model_edge_net_cents(
+    up_prob: Optional[float], yes_ask: Optional[float], no_ask: Optional[float],
+) -> Optional[float]:
+    """Best fee-adjusted cents of edge the settlement model sees on EITHER
+    side: buy-up edge = P(up)·100 − upAsk − fee, buy-down mirrored. Positive =
+    the model thinks a side is underpriced net of the taker fee; the sign of
+    which side is implied by upProb vs the asks. None when the model or both
+    asks are unavailable."""
+    if up_prob is None:
+        return None
+    edges = []
+    if yes_ask and 0 < yes_ask < 1:
+        ask_c = yes_ask * 100.0
+        edges.append(up_prob * 100.0 - ask_c - _fee_cents(ask_c))
+    if no_ask and 0 < no_ask < 1:
+        ask_c = no_ask * 100.0
+        edges.append((1.0 - up_prob) * 100.0 - ask_c - _fee_cents(ask_c))
+    if not edges:
+        return None
+    return round(max(edges), 2)
 
 
 def _track_window_open(asset: str, window_start: int, spot: Optional[float]) -> Optional[float]:
@@ -343,10 +509,37 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
     candidates.sort(key=lambda x: x[0])
     close_epoch, m = candidates[0]
 
+    # Overlay the live WS ticker quote when it's fresher than the REST list
+    # response (the loop subscribes every ACTIVE window ticker, so entry and
+    # pairs decisions read real-time prices instead of the snapshot cache's
+    # 0-7s-stale ones). On Kalshi's complementary book the NO ask is exactly
+    # 100c − yes_bid, so the overlay covers both sides.
+    wsq = kalshi_ws.ticker_quote(m.get("ticker") or "")
+    if wsq:
+        ts_ms = float(wsq.get("ts_ms") or 0)
+        if ts_ms > 0 and (now_epoch * 1000.0 - ts_ms) <= 10_000.0:
+            yb, ya = wsq.get("yes_bid_cents"), wsq.get("yes_ask_cents")
+            lp = wsq.get("last_cents")
+            if yb is not None:
+                m = dict(m)
+                m["yes_bid_dollars"] = yb / 100.0
+                m["no_ask_dollars"] = (100 - yb) / 100.0
+                if ya is not None:
+                    m["yes_ask_dollars"] = ya / 100.0
+                if lp is not None:
+                    m["last_price_dollars"] = lp / 100.0
+
     window_start = int(close_epoch - _QUARTER_SEC)
     open15m = _track_window_open(asset, window_start, spot)
-    delta = abs(open15m - spot) if (open15m is not None and spot is not None) else None
-    delta_pct = (delta / open15m) if (delta is not None and open15m) else None
+    # Reference level: Kalshi's actual strike when the market carries it (it
+    # does for the up/down series); the self-tracked window-open spot is only
+    # the fallback — it can be a pre-window price up to ~14s stale and is wrong
+    # for any window observed first mid-way (e.g. right after an app start).
+    strike = _market_strike(m)
+    ref = strike if strike is not None else open15m
+    delta_signed = ((spot - ref) / ref) if (ref and spot is not None) else None
+    delta = abs(spot - ref) if (ref is not None and spot is not None) else None
+    delta_pct = abs(delta_signed) if delta_signed is not None else None
 
     yes_bid = _price_dollars(m, "yes_bid")
     yes_ask = _price_dollars(m, "yes_ask")
@@ -361,17 +554,46 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
 
     mins_left = (close_epoch - now_epoch) / 60.0
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
-    in_window = mins_left <= _const(cfg, "time_delay_min")
+    # HARD floor on new entries: Kalshi's final 60s IS the settlement sampling
+    # window (the 60-print average is being computed), and binary gamma is at
+    # its maximum — a favorite bought at 89c with 37s left can settle at 0
+    # (real trade #250: −$7.12, the session's biggest loss). No signal fires
+    # inside the final minute regardless of the entry-window setting.
+    in_window = 1.0 <= mins_left <= _const(cfg, "time_delay_min")
+    # Strict threshold (default ON): entry_threshold is a HARD floor on the
+    # price actually paid (the executable ask of the favorite side), not just
+    # the mid-derived probability. On thin/one-sided books the mid can call an
+    # 85c favorite while the real ask is way below (e.g. a 71c NO) — the
+    # favorite isn't actually that strong, so no signal. Also requires a
+    # two-sided book: a mid built from one quote or last_price is exactly the
+    # degenerate snapshot that produces those phantom favorites.
+    strict = bool(cfg.get("crypto15m_strict_threshold", True))
+    two_sided = bool(yes_bid and yes_ask)
+    # min_delta_pct is direction-AWARE when the signed move is known: the
+    # underlying must have moved toward the favorite by ≥ the gate, not merely
+    # moved (an adverse move used to satisfy the old abs() check — buying the
+    # favorite precisely as the spot ran against it).
+    min_dp = _const(cfg, "min_delta_pct")
+    if delta_signed is None or min_dp <= 0:
+        delta_ok = True
+    elif favorite == "up":
+        delta_ok = delta_signed >= min_dp
+    else:
+        delta_ok = delta_signed <= -min_dp
     signal = (
         in_window
         and hours_ok(cfg)
         and fav_price >= _const(cfg, "entry_threshold")
         and entry_cost <= _const(cfg, "entry_max")
-        and (delta_pct is None or delta_pct >= _const(cfg, "min_delta_pct"))
+        and delta_ok
+        and (not strict or (two_sided and entry_cost >= _const(cfg, "entry_threshold")))
     )
 
     out.update({
         "open15mUsd": open15m, "deltaUsd": delta, "deltaPct": delta_pct,
+        "strikeUsd": ref, "deltaSignedPct": (
+            round(delta_signed, 6) if delta_signed is not None else None
+        ),
         "hasMarket": True, "ticker": m.get("ticker"),
         "closeTime": m.get("close_time"), "minsLeft": round(mins_left, 2),
         "upProb": round(up, 4), "downProb": round(down, 4),
@@ -382,6 +604,11 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         "inWindow": in_window, "signal": signal, "hourUtc": hour_utc,
     })
 
+    # Both sides' asks are always exposed — the pairs engine and rule builder
+    # need them regardless of the arb detector toggle.
+    out["upAsk"] = round(yes_ask, 4) if yes_ask else None
+    out["downAsk"] = round(no_ask, 4) if no_ask else None
+
     # Up + Down ≠ $1 arbitrage detection (market-neutral edge). Detection only.
     # On Kalshi a single binary market carries both sides, so if yes_ask + no_ask
     # sums below $1 you could buy both for a locked profit — computed for free
@@ -391,8 +618,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         up_ask_c = round(yes_ask * 100.0, 1)
         dn_ask_c = round(no_ask * 100.0, 1)
         edge_c = round(100.0 - (up_ask_c + dn_ask_c), 1)
-        out["upAsk"] = round(yes_ask, 4)
-        out["downAsk"] = round(no_ask, 4)
         out["arbEdgeCents"] = edge_c
         out["arbSignal"] = edge_c >= thresh
 
@@ -410,6 +635,27 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         out["macdHist"] = ind.get("macdHist")
         out["macdCross"] = ind.get("macdCross")
         out["rsi"] = ind.get("rsi")
+        out["sigma1m"] = ind.get("sigma1m")
+        # Spot-vs-strike settlement model (detection-only): P(up) under
+        # Kalshi's real settlement rule (60s BRTI average). Inside the final
+        # minute the Coinbase WS sampler supplies the prints already realized,
+        # so the probability sharpens second by second while the market quote
+        # lags. Recorded by the tick logger + exposed to the rule builder so
+        # users can gate on `edgeNetCents >= X` once their data supports it.
+        # Realized settlement prints: prefer Kalshi's own final-minute average
+        # (the exact number, with its print count) over the Coinbase sampler.
+        psum, pcount = cf_ws.settle_partial(asset, close_epoch)
+        if pcount == 0:
+            psum, pcount = spot_ws.window_partial(asset, close_epoch)
+        out["settlePrints"] = pcount
+        mp = settlement_up_prob(
+            spot, ref, ind.get("sigma1m"), mins_left,
+            partial_sum=psum, partial_count=pcount,
+        )
+        out["modelProb"] = round(mp, 4) if mp is not None else None
+        out["edgeNetCents"] = model_edge_net_cents(
+            mp, yes_ask if yes_ask else None, no_ask if no_ask else None,
+        )
     return out
 
 
@@ -446,13 +692,24 @@ _snapshot_cache: dict = {"at": 0.0, "data": None}
 _SNAPSHOT_TTL = 3.0
 
 
+def active_tickers() -> set[str]:
+    """Tickers of the CURRENT 15m window per asset (from the last snapshot) —
+    the set the WS layer subscribes so entry/pairs decisions read live quotes,
+    not just positions we already hold."""
+    snap = _snapshot_cache.get("data") or {}
+    return {
+        a["ticker"] for a in snap.get("assets", [])
+        if a.get("hasMarket") and a.get("ticker")
+    }
+
+
 async def snapshot(cfg: dict) -> dict:
     """Build the full monitor snapshot for all seven series, then inject the
     cross-asset fields. Cached ~3s so the executor poll, the recorder and the
     open Crypto tab SHARE one snapshot instead of each firing the full fan-out
     (incl. the new Hyperliquid indicator calls) — well inside the poll interval
     and a 15-min window, so the slight staleness is immaterial."""
-    now_epoch = datetime.now(timezone.utc).timestamp()
+    now_epoch = kalshi_auth.server_now()
     cached = _snapshot_cache.get("data")
     if cached is not None and (now_epoch - _snapshot_cache.get("at", 0.0)) < _SNAPSHOT_TTL:
         return cached
@@ -488,6 +745,7 @@ async def snapshot(cfg: dict) -> dict:
             "entryMax": _const(cfg, "entry_max"),
             "minDeltaPct": _const(cfg, "min_delta_pct"),
             "entryDiff": _const(cfg, "entry_diff"),
+            "strictThreshold": bool(cfg.get("crypto15m_strict_threshold", True)),
             "directionMode": str(cfg.get("crypto15m_direction_mode", "favorite")),
             "entryStyle": str(cfg.get("crypto15m_entry_style", "maker")),
             "hoursStartUtc": int(cfg.get("crypto15m_hours_start_utc", 0) or 0),

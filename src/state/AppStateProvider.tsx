@@ -55,6 +55,15 @@ const DEFAULT_BACKEND: BackendInfo = {
   authOk: false,
 };
 
+/** OS-level toast for money moments (fills, settlements). Electron grants
+ * Notification permission by default; failures are silently ignored. */
+function notify(title: string, body: string): void {
+  try {
+    // eslint-disable-next-line no-new
+    new Notification(title, { body, silent: true });
+  } catch { /* headless / permission denied — never break state flow */ }
+}
+
 export function AppStateProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState | null>(null);
   const [backend, setBackend] = useState<BackendInfo>(DEFAULT_BACKEND);
@@ -66,7 +75,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [credentials, setCredentials] = useState<CredentialsState | null>(null);
   const [credentialsAll, setCredentialsAll] = useState<CredentialsStatusAll | null>(null);
   const [strategies, setStrategies] = useState<StrategyPreset[]>([]);
-  const [appVersion, setAppVersion] = useState('2.6.1');
+  const [appVersion, setAppVersion] = useState('3.0.0');
 
   const positionsByIdRef = useRef<Map<number, BotPosition>>(new Map());
   const signalsByKeyRef = useRef<Map<string, SignalRow>>(new Map());
@@ -194,6 +203,18 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     const offBackend = window.krypt.backend.onInfo((b) => setBackend(b));
     const offAccount = window.krypt.data.onAccount((a) => setAccount(a));
     const offPos = window.krypt.data.onPosition((p) => {
+      // Money-moment notifications: diff status transitions so fills,
+      // stop-outs and settlements surface without staring at a table.
+      const prev = positionsByIdRef.current.get(p.id);
+      if (prev && prev.status !== p.status) {
+        const name = p.title || p.ticker;
+        if (p.status === 'filled' && prev.status !== 'filled') {
+          notify(`Filled: ${name}`, `${p.filledContracts} @ ${p.avgFillPriceCents ?? '?'}¢`);
+        } else if (p.resolved && !prev.resolved && typeof p.pnlUsd === 'number') {
+          const won = p.pnlUsd >= 0;
+          notify(`${won ? 'Won' : 'Lost'} $${Math.abs(p.pnlUsd).toFixed(2)} — ${name}`, p.status ?? '');
+        }
+      }
       positionsByIdRef.current.set(p.id, p);
       flushPositions();
     });

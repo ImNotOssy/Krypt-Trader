@@ -24,6 +24,7 @@ def _base(monkeypatch):
     monkeypatch.setattr(service, "emit_event", _noop_emit)
     monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
     monkeypatch.setattr(kalshi_auth, "prime_credentials", lambda *a, **k: True)
+    monkeypatch.setattr(kalshi_auth, "sync_server_time", lambda *a, **k: 0)
     yield
     service.STATE.auth_ok = False
 
@@ -33,7 +34,7 @@ def test_reverify_recovers_when_creds_valid(monkeypatch):
     # verify succeeds, re-enabling trading without user intervention.
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: True)
 
-    async def _bal():
+    async def _bal(*a, **k):
         return {"balance": 4200}
 
     monkeypatch.setattr(kalshi_api, "get_balance", _bal)
@@ -45,7 +46,7 @@ def test_reverify_noop_without_credentials(monkeypatch):
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: False)
     calls = {"n": 0}
 
-    async def _bal():
+    async def _bal(*a, **k):
         calls["n"] += 1
         return {"balance": 1}
 
@@ -60,7 +61,7 @@ def test_reverify_stays_off_when_verify_fails(monkeypatch):
     # the exception from killing the loop and retries later.
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: True)
 
-    async def _bal():
+    async def _bal(*a, **k):
         raise RuntimeError("kalshi 503")
 
     monkeypatch.setattr(kalshi_api, "get_balance", _bal)
@@ -73,7 +74,7 @@ def test_reverify_noop_when_already_authed(monkeypatch):
     service.STATE.auth_ok = True
     calls = {"n": 0}
 
-    async def _bal():
+    async def _bal(*a, **k):
         calls["n"] += 1
         return {"balance": 1}
 

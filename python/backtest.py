@@ -13,14 +13,31 @@ DEFAULT_FEE_COEFF = 0.07
 
 
 
-def kalshi_fee_per_contract(price: float, fee_coeff: float = DEFAULT_FEE_COEFF) -> float:
+def kalshi_fee_per_contract(
+    price: float, fee_coeff: float = DEFAULT_FEE_COEFF,
+    contracts: Optional[int] = None,
+) -> float:
+    """Kalshi taker fee per contract, in dollars.
+
+    contracts=None → the continuous marginal rate fee_coeff·p·(1−p) (right for
+    large orders, where per-order rounding vanishes). With `contracts`, model
+    the REAL fee: Kalshi rounds the per-ORDER fee UP to the next cent, so small
+    orders pay much more per contract — a 1-lot at 95c pays 1c (3× the 0.33c
+    continuous model), which is exactly where the deep-favorite presets live.
+    """
     p = max(0.0, min(1.0, float(price)))
-    return fee_coeff * p * (1.0 - p)
+    raw = fee_coeff * p * (1.0 - p)
+    if not contracts or contracts <= 0:
+        return raw
+    return math.ceil(raw * contracts * 100.0) / 100.0 / contracts
 
 
-def net_pnl_per_contract(cost: float, correct: bool, fee_coeff: float = DEFAULT_FEE_COEFF) -> float:
+def net_pnl_per_contract(
+    cost: float, correct: bool, fee_coeff: float = DEFAULT_FEE_COEFF,
+    contracts: Optional[int] = None,
+) -> float:
     gross = (1.0 - cost) if correct else (-cost)
-    return gross - kalshi_fee_per_contract(cost, fee_coeff)
+    return gross - kalshi_fee_per_contract(cost, fee_coeff, contracts)
 
 
 def signal_cost(row: dict, source: str) -> float:
@@ -34,7 +51,10 @@ def signal_cost(row: dict, source: str) -> float:
 
 
 
-def summarize(signals: list[dict], fee_coeff: float = DEFAULT_FEE_COEFF) -> dict:
+def summarize(
+    signals: list[dict], fee_coeff: float = DEFAULT_FEE_COEFF,
+    contracts: Optional[int] = None,
+) -> dict:
     n = len(signals)
     if n == 0:
         return {"n": 0, "wins": 0, "win_rate": 0.0, "gross_ev": 0.0,
@@ -48,8 +68,8 @@ def summarize(signals: list[dict], fee_coeff: float = DEFAULT_FEE_COEFF) -> dict
         if correct:
             wins += 1
         grosses.append((1.0 - cost) if correct else (-cost))
-        fees.append(kalshi_fee_per_contract(cost, fee_coeff))
-        nets.append(net_pnl_per_contract(cost, correct, fee_coeff))
+        fees.append(kalshi_fee_per_contract(cost, fee_coeff, contracts))
+        nets.append(net_pnl_per_contract(cost, correct, fee_coeff, contracts))
 
     mean_net = sum(nets) / n
     var = sum((x - mean_net) ** 2 for x in nets) / (n - 1) if n > 1 else 0.0
@@ -334,7 +354,10 @@ def crypto15m_eval(
             cost = s["entry_cost"]
             correct = s["fav_won"]
         built.append({"cost": cost, "correct": correct, "confidence": fp * 100.0})
-    return summarize(built, fee_coeff)
+    # contracts=1 models the shipped 15m default (1-lot orders), where Kalshi's
+    # per-order round-UP dominates: at 95c the real fee is 1c/contract, 3× the
+    # continuous rate — the difference between a "+2.8c edge" and reality.
+    return summarize(built, fee_coeff, contracts=1)
 
 
 _FAV_THRESHOLDS = [50, 60, 70, 80, 85, 90, 95]
@@ -409,7 +432,8 @@ def format_crypto15m_report(report: dict, source_label: str) -> str:
     fc = report["fee_coeff"]
     L = ["═══ Krypt Trader — 15-minute crypto backtest ═══",
          f"source: {source_label}",
-         f"fee model: {fc:.3f} × C × P × (1−P)",
+         f"fee model: ceil({fc:.3f} × C × P × (1−P)) per order, C=1 "
+         f"(matches the 1-lot default; Kalshi rounds each order's fee up to the cent)",
          f"settled 15m signals: {report['n']}", ""]
     if report["n"] == 0:
         L.append("No settled 15m signals yet. Leave the app open — the recorder logs")

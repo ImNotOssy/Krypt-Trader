@@ -68,6 +68,9 @@ const api: KryptApi = {
     setEnabled: (v: boolean): Promise<ActionResult> =>
       ipcRenderer.invoke('trading:setEnabled', v),
     cancelAllOpen: () => ipcRenderer.invoke('trading:cancelAllOpen'),
+    status: () => ipcRenderer.invoke('trading:status'),
+    collection: () => ipcRenderer.invoke('backtest:collection'),
+    exportData: () => ipcRenderer.invoke('backtest:export'),
     flatten: () => ipcRenderer.invoke('trading:flatten'),
   },
   data: {
@@ -88,6 +91,9 @@ const api: KryptApi = {
   crypto15m: {
     snapshot: () => ipcRenderer.invoke('crypto15m:snapshot'),
     status: () => ipcRenderer.invoke('crypto15m:status'),
+    backtest: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('crypto15m:backtest', args),
+    backtestMain: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('main:backtest', args),
+    history: (args?: { limit?: number }) => ipcRenderer.invoke('crypto15m:history', args),
   },
   kalshi: {
     marketUrl: (args) => ipcRenderer.invoke('kalshi:marketUrl', args),

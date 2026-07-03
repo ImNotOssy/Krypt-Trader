@@ -24,6 +24,14 @@ PATH_PREFIX = "/trade-api/v2"
 REQUEST_TIMEOUT = 25.0
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.5
+# Hot-path budget for latency-critical calls (order place/cancel, order status,
+# orderbook): one hung socket must cost seconds, not the bulk 25s — a stop-loss
+# waiting out 3 × 25s retries rides a crash for over a minute.
+HOT_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=6.0, pool=6.0)
+# Keep-alive: httpx's default expiry is 5s, and hot signed calls are often
+# spaced further apart than that — so most order placements paid a fresh
+# TCP+TLS handshake (~100-300ms). 60s keeps the connection warm between polls.
+KEEPALIVE_SEC = 60.0
 
 _pub_client: Optional[httpx.AsyncClient] = None
 _signed_client: Optional[httpx.AsyncClient] = None
@@ -39,7 +47,10 @@ async def _get_pub_client() -> httpx.AsyncClient:
                 "Accept": "application/json",
                 "User-Agent": "KryptTrader/1.0",
             },
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(
+                max_connections=20, max_keepalive_connections=10,
+                keepalive_expiry=KEEPALIVE_SEC,
+            ),
             follow_redirects=True,
         )
     return _pub_client
@@ -66,7 +77,10 @@ async def _get_signed_client() -> httpx.AsyncClient:
                 "Content-Type": "application/json",
                 "User-Agent": "KryptTrader/1.0",
             },
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=httpx.Limits(
+                max_connections=10, max_keepalive_connections=5,
+                keepalive_expiry=KEEPALIVE_SEC,
+            ),
         )
         _signed_env = env
     return _signed_client
@@ -273,18 +287,41 @@ async def _signed_request(
     *,
     json: dict | None = None,
     params: dict | None = None,
+    timeout: httpx.Timeout | float | None = None,
+    pin_env: str | None = None,
 ) -> Any:
+    """Signed request with retries.
+
+    Env safety: the env is PINNED (to `pin_env` when given — read under
+    ENV_LOCK by order placement — else to the env seen on the first attempt).
+    If a credential test / env switch flips the global env at any point,
+    attempts ABORT instead of silently signing for (and sending real money to)
+    the other account. Signing + client fetch are back-to-back with no lock held
+    across the HTTP call itself, so a slow request or its 429/backoff ladder can
+    never wedge other callers (the old design held ENV_LOCK around whole calls —
+    one hung balance poll blocked every order placement behind it).
+    """
     assert path.startswith("/")
     signed_path = f"{PATH_PREFIX}{path}"
     method = method.upper()
     last_exc: Optional[Exception] = None
+    env0: Optional[str] = pin_env
 
     for attempt in range(1, MAX_RETRIES + 1):
+        cur_env = get_env()
+        if env0 is None:
+            env0 = cur_env
+        elif cur_env != env0:
+            raise KalshiAPIError(
+                409, {"error": {"code": "env_changed",
+                                "message": "environment switched mid-request; aborted"}},
+            )
         headers = sign_headers(method, signed_path)
         client = await _get_signed_client()
         try:
             resp = await client.request(
-                method, signed_path, headers=headers, json=json, params=params
+                method, signed_path, headers=headers, json=json, params=params,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         except (httpx.TimeoutException, httpx.NetworkError) as e:
             last_exc = e
@@ -310,7 +347,9 @@ async def _signed_request(
         if resp.status_code == 401 and attempt < MAX_RETRIES:
             code = ((body.get("error") or {}).get("code") or "") if isinstance(body, dict) else ""
             if "timestamp" in code:
-                sync_server_time(force=True)
+                # Blocking 5s HTTP HEAD — run it off the event loop so a clock
+                # resync can't freeze every other coroutine (incl. exits).
+                await asyncio.to_thread(sync_server_time, True)
                 await asyncio.sleep(0.2)
                 continue
 
@@ -323,8 +362,8 @@ async def _signed_request(
     raise RuntimeError("exhausted retries without response")
 
 
-async def get_balance() -> dict:
-    return await _signed_request("GET", "/portfolio/balance")
+async def get_balance(pin_env: str | None = None) -> dict:
+    return await _signed_request("GET", "/portfolio/balance", pin_env=pin_env)
 
 
 async def get_positions(
@@ -370,7 +409,28 @@ async def get_settled_positions(limit: int = 200) -> list[dict]:
 
 
 async def get_order(order_id: str) -> dict:
-    return await _signed_request("GET", f"/portfolio/orders/{order_id}")
+    return await _signed_request(
+        "GET", f"/portfolio/orders/{order_id}", timeout=HOT_TIMEOUT,
+    )
+
+
+async def find_order_by_client_id(
+    client_order_id: str, *, ticker: str = "", limit: int = 200,
+) -> dict | None:
+    """Look an order up by our client_order_id. Used after a POST whose
+    response was lost (timeout / dropped connection): the order may be live on
+    Kalshi even though place_limit_order raised, and booking it as 'error'
+    would leave an untracked real-money position. Returns the order dict or
+    None when no order with that client id exists."""
+    params: dict = {"limit": int(limit)}
+    if ticker:
+        params["ticker"] = ticker
+    data = await _signed_request("GET", "/portfolio/orders", params=params)
+    orders = (data.get("orders") if isinstance(data, dict) else data) or []
+    for o in orders:
+        if isinstance(o, dict) and str(o.get("client_order_id") or "") == str(client_order_id):
+            return o
+    return None
 
 
 async def get_fills_for_order(order_id: str, limit: int = 200) -> list[dict]:
@@ -449,7 +509,9 @@ async def get_orderbook(ticker: str) -> dict:
     if wb is not None and (wb["yes"] or wb["no"]):
         return wb
     try:
-        book = _normalize_orderbook(await _signed_request("GET", f"/markets/{ticker}/orderbook"))
+        book = _normalize_orderbook(await _signed_request(
+            "GET", f"/markets/{ticker}/orderbook", timeout=HOT_TIMEOUT,
+        ))
         if book["yes"] or book["no"]:
             return book
     except Exception:
@@ -500,13 +562,23 @@ async def place_limit_order(
         "time_in_force": "good_till_canceled",
         "self_trade_prevention_type": "taker_at_cross",
     }
-    # Hold ENV_LOCK across sign+send so a concurrent credential test / env switch
-    # (which briefly flips the global signing env) can never route this real-money
-    # order to the wrong Kalshi account.
+    # Serialize against an in-progress credential test / env switch (which
+    # briefly flips the global signing env) WITHOUT holding the lock across the
+    # HTTP call: the env is read under ENV_LOCK (so a flip-in-progress is waited
+    # out) and pinned across every attempt inside _signed_request — a flip after
+    # the read makes the request ABORT rather than sign for the other account.
+    # A slow send / 429 ladder no longer wedges every other caller behind the
+    # lock (the old design held it across the whole call, worst case ~80s).
     async with ENV_LOCK:
-        return await _signed_request("POST", ORDERS_V2_PATH, json=body)
+        env0 = get_env()
+    return await _signed_request(
+        "POST", ORDERS_V2_PATH, json=body, timeout=HOT_TIMEOUT, pin_env=env0,
+    )
 
 
 async def cancel_order(order_id: str) -> dict:
     async with ENV_LOCK:
-        return await _signed_request("DELETE", f"{ORDERS_V2_PATH}/{order_id}")
+        env0 = get_env()  # wait out any env flip, pin; see place_limit_order
+    return await _signed_request(
+        "DELETE", f"{ORDERS_V2_PATH}/{order_id}", timeout=HOT_TIMEOUT, pin_env=env0,
+    )

@@ -6,6 +6,7 @@ import { useApp } from '../state/AppStateProvider';
 import { Card, Empty, Page, ShareableStat, StatCard } from '../components/common';
 import { cls, fmtPct, fmtRelative, fmtUsd } from '../utils/format';
 import { computeTradeWarnings } from '../utils/warnings';
+import { WhyNotTrading } from '../components/WhyNotTrading';
 import type { PageId } from '../App';
 
 interface DashboardProps {
@@ -260,6 +261,9 @@ export function DashboardPage({ onNav }: DashboardProps) {
             <Mini label="Momentum hit" value={`${(scannerStats?.momentum.winRate ?? 0).toFixed(1)}%`} />
             <Mini label="Markets" value={`${scannerStats?.marketsTracked ?? 0}`} />
             <Mini label="Last scan" value={fmtRelative(scannerStats?.lastTradeScanAt)} />
+          </div>
+          <div className="mt-4">
+            <WhyNotTrading />
           </div>
         </Card>
       </div>

@@ -26,6 +26,10 @@ export interface TraderConfig {
   minEdgePtsMomentum: number;
   minConfidenceWhale: number;
   minConfidenceMomentum: number;
+  feeAwareEdge?: boolean;          // subtract the Kalshi taker fee from edge before the min-edge gates
+  maxEntrySlippageCents?: number;  // reject entries priced more than N¢ past the signal price; 0 = off
+  minMarketVolume?: number;        // skip signals on markets with lifetime volume below this; 0 = off
+  maxTradeAgeMin?: number;         // only count tape trades younger than N minutes (whales + clusters)
   minEntryPriceCents: number;
   maxEntryPriceCents: number;
   maxResolutionDays?: number; // skip markets resolving more than N days out; 0 = off
@@ -71,6 +75,7 @@ export interface TraderConfig {
 
   startBankrollUsd: number;
   stopLossOnDay: number;
+  stopLossOnDayPct?: number; // daily stop as a fraction of the day-start total (0..1); tighter of the two limits binds; 0 = off
   takeProfitOnDay: number;
 
   tradingHoursEnabled: boolean;
@@ -80,10 +85,6 @@ export interface TraderConfig {
   tradingTimezoneOffsetMin: number;
 
   minWhaleUsd: number;
-  minWhaleConfidence: number;
-  minWhaleEdge: number;
-  minMomentumConfidence: number;
-  minMomentumEdge: number;
   minEntryPriceFrac: number;
 
   eventWebhookUrl: string;
@@ -100,11 +101,17 @@ export interface TraderConfig {
   crypto15mOrderSize?: number;
   crypto15mBalancePct?: number;
   crypto15mMaxLossPct?: number;
+  crypto15mMaxTotalPct?: number;             // aggregate cap: total committed 15m cost ≤ this fraction of bankroll; 0 = off
   crypto15mMaxConcurrent?: number;
   crypto15mAssets?: string[] | null;        // which assets the executor may enter (null = all)
-  crypto15mDirectionMode?: 'favorite' | 'contrarian';
+  crypto15mDirectionMode?: 'favorite' | 'contrarian' | 'model';
+  crypto15mModelMinProb?: number;                // sniper: min model probability for the bought side (0.5–1)
+  crypto15mModelMinEdgeCents?: number;           // sniper: min fee-adjusted edge vs the ask (¢)
+  crypto15mModelFinalMinute?: boolean;           // sniper: allow final-60s entries with ≥30 settlement prints + 3σ certainty
+  crypto15mModelAutopause?: boolean;             // sniper: auto-pause entries when rolling calibration drops below break-even
   crypto15mTimeDelayMin?: number;
   crypto15mEntryThreshold?: number;
+  crypto15mStrictThreshold?: boolean;            // hard floor: the price actually paid must be ≥ entryThreshold (two-sided book required)
   crypto15mEntryMax?: number;
   crypto15mExitThreshold?: number;
   crypto15mStopSlippageCents?: number;
@@ -120,11 +127,22 @@ export interface TraderConfig {
   crypto15mHoursStartUtc?: number;
   crypto15mHoursEndUtc?: number;
   crypto15mRecordSignals?: boolean;
+  mainRecordSignals?: boolean;             // record whale/momentum signals while the app runs (forced on when trading is enabled)
   crypto15mIndicatorDetect?: boolean;            // compute underlying MACD/RSI (rule fields, detection-only)
+  crypto15mSpotWs?: boolean;                     // Coinbase WS spot feed (BRTI proxy) + final-minute settlement tracker
   crypto15mArbDetect?: boolean;                  // detect Up+Down ≠ $1 arbitrage
   crypto15mArbMinEdgeCents?: number;             // minimum edge (cents) to flag an arb
   crypto15mUseRules?: boolean;                   // use the composed rule-set as the entry gate
   crypto15mRules?: RuleCondition[];              // composed entry conditions (all AND-ed)
+  // Pairs — temporal complement accumulation (buy YES on dips + NO on peaks;
+  // matched pairs settle at exactly $1, so blended cost < ceiling = locked profit)
+  crypto15mPairsEnabled?: boolean;
+  crypto15mDirectionalEnabled?: boolean;         // favorite/contrarian engine; false = pairs-only mode
+  crypto15mPairsCeilingCents?: number;           // max blended YES+NO cost per pair (¢)
+  crypto15mPairsDipCents?: number;               // a leg buys only this far below its rolling median (¢)
+  crypto15mPairsClip?: number;                   // contracts per leg
+  crypto15mPairsFirstLegMinCents?: number;       // never start a pair below this ask (strong favorite = trend, not seesaw)
+  crypto15mPairsFirstLegMaxCents?: number;       // never start a pair above this ask (¢)
 }
 
 export interface CredentialsState {
@@ -425,6 +443,13 @@ export interface Crypto15mAsset {
   macdHist?: number | null;      // MACD histogram = macd − signal
   macdCross?: number | null;     // +1 bullish / −1 bearish / 0 no cross on this bar
   rsi?: number | null;           // Wilder RSI(14), 0..100
+  // spot-vs-strike settlement model (detection-only rule fields)
+  strikeUsd?: number | null;       // Kalshi strike (fallback: tracked window open)
+  deltaSignedPct?: number | null;  // (spot − strike)/strike; + = above strike
+  sigma1m?: number | null;         // realized 1-min return vol (fraction/√min)
+  modelProb?: number | null;       // model P(up) under Kalshi's 60s-average settlement rule
+  edgeNetCents?: number | null;    // best fee-adjusted model edge on either side (¢)
+  settlePrints?: number;           // final-minute settlement prints already observed (0 outside it)
 }
 
 export interface Crypto15mSnapshot {
@@ -447,6 +472,7 @@ export interface Crypto15mPosition {
   ticker: string;
   side: 'up' | 'down' | '';
   direction: 'yes' | 'no' | '';
+  strategy?: string;               // '' = directional; 'pair' = complement-accumulation leg
   targetContracts: number;
   filledContracts: number;
   entryLimitCents: number;
@@ -489,7 +515,63 @@ export interface Crypto15mSizing {
   note: string;
 }
 
+export interface Crypto15mBacktest {
+  n: number;
+  wins: number;
+  winRate: number;
+  netEvCentsPerContract: number;
+  totalPnlUsd: number;
+  maxDrawdownUsd: number;
+  contracts: number;
+  windowsScanned: number;
+  byAsset: Record<string, { n: number; wins: number; pnlUsd: number }>;
+  equity: { at: string | null; value: number }[];
+  byHourUtc: { hour: number; n: number; wins: number; pnlUsd: number }[];
+  byDay: { day: string; n: number; wins: number; pnlUsd: number }[];
+  trades: { ticker: string; asset: string; side: string; costCents: number; minsLeft: number | null; won: boolean; pnlUsd: number; at: string }[];
+  caveats: string[];
+}
+
+export interface CollectionStats {
+  c15: {
+    windows: number; resolved: number; ticks: number;
+    firstAt: string | null; lastAt: string | null;
+    recent: { ticker: string; asset: string; favorite: string | null; favorite_price: number | null; up_won: number | null; resolved: number; close_time: string }[];
+  };
+  main: {
+    whales: number; whalesResolved: number; alerts: number; alertsResolved: number;
+    firstAt: string | null; lastAt: string | null;
+    topCategories: { category: string; n: number }[];
+    recent: { ticker: string; category: string; taker_side: string; price: number; dollar_value: number; outcome_correct: number | null; resolved: number; created_at: string }[];
+  };
+  collecting: { c15: boolean; main: boolean };
+}
+
+export interface TradingGate {
+  id: string;
+  label: string;
+  state: 'ok' | 'blocked' | 'off';
+  reason: string;
+}
+
+export interface TradingStatus {
+  main: TradingGate[];
+  mainFilterCounts: Record<string, number>;
+  mainCandidates: number;
+  mainPlaced: number;
+  c15: {
+    enabled: boolean;
+    live: boolean;
+    authed: boolean;
+    env: string;
+    blockReasons: Record<string, string>;
+    takeProfitHalted?: boolean;
+  };
+}
+
 export interface Crypto15mStatus {
+  byStrategy?: { strategy: string; n: number; wins: number; losses: number; pnl_usd: number; fees_usd: number }[];
+  modelCalibration?: { ok: boolean; n: number; rate: number | null; lb: number | null };
   enabled: boolean;
   live: boolean;
   liveArmed: boolean;
@@ -573,6 +655,9 @@ export interface KryptApi {
   trading: {
     setEnabled: (enabled: boolean) => Promise<ActionResult>;
     cancelAllOpen: () => Promise<ActionResult<{ canceled: number }>>;
+    status: () => Promise<TradingStatus | null>;
+    collection: () => Promise<CollectionStats | null>;
+    exportData: () => Promise<{ dir: string; files: string[] } | null>;
     flatten: () => Promise<ActionResult<{ closed: number }>>;
   };
   data: {
@@ -589,6 +674,9 @@ export interface KryptApi {
   crypto15m: {
     snapshot: () => Promise<Crypto15mSnapshot>;
     status: () => Promise<Crypto15mStatus>;
+    backtest: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
+    backtestMain: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
+    history: (args?: { limit?: number }) => Promise<{ rows: Crypto15mPosition[] } | null>;
   };
   kalshi: {
     marketUrl: (args: { eventTicker?: string; ticker?: string; env?: string }) =>

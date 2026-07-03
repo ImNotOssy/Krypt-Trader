@@ -89,6 +89,7 @@ import crypto15m_record  # noqa: E402
 import webhook  # noqa: E402
 import leaderboard  # noqa: E402
 import kalshi_ws  # noqa: E402
+import spot_ws  # noqa: E402
 from config import DEFAULT_CONFIG, merge_with_defaults  # noqa: E402
 
 
@@ -120,6 +121,14 @@ class State:
     # waiting for the timer (WS pushes the event; REST stays the source of truth).
     ws_fill_pending: bool = False
     ws_resolve_pending: bool = False
+    # A whale-sized trade just hit the WS tape → run the whale scan (and the
+    # trade scan behind it) NOW instead of waiting out the scan timers. The
+    # timers alone added ~70s average from tape-print to our order — fatal for
+    # whale-following, where being late means worse prices.
+    ws_whale_pending: bool = False
+    # A WS fill arrived → wake the 15m executor tick immediately (entry-fill
+    # recognition arms the stop-loss/TP up to one poll interval sooner).
+    ws_c15_pending: bool = False
 
 
 STATE = State()
@@ -456,7 +465,30 @@ def _signal_row_to_js(r: dict, source: str, traded: bool) -> dict:
 
 
 _loop_task: asyncio.Task | None = None
+_c15_task: asyncio.Task | None = None
 _loop_stop: asyncio.Event | None = None
+
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Run a notification coroutine (Discord webhook) as a background task —
+    a slow or unreachable Discord must never stall the trading loop (inline
+    awaits cost up to 8s per send, multiplied by event bursts). Errors are
+    swallowed (webhooks are best-effort); a strong reference is kept so the
+    task can't be garbage-collected mid-flight."""
+    async def _quiet():
+        try:
+            await coro
+        except Exception:
+            pass
+    try:
+        t = asyncio.get_event_loop().create_task(_quiet())
+    except RuntimeError:
+        return
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
 
 _event_webhook_last: dict[int, str] = {}
 
@@ -480,12 +512,29 @@ def _on_ws_fill(_msg: dict) -> None:
     instead of waiting out the 30s timer. REST poll remains the accounting
     truth; this only removes the detection latency."""
     STATE.ws_fill_pending = True
+    STATE.ws_c15_pending = True
 
 
 def _on_ws_lifecycle(msg: dict) -> None:
     """A market was determined/settled — wake the resolution check immediately."""
     if (msg or {}).get("event_type") in ("determined", "settled"):
         STATE.ws_resolve_pending = True
+
+
+def _on_ws_trade(trade: dict) -> None:
+    """Per-trade WS hook (sync, must stay cheap): flag whale-sized prints so the
+    scanner runs immediately instead of waiting out whale_scan_interval."""
+    try:
+        count = float(trade.get("count_fp") or 0)
+        side = trade.get("taker_side") or ""
+        price = float(
+            (trade.get("yes_price_dollars") if side == "yes"
+             else trade.get("no_price_dollars")) or 0
+        )
+        if count * price >= float(STATE.cfg.get("min_whale_usd", 2500) or 2500):
+            STATE.ws_whale_pending = True
+    except (TypeError, ValueError):
+        pass
 
 
 def _ws_held_tickers() -> set[str]:
@@ -522,10 +571,16 @@ async def _reverify_auth_if_needed() -> bool:
         return False
     if not kalshi_auth.credentials_present(kalshi_auth.get_env()):
         return False
-    # Serialize with credential/env changes exactly like _h_testCredentials.
+    # Serialize credential priming with env changes, but do the slow parts —
+    # the blocking 5s clock-sync HEAD and the balance probe's retry ladder —
+    # OUTSIDE the lock (and off the event loop for the HEAD): while auth is
+    # down this retries every 60s, and holding ENV_LOCK across it blocked
+    # every order placement's env read behind a dead network.
     async with kalshi_auth.ENV_LOCK:
-        kalshi_auth.prime_credentials(sync_time=True)
-        bal = await kalshi_api.get_balance()
+        env0 = kalshi_auth.get_env()
+        kalshi_auth.prime_credentials(sync_time=False)
+    await asyncio.to_thread(kalshi_auth.sync_server_time, True)
+    bal = await kalshi_api.get_balance(pin_env=env0)
     int(bal.get("balance", 0))  # shape check; raises if the poll was malformed
     STATE.auth_ok = True
     await emit_event("backend:authChanged", {"authOk": True})
@@ -542,8 +597,9 @@ async def _scanner_and_trader_loop() -> None:
     last_market_sync = 0.0
     last_event_sync = 0.0
     last_account_emit = 0.0
+    last_snapshot_persist = 0.0
     last_reconcile = 0.0
-    last_crypto15m = 0.0
+    _consec_reconcile_fails = 0
     last_crypto15m_record = 0.0
     last_ws_subs = 0.0
     last_cleanup = 0.0
@@ -603,12 +659,29 @@ async def _scanner_and_trader_loop() -> None:
             logger.warning(f"sync error: {e}")
 
         try:
-            if now - last_whale >= float(cfg.get("whale_scan_interval", 120)):
+            # Timer OR event-driven: a whale-sized WS trade wakes the scan now
+            # (2s floor paces bursts) — the timers alone averaged ~70s from
+            # tape-print to order, throwing away the whole point of following.
+            # Collection toggle: scanning stops only when BOTH collection and
+            # trading are off — live trading cannot run blind.
+            collect_main = bool(cfg.get("main_record_signals", True)) or bool(
+                cfg.get("enable_trading")
+            )
+            whale_due = collect_main and (
+                now - last_whale >= float(cfg.get("whale_scan_interval", 120))
+                or (STATE.ws_whale_pending and now - last_whale >= 2)
+            )
+            if whale_due:
+                STATE.ws_whale_pending = False
                 cnt, rows = await scanner.scan_whales(cfg)
                 last_whale = now
                 STATE.last_whale_scan_at = datetime.now(timezone.utc).isoformat()
                 if cnt:
                     logger.info(f"whale scan: {cnt} new")
+                    # Chain straight into the trade scan this same iteration —
+                    # a fresh whale signal shouldn't sit in the DB for up to
+                    # trade_scan_interval before the gate even looks at it.
+                    last_trade = 0.0
                 with db.get_db() as conn:
                     seen = db.already_traded_signal_ids(
                         conn, "whale", kalshi_auth.get_env()
@@ -617,17 +690,14 @@ async def _scanner_and_trader_loop() -> None:
                     js = _signal_row_to_js(row, "whale", int(row["id"]) in seen)
                     await emit_event("signal:new", js)
                     if cfg.get("enable_discord"):
-                        try:
-                            await webhook.send_whale(
-                                cfg.get("whale_webhook_url", ""), row
-                            )
-                        except Exception:
-                            pass
+                        _fire_and_forget(webhook.send_whale(
+                            cfg.get("whale_webhook_url", ""), row
+                        ))
         except Exception as e:
             logger.warning(f"whale scan error: {e}")
 
         try:
-            if now - last_momentum >= float(cfg.get("momentum_scan_interval", 90)):
+            if collect_main and now - last_momentum >= float(cfg.get("momentum_scan_interval", 90)):
                 cnt, rows = await scanner.scan_momentum(cfg)
                 last_momentum = now
                 STATE.last_momentum_scan_at = datetime.now(timezone.utc).isoformat()
@@ -641,12 +711,9 @@ async def _scanner_and_trader_loop() -> None:
                     js = _signal_row_to_js(row, "momentum", int(row["id"]) in seen)
                     await emit_event("signal:new", js)
                     if cfg.get("enable_discord"):
-                        try:
-                            await webhook.send_momentum(
-                                cfg.get("momentum_webhook_url", ""), row
-                            )
-                        except Exception:
-                            pass
+                        _fire_and_forget(webhook.send_momentum(
+                            cfg.get("momentum_webhook_url", ""), row
+                        ))
         except Exception as e:
             logger.warning(f"momentum scan error: {e}")
 
@@ -665,13 +732,10 @@ async def _scanner_and_trader_loop() -> None:
                         cfg.get("enable_discord")
                         and _should_fire_event_webhook(int(row.get("id") or 0), "placed")
                     ):
-                        try:
-                            await webhook.send_event(
-                                cfg.get("event_webhook_url", ""),
-                                "placed", row, kalshi_auth.get_env(),
-                            )
-                        except Exception:
-                            pass
+                        _fire_and_forget(webhook.send_event(
+                            cfg.get("event_webhook_url", ""),
+                            "placed", row, kalshi_auth.get_env(),
+                        ))
         except Exception as e:
             logger.error(f"trade scan error: {e}", exc_info=True)
 
@@ -695,13 +759,10 @@ async def _scanner_and_trader_loop() -> None:
                                 int(row.get("id") or 0), kind
                             )
                         ):
-                            try:
-                                await webhook.send_event(
-                                    cfg.get("event_webhook_url", ""),
-                                    kind, row, kalshi_auth.get_env(),
-                                )
-                            except Exception:
-                                pass
+                            _fire_and_forget(webhook.send_event(
+                                cfg.get("event_webhook_url", ""),
+                                kind, row, kalshi_auth.get_env(),
+                            ))
         except Exception as e:
             logger.error(f"poll error: {e}", exc_info=True)
 
@@ -709,6 +770,7 @@ async def _scanner_and_trader_loop() -> None:
             if STATE.auth_ok and now - last_reconcile >= 30:
                 summary, changed = await trader.reconcile_positions_with_kalshi()
                 last_reconcile = now
+                _consec_reconcile_fails = 0
                 if any(summary.values()):
                     logger.info(f"reconcile: {summary}")
                     await emit_event("backend:reconciled", summary)
@@ -717,7 +779,24 @@ async def _scanner_and_trader_loop() -> None:
                         "position:update", _position_row_to_js(row),
                     )
         except Exception as e:
-            logger.debug(f"periodic reconcile failed: {e}")
+            # DEBUG for a blip, but a reconcile that fails FOREVER silently
+            # stops orphan-closing/rescue/import — the open-count inflates and
+            # max_open_positions quietly blocks all new entries with no trace
+            # at the default log level. Escalate after 10 straight failures
+            # (~5 min) and tell the renderer so the UI can badge it.
+            _consec_reconcile_fails += 1
+            if _consec_reconcile_fails == 10:
+                logger.warning(
+                    f"periodic reconcile has failed {_consec_reconcile_fails}x "
+                    f"in a row ({e}) — positions may be stale; open-count "
+                    f"gating may block new entries"
+                )
+                await emit_event("backend:degraded", {
+                    "component": "reconcile", "error": str(e)[:200],
+                    "action": "retrying",
+                })
+            else:
+                logger.debug(f"periodic reconcile failed: {e}")
 
         try:
             if (
@@ -740,27 +819,16 @@ async def _scanner_and_trader_loop() -> None:
                         if _should_fire_event_webhook(
                             int(row.get("id") or 0), kind
                         ):
-                            try:
-                                await webhook.send_event(
-                                    cfg.get("event_webhook_url", ""),
-                                    kind, row, kalshi_auth.get_env(),
-                                )
-                            except Exception:
-                                pass
+                            _fire_and_forget(webhook.send_event(
+                                cfg.get("event_webhook_url", ""),
+                                kind, row, kalshi_auth.get_env(),
+                            ))
         except Exception as e:
             logger.error(f"resolution error: {e}", exc_info=True)
 
-        try:
-            if (
-                cfg.get("crypto15m_enabled")
-                and now - last_crypto15m >= float(cfg.get("crypto15m_poll_sec", 4))
-            ):
-                await crypto15m_trader.run_tick(
-                    cfg, authed=STATE.auth_ok, session_start=STATE.started_at
-                )
-                last_crypto15m = now
-        except Exception as e:
-            logger.error(f"crypto15m tick error: {e}", exc_info=True)
+        # (the 15m executor tick runs in its own task — see _crypto15m_loop —
+        # so a slow market sync / scan / 5xx storm here can never stall a
+        # stop-loss that needs its 4s cadence)
 
         try:
             if (
@@ -787,14 +855,16 @@ async def _scanner_and_trader_loop() -> None:
         except Exception as e:
             logger.warning(f"db maintenance failed: {e}")
 
-        # Keep the WS subscribed to exactly the markets we hold/work, so the
-        # stop-loss chase reads a live local book and resolution fires instantly.
+        # Keep the WS subscribed to the markets we hold/work PLUS the current
+        # 15m window tickers — so the stop-loss chase reads a live local book,
+        # resolution fires instantly, and entry/pairs decisions price off
+        # real-time quotes instead of the REST snapshot cache.
         try:
             if kalshi_ws.is_connected() and now - last_ws_subs >= 5:
-                held = _ws_held_tickers()
-                kalshi_ws.set_orderbook_markets(held)
-                kalshi_ws.set_ticker_markets(held)
-                kalshi_ws.set_lifecycle_markets(held)
+                watch = _ws_held_tickers() | crypto15m.active_tickers()
+                kalshi_ws.set_orderbook_markets(watch)
+                kalshi_ws.set_ticker_markets(watch)
+                kalshi_ws.set_lifecycle_markets(watch)
                 last_ws_subs = now
         except Exception as e:
             logger.debug(f"ws subscription reconcile error: {e}")
@@ -807,8 +877,11 @@ async def _scanner_and_trader_loop() -> None:
                 # while the balance fetch has never succeeded (cached_balance is
                 # None) -> snap totals are $0, which would poison today's baseline
                 # and silently defeat the daily stop-loss. Still emit for display.
+                # Persist at 60s (display stays 15s): 15s inserts × 45-day
+                # retention was a ~260k-row table feeding the P&L chart.
                 balance_known = trader.cached_balance(kalshi_auth.get_env()) is not None
-                if STATE.auth_ok and balance_known:
+                if STATE.auth_ok and balance_known and now - last_snapshot_persist >= 60:
+                    last_snapshot_persist = now
                     with db.get_db() as conn:
                         db.insert_pnl_snapshot(
                             conn,
@@ -886,23 +959,111 @@ async def _scanner_and_trader_loop() -> None:
         await asyncio.sleep(1)
 
 
+async def _crypto15m_loop() -> None:
+    """Dedicated 15m-executor loop, ISOLATED from the main scanner/trader loop.
+
+    The main loop is one long serial iteration (market sync, scans, order poll,
+    reconcile, resolution) — a Kalshi 5xx storm or a slow 10-page market sync
+    stalled the 15m tick 5-80s, exactly the windows where a stop-loss needed
+    its 4s cadence to protect capital in a fast drop. run_tick manages its own
+    concurrency through DB state, and only this task calls it, so ticks never
+    overlap. A WS fill wakes the next tick within ~0.5s (STATE.ws_c15_pending)
+    so a just-filled entry arms its stop-loss/TP without waiting out the poll."""
+    last_tick = 0.0
+    while not (_loop_stop and _loop_stop.is_set()):
+        try:
+            cfg = STATE.cfg
+            now = asyncio.get_event_loop().time()
+            # Reconcile the spot feeds against the config toggle so flipping it
+            # in Settings takes effect without a backend restart. One toggle
+            # governs both: the cfbenchmarks_value channel on the Kalshi socket
+            # (the exact settlement index) and the Coinbase proxy fallback.
+            want_spot_ws = bool(cfg.get("crypto15m_spot_ws", True))
+            kalshi_ws.set_cf_enabled(want_spot_ws)
+            if want_spot_ws and not spot_ws.is_running():
+                spot_ws.start()
+            elif not want_spot_ws and spot_ws.is_running():
+                await spot_ws.stop()
+            # The enabled flag gates ENTRIES inside run_tick, not the loop:
+            # open live positions must keep being managed (stops/settlement)
+            # even after the user turns the 15m feature off.
+            due = (
+                not STATE.paused
+                and (
+                    now - last_tick >= float(cfg.get("crypto15m_poll_sec", 4))
+                    or (STATE.ws_c15_pending and now - last_tick >= 1)
+                )
+            )
+            if due:
+                STATE.ws_c15_pending = False
+                await crypto15m_trader.run_tick(
+                    cfg, authed=STATE.auth_ok, session_start=STATE.started_at
+                )
+                last_tick = asyncio.get_event_loop().time()
+        except Exception as e:
+            logger.error(f"crypto15m tick error: {e}", exc_info=True)
+        await asyncio.sleep(0.5)
+
+
+def _watchdog_restart(name: str, factory):
+    """Done-callback for the core loop tasks: if one DIES (a loop-killing
+    exception like MemoryError escaping the per-section try/excepts), the
+    process previously kept serving RPCs — balances refreshed, the UI stayed
+    green — while all scanning/trading/exits were silently dead. Log loud,
+    tell the renderer, and restart the loop after a short breather."""
+    def _cb(task: asyncio.Task) -> None:
+        if task.cancelled() or (_loop_stop and _loop_stop.is_set()):
+            return
+        exc = task.exception()
+        logger.critical(
+            f"{name} DIED unexpectedly ({type(exc).__name__ if exc else 'no exception'}: "
+            f"{exc}) — restarting in 5s", exc_info=exc,
+        )
+
+        async def _restart():
+            await asyncio.sleep(5)
+            if _loop_stop and _loop_stop.is_set():
+                return
+            await emit_event("backend:degraded", {
+                "component": name, "error": str(exc)[:200] if exc else "",
+                "action": "restarted",
+            })
+            factory()
+        _fire_and_forget(_restart())
+    return _cb
+
+
+def _spawn_main_loop() -> None:
+    global _loop_task
+    _loop_task = asyncio.create_task(_scanner_and_trader_loop())
+    _loop_task.add_done_callback(_watchdog_restart("trader loop", _spawn_main_loop))
+
+
+def _spawn_c15_loop() -> None:
+    global _c15_task
+    _c15_task = asyncio.create_task(_crypto15m_loop())
+    _c15_task.add_done_callback(_watchdog_restart("crypto15m loop", _spawn_c15_loop))
+
+
 async def _start_loop() -> None:
-    global _loop_task, _loop_stop
+    global _loop_task, _c15_task, _loop_stop
     if _loop_task and not _loop_task.done():
         return
     _loop_stop = asyncio.Event()
-    _loop_task = asyncio.create_task(_scanner_and_trader_loop())
+    _spawn_main_loop()
+    _spawn_c15_loop()
 
 
 async def _stop_loop() -> None:
-    global _loop_task, _loop_stop
+    global _loop_task, _c15_task, _loop_stop
     if _loop_stop:
         _loop_stop.set()
-    if _loop_task:
-        try:
-            await asyncio.wait_for(_loop_task, timeout=5)
-        except Exception:
-            pass
+    for task in (_loop_task, _c15_task):
+        if task:
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except Exception:
+                pass
 
 
 
@@ -1340,10 +1501,202 @@ async def _h_kalshiMarketUrl(p: dict) -> dict:
     return {"url": url}
 
 
+
+async def _h_trading_status(p: dict) -> dict:
+    """Ordered gate checklist for both engines — the "why isn't it trading"
+    panel. Each row: {id, label, state: ok|blocked|off, reason}. The first
+    blocked row is the answer."""
+    cfg = STATE.cfg
+    env = trader.get_env()
+    main: list[dict] = []
+
+    def gate(gid: str, label: str, ok: bool, reason: str = "", off: bool = False) -> None:
+        main.append({
+            "id": gid, "label": label,
+            "state": "off" if off else ("ok" if ok else "blocked"),
+            "reason": reason if not ok else "",
+        })
+
+    gate("paused", "Engine not paused", not STATE.paused, "paused by user")
+    gate("auth", "Kalshi auth", bool(STATE.auth_ok), "auth failed — check API keys")
+    enabled = bool(cfg.get("enable_trading"))
+    gate("master", "Trading enabled", enabled, "master switch is OFF", off=not enabled)
+    # A diagnostics endpoint must never take the panel down with it.
+    try:
+        blocked, why = trader._is_blocked_by_daily_risk(cfg, env)
+        gate("dailyRisk", "Daily stop/take-profit", not blocked, why or "")
+    except Exception:
+        gate("dailyRisk", "Daily stop/take-profit", True)
+    try:
+        hblocked, hwhy = trader._is_blocked_by_trading_hours(cfg)
+        gate("hours", "Trading hours", not hblocked, hwhy or "")
+    except Exception:
+        gate("hours", "Trading hours", True)
+    lc = dict(getattr(trader, "last_cycle", {}) or {})
+    if lc.get("skipReason"):
+        gate("cycle", "Last scan cycle", False, str(lc.get("skipReason")))
+    else:
+        gate("cycle", "Last scan cycle", True)
+
+    c15 = await crypto15m_trader.status(cfg, authed=STATE.auth_ok, session_start=STATE.started_at)
+    return {
+        "main": main,
+        "mainFilterCounts": lc.get("filterCounts") or {},
+        "mainCandidates": lc.get("candidates") or 0,
+        "mainPlaced": lc.get("placed") or 0,
+        "c15": {
+            "enabled": c15.get("enabled"),
+            "live": c15.get("live"),
+            "authed": bool(STATE.auth_ok),
+            "env": env,
+            "blockReasons": c15.get("blockReasons") or {},
+            "takeProfitHalted": c15.get("takeProfitHalted"),
+        },
+    }
+
+
+
+async def _h_c15_backtest(p: dict) -> dict:
+    """Replay the CURRENT (or supplied) 15m config over recorded ticks using
+    the live entry gates. Read-heavy — run off the event loop."""
+    import replay
+    from config import merge_with_defaults as _merge
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = _merge(cfg)
+    since = int((p or {}).get("sinceDays") or 60)
+    env = str((p or {}).get("env") or "production")
+    return await asyncio.to_thread(replay.replay, cfg, env=env, since_days=since)
+
+
+
+async def _h_main_backtest(p: dict) -> dict:
+    """Replay recorded whale/momentum signals through the live should_trade
+    gates with follower economics."""
+    import replay
+    from config import merge_with_defaults as _merge
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = _merge(cfg)
+    since = int((p or {}).get("sinceDays") or 60)
+    return await asyncio.to_thread(replay.replay_main, cfg, since_days=since)
+
+
+
+async def _h_collection_stats(p: dict) -> dict:
+    """Inventory of the passively collected research data — what the Backtest
+    page's "view data" area shows. Counts + spans + a recent sample per
+    stream, all cheap indexed queries."""
+    def _q() -> dict:
+        with db.get_db() as conn:
+            c15 = conn.execute(
+                """SELECT COUNT(*) n, SUM(resolved) r, MIN(observed_at) a,
+                          MAX(observed_at) b
+                   FROM crypto15m_signals WHERE kalshi_env='production'"""
+            ).fetchone()
+            ticks = conn.execute(
+                "SELECT COUNT(*) FROM crypto15m_ticks WHERE kalshi_env='production'"
+            ).fetchone()[0]
+            recent_c15 = conn.execute(
+                """SELECT ticker, asset, favorite, favorite_price, up_won,
+                          resolved, close_time
+                   FROM crypto15m_signals WHERE kalshi_env='production'
+                   ORDER BY id DESC LIMIT 12"""
+            ).fetchall()
+            wh = conn.execute(
+                """SELECT COUNT(*) n, SUM(resolved) r, MIN(created_at) a,
+                          MAX(created_at) b FROM whale_trades"""
+            ).fetchone()
+            al = conn.execute(
+                """SELECT COUNT(*) n, SUM(resolved) r, MIN(created_at) a,
+                          MAX(created_at) b FROM alerts"""
+            ).fetchone()
+            cats = conn.execute(
+                """SELECT category, COUNT(*) n FROM whale_trades
+                   GROUP BY category ORDER BY n DESC LIMIT 6"""
+            ).fetchall()
+            recent_main = conn.execute(
+                """SELECT ticker, category, taker_side, price, dollar_value,
+                          outcome_correct, resolved, created_at
+                   FROM whale_trades ORDER BY id DESC LIMIT 12"""
+            ).fetchall()
+        return {
+            "c15": {
+                "windows": int(c15["n"] or 0),
+                "resolved": int(c15["r"] or 0),
+                "ticks": int(ticks or 0),
+                "firstAt": c15["a"], "lastAt": c15["b"],
+                "recent": [dict(r) for r in recent_c15],
+            },
+            "main": {
+                "whales": int(wh["n"] or 0), "whalesResolved": int(wh["r"] or 0),
+                "alerts": int(al["n"] or 0), "alertsResolved": int(al["r"] or 0),
+                "firstAt": wh["a"] or al["a"], "lastAt": wh["b"] or al["b"],
+                "topCategories": [dict(r) for r in cats],
+                "recent": [dict(r) for r in recent_main],
+            },
+            "collecting": {
+                "c15": bool((STATE.cfg or {}).get("crypto15m_record_signals", True)),
+                "main": True,
+            },
+        }
+    return await asyncio.to_thread(_q)
+
+
+
+async def _h_c15_history(p: dict) -> dict:
+    limit = min(500, int((p or {}).get("limit") or 200))
+    env = trader.get_env()
+    def _q():
+        with db.get_db() as conn:
+            rows = db.recent_crypto15m_resolved(conn, env, limit=limit)
+        return {"rows": [crypto15m_trader._pos_to_js(r) for r in rows]}
+    return await asyncio.to_thread(_q)
+
+
+
+async def _h_export_research(p: dict) -> dict:
+    """Dump the collected research data as CSVs the user can analyze anywhere.
+    Written under data/exports/<stamp>/; the renderer reveals the folder."""
+    import csv
+    def _dump() -> dict:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out_dir = os.path.join(os.path.dirname(str(db.db_path())), "exports", stamp)
+        os.makedirs(out_dir, exist_ok=True)
+        tables = ["crypto15m_signals", "crypto15m_ticks", "crypto15m_positions",
+                  "whale_trades", "alerts"]
+        files = []
+        with db.get_db() as conn:
+            for t in tables:
+                rows = conn.execute(f"SELECT * FROM {t}").fetchall()
+                path = os.path.join(out_dir, f"{t}.csv")
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    if rows:
+                        w = csv.DictWriter(f, fieldnames=list(dict(rows[0]).keys()))
+                        w.writeheader()
+                        for r in rows:
+                            w.writerow(dict(r))
+                    else:
+                        f.write("")
+                files.append(path)
+        return {"dir": out_dir, "files": files}
+    return await asyncio.to_thread(_dump)
+
+
 _HANDLERS = {
     "ping": _h_ping,
     "crypto15m": _h_crypto15m,
     "crypto15mStatus": _h_crypto15mStatus,
+    "tradingStatus": _h_trading_status,
+    "c15Backtest": _h_c15_backtest,
+    "mainBacktest": _h_main_backtest,
+    "collectionStats": _h_collection_stats,
+    "c15History": _h_c15_history,
+    "exportResearch": _h_export_research,
     "kalshiMarketUrl": _h_kalshiMarketUrl,
     "setConfig": _h_setConfig,
     "setCredentials": _h_setCredentials,
@@ -1410,7 +1763,12 @@ async def _stdin_reader() -> None:
             continue
         if req.get("type") != "rpc":
             continue
-        asyncio.create_task(_dispatch_request(req))
+        # Keep a strong reference: a bare create_task can be garbage-collected
+        # while pending (documented asyncio footgun), losing the RPC — the
+        # renderer then just sees an opaque 30s timeout.
+        t = asyncio.create_task(_dispatch_request(req))
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
 
 
 _shutting_down = False
@@ -1442,6 +1800,10 @@ async def _shutdown() -> None:
         pass
     try:
         await kalshi_ws.stop()
+    except Exception:
+        pass
+    try:
+        await spot_ws.stop()
     except Exception:
         pass
     await emit_event("backend:shutdown", {})
@@ -1516,9 +1878,22 @@ async def _main() -> None:
         kalshi_ws.start(
             kalshi_auth.get_env(),
             on_fill=_on_ws_fill, on_lifecycle=_on_ws_lifecycle,
+            on_trade=_on_ws_trade,
         )
     except Exception as e:
         logger.warning(f"kalshi_ws start failed (staying on REST): {e}")
+
+    # Spot feeds for the 15m settlement model: the cfbenchmarks_value channel
+    # on the Kalshi socket (the EXACT settlement index + live final-minute
+    # average) with the keyless Coinbase proxy as fallback. Same strict-
+    # accelerator contract: any failure leaves the REST spot chain as the
+    # source. The 15m loop reconciles these against the config toggle.
+    try:
+        if STATE.cfg.get("crypto15m_spot_ws", True):
+            kalshi_ws.set_cf_enabled(True)
+            spot_ws.start()
+    except Exception as e:
+        logger.warning(f"spot feeds start failed (staying on REST spots): {e}")
 
     await _start_loop()
     try:

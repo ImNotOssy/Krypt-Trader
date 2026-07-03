@@ -8,6 +8,7 @@ import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Empty, NameDialog, Page, Switch, useOptimisticValue } from '../components/common';
 import { TickerLink } from '../components/KalshiTicker';
+import { BacktestPanel } from '../components/BacktestPanel';
 import { cls, fmtUsd } from '../utils/format';
 
 const POLL_MS = 4000;
@@ -105,7 +106,7 @@ export function Crypto15mPage() {
   return (
     <Page
       title="15m Crypto"
-      subtitle="Kalshi 15-minute crypto markets. Experimental — favorite-follow has no proven edge at any threshold (its return ≈ win-rate − price), so treat it as for-fun and test on Demo first. Tune the entry window, favorite threshold, delta filter, and stop-loss below."
+      subtitle="Kalshi 15-minute crypto markets. Settlement Sniper is the evidence-backed preset (it buys what the live settlement feed says is near-certain while the quote lags); everything else is experimental. Validate any change on the Backtest page before arming, and start small — one bad tail erases many small wins."
       actions={
         <button
           onClick={() => void load()}
@@ -151,8 +152,32 @@ export function Crypto15mPage() {
             <KV label="Max open" value={`${status?.maxConcurrent ?? 7}`} />
             <KV label="Open" value={`${status?.stats.openCount ?? 0}`} />
             <KV label="W / L" value={`${status?.stats.wins ?? 0} / ${status?.stats.losses ?? 0}`} />
+            <KV
+              label="P&L (net)"
+              value={fmtUsd(status?.stats.realizedPnlUsd ?? 0, { sign: true })}
+              accent={(status?.stats.realizedPnlUsd ?? 0) >= 0 ? 'good' : 'bad'}
+            />
           </div>
         </div>
+        {enabled && status?.modelCalibration && !status.modelCalibration.ok && (
+          <div className="mt-2 text-[11px] text-krypt-loss">
+            ⛔ Model calibration degraded — recent high-confidence predictions hit only{' '}
+            {Math.round((status.modelCalibration.rate ?? 0) * 100)}% over the last {status.modelCalibration.n} windows.
+            Sniper entries are auto-paused and resume when calibration recovers.
+          </div>
+        )}
+        {enabled && (status?.byStrategy?.length ?? 0) > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {status!.byStrategy!.map((st) => (
+              <span key={st.strategy} className="rounded bg-krypt-surface2 px-1.5 py-0.5 font-mono text-[10px] text-krypt-dim" title={`fees $${st.fees_usd.toFixed(2)}`}>
+                {st.strategy} {st.wins}/{st.n}{' '}
+                <span className={st.pnl_usd >= 0 ? 'text-krypt-win' : 'text-krypt-loss'}>
+                  {st.pnl_usd >= 0 ? '+' : ''}${st.pnl_usd.toFixed(2)}
+                </span>
+              </span>
+            ))}
+          </div>
+        )}
         {enabled && status?.takeProfitHalted && (
           <div className="mt-2 text-[11px] text-krypt-win">
             🎯 Session take-profit reached ({fmtUsd(status.sessionPnlUsd, { sign: true })} ≥ {fmtUsd(status.sessionTakeProfitUsd)}).
@@ -314,34 +339,48 @@ const C15_DEFAULTS = {
   hoursStartUtc: 0,
   hoursEndUtc: 24,
   orderSize: 1,
-  maxConcurrent: 7,
+  maxConcurrent: 3,
 };
 
+// Every preset is a complete strategy choice: the directional presets turn
+// Pairs OFF and the Pairs preset turns the directional engine OFF, so clicking
+// a chip always answers "what is this tab running?" with exactly one thing.
 const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<TraderConfig> }[] = [
   {
     id: 'favorite', name: 'Deep Favorite',
     hint: 'Only the deepest favorites (95–98¢) — the one band that didn\'t lose in collected data (small sample).',
-    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.95, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.95, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
   },
   {
     id: 'contrarian', name: 'Contrarian Fade',
     hint: 'Fade extreme favorites — buy the cheap side, hold to settle. Measured ≈ break-even.',
-    patch: { crypto15mDirectionMode: 'contrarian', crypto15mEntryThreshold: 0.9, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'contrarian', crypto15mEntryThreshold: 0.9, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
   },
   {
     id: 'momentum', name: 'Momentum (Δ-confirmed)',
     hint: 'Buy the favorite only once the underlying has already moved ≥0.2% this window — a momentum filter on the 15-min open.',
-    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.80, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0.002, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.80, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0.002, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
   },
   {
     id: 'fav-90-95', name: 'Favorite 90–95¢',
     hint: 'Favorites in the 90–95¢ pocket. Caveat: priced off the mid — unconfirmed on real fills near close.',
-    patch: { crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.90, crypto15mEntryMax: 0.95, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.90, crypto15mEntryMax: 0.95, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
+  },
+  {
+    id: 'sniper', name: 'Settlement Sniper',
+    hint: 'Model mode: buys whichever side the live settlement model favors when YOUR certainty and edge thresholds are met. Ships with neutral (zero) thresholds on purpose — set "Model certainty" and "Min net edge" below to build your own strategy, and validate it on the Backtest page before going live.',
+    patch: {
+      crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mUseRules: false,
+      crypto15mDirectionMode: 'model',
+      crypto15mModelMinProb: 0.5, crypto15mModelMinEdgeCents: 0,
+      crypto15mIndicatorDetect: true, crypto15mSpotWs: true,
+    },
   },
   {
     id: 'macd-trend', name: 'MACD Trend (rules)',
     hint: 'Experimental: enter Up when Up is favored and the 1-min underlying MACD is bullish, in the last 6 min. Uses the rule builder + MACD field — recorded, not yet backtested.',
     patch: {
+      crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false,
       crypto15mDirectionMode: 'favorite', crypto15mEntryStyle: 'maker', crypto15mExitThreshold: 0.4,
       crypto15mMinDeltaPct: 0, crypto15mIndicatorDetect: true, crypto15mUseRules: true,
       crypto15mRules: [
@@ -351,6 +390,10 @@ const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<Trad
       ],
     },
   },
+  // NOTE: the Pairs preset was removed after live testing settled at −$11.69:
+  // Kalshi runs ONE complementary book per market, so "accumulating both
+  // sides" is just a taker-taker scalp in disguise and stranded first legs
+  // lose nearly always. The engine keeps the code hard-disabled for research.
 ];
 
 // Snapshot fields a custom entry rule may gate on (mirrors the backend's
@@ -361,16 +404,22 @@ const C15_RULE_FIELDS: { v: string; label: string }[] = [
   { v: 'upProb', label: 'Up probability (0–1)' },
   { v: 'downProb', label: 'Down probability (0–1)' },
   { v: 'deltaPct', label: 'Underlying Δ (fraction)' },
+  { v: 'deltaSignedPct', label: 'Underlying Δ signed (+ = above strike)' },
   { v: 'minsLeft', label: 'Minutes left' },
   { v: 'hourUtc', label: 'Hour (UTC 0–23)' },
   { v: 'peersAgree', label: 'Peers agree (0–1)' },
   { v: 'marketBias', label: 'Market bias (−1..1)' },
-  { v: 'arbEdgeCents', label: 'Arb edge (¢)' },
+  { v: 'settlePrints', label: 'Settlement prints in (0-60)' },
+  { v: 'upAsk', label: 'UP ask ($)' },
+  { v: 'downAsk', label: 'DOWN ask ($)' },
   { v: 'macd', label: 'MACD line' },
   { v: 'macdSignal', label: 'MACD signal' },
   { v: 'macdHist', label: 'MACD histogram' },
   { v: 'macdCross', label: 'MACD cross (+1/0/−1)' },
   { v: 'rsi', label: 'RSI (0–100)' },
+  { v: 'sigma1m', label: '1-min volatility (fraction)' },
+  { v: 'modelProb', label: 'Model P(up) (0–1)' },
+  { v: 'edgeNetCents', label: 'Model edge net of fees (¢)' },
 ];
 const C15_RULE_OPS = ['>=', '<=', '>', '<'] as const;
 
@@ -403,6 +452,11 @@ function StrategySettings({
   };
   const dir = (config?.crypto15mDirectionMode ?? C15_DEFAULTS.directionMode);
   const entryStyle = (config?.crypto15mEntryStyle ?? C15_DEFAULTS.entryStyle);
+  // Pairs was removed (engine hard-disables it), so the directional engine is
+  // always on; the dim wrappers below are inert and kept only to avoid a
+  // sweeping layout diff.
+  const dimCls = '';
+  const dimTitle = undefined;
 
   const applyPreset = async (p: typeof C15_PRESETS[number]) => {
     setSavingPreset(p.id);
@@ -411,6 +465,9 @@ function StrategySettings({
 
   const resetDefaults = () => void update({
     crypto15mDirectionMode: C15_DEFAULTS.directionMode,
+    crypto15mDirectionalEnabled: true,
+    crypto15mPairsEnabled: false,
+    crypto15mUseRules: false,
     crypto15mTimeDelayMin: C15_DEFAULTS.timeDelayMin,
     crypto15mEntryThreshold: C15_DEFAULTS.entryThreshold,
     crypto15mEntryMax: C15_DEFAULTS.entryMax,
@@ -485,82 +542,133 @@ function StrategySettings({
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
         <SelectField
           label="Direction" value={dir}
-          options={[['favorite', 'Favorite-follow'], ['contrarian', 'Contrarian fade']]}
-          hint="Buy the favorite, or fade it and buy the cheap side."
-          onCommit={(v) => void update({ crypto15mDirectionMode: v as 'favorite' | 'contrarian' })}
+          options={[['model', 'Model — settlement sniper'], ['favorite', 'Favorite-follow'], ['contrarian', 'Contrarian fade']]}
+          hint="Model buys whichever side the settlement model calls near-certain (the sniper); Favorite buys the market's favorite; Contrarian fades it."
+          onCommit={(v) => void update({ crypto15mDirectionalEnabled: true, crypto15mDirectionMode: v as 'favorite' | 'contrarian' | 'model' })}
         />
+        {dir === 'model' && (
+          <>
+            <NumField
+              label="Model certainty" suffix="%" min={50} max={100} step={1}
+              value={Math.round(num('crypto15mModelMinProb', 0.97) * 100)}
+              hint="Only enter when the settlement model gives the bought side at least this probability. Set your own threshold and validate it on the Backtest page."
+              onCommit={(v) => void update({ crypto15mModelMinProb: Math.max(50, Math.min(100, Math.round(v))) / 100 })}
+            />
+            <NumField
+              label="Min net edge" suffix="¢" min={0} max={50} step={0.5}
+              value={num('crypto15mModelMinEdgeCents', 2)}
+              hint="Model probability minus the executable ask minus the taker fee must be at least this many cents — the margin you're paid for taking the trade."
+              onCommit={(v) => void update({ crypto15mModelMinEdgeCents: v })}
+            />
+            <SelectField
+              label="Calibration guard" value={(config?.crypto15mModelAutopause ?? true) ? 'on' : 'off'}
+              options={[['on', 'Auto-pause (recommended)'], ['off', 'Off']]}
+              hint="Watches whether the model's ≥97% predictions keep actually winning ≥~96%. If the rolling hit rate drops below break-even, sniper entries pause automatically and resume when calibration recovers."
+              onCommit={(v) => void update({ crypto15mModelAutopause: v === 'on' })}
+            />
+            <SelectField
+              label="Final-minute strikes" value={(config?.crypto15mModelFinalMinute ?? true) ? 'on' : 'off'}
+              options={[['on', 'On (recommended)'], ['off', 'Off']]}
+              hint="Trade inside the last 60s once ≥30 of the 60 settlement prints are locked and certainty passes 3σ — the settlement average is being realized in real time while stale quotes linger."
+              onCommit={(v) => void update({ crypto15mModelFinalMinute: v === 'on' })}
+            />
+          </>
+        )}
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Entry window" suffix="min" min={1} max={15} step={1}
           value={num('crypto15mTimeDelayMin', C15_DEFAULTS.timeDelayMin)}
           hint="Only act inside the last N minutes of the 15-min quarter."
           onCommit={(v) => void update({ crypto15mTimeDelayMin: v })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Favorite ≥" suffix="¢" min={1} max={99} step={1}
           value={Math.round(num('crypto15mEntryThreshold', C15_DEFAULTS.entryThreshold) * 100)}
           hint="The favorite side must be at least this likely to enter."
           onCommit={(v) => void update({ crypto15mEntryThreshold: v / 100 })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Skip above" suffix="¢" min={1} max={99} step={1}
           value={Math.round(num('crypto15mEntryMax', C15_DEFAULTS.entryMax) * 100)}
           hint="Don't pay more than this — too little room left to profit."
           onCommit={(v) => void update({ crypto15mEntryMax: v / 100 })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Min move Δ" suffix="%" min={0} max={50} step={0.05}
           value={+(num('crypto15mMinDeltaPct', C15_DEFAULTS.minDeltaPct) * 100).toFixed(2)}
           hint="Required underlying move from the 15-min open (CoinGecko spot). 0 = off."
           onCommit={(v) => void update({ crypto15mMinDeltaPct: v / 100 })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Min RSI" suffix="0–100" min={0} max={100} step={1}
           value={num('crypto15mMinRsi', C15_DEFAULTS.minRsi)}
           hint="Direction-aware momentum gate: an up-bet needs RSI ≥ this; a down-bet needs RSI ≤ (100 − this). Pair with a wide Entry window to enter early only on strong momentum. Needs Detect MACD/RSI (auto-enabled). 0 = off."
           onCommit={(v) => void update({ crypto15mMinRsi: Math.round(v), ...(v > 0 ? { crypto15mIndicatorDetect: true } : {}) })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Min MACD" suffix="|hist|" min={0} max={100000} step={0.5}
           value={num('crypto15mMinMacdHist', C15_DEFAULTS.minMacdHist)}
           hint="Direction-aware: an up-bet needs MACD histogram ≥ this; a down-bet needs ≤ −this. Raw price units, so the right value differs per asset (larger for BTC than DOGE — watch the MACD chip on each card). Needs Detect MACD/RSI (auto-enabled). 0 = off."
           onCommit={(v) => void update({ crypto15mMinMacdHist: v, ...(v > 0 ? { crypto15mIndicatorDetect: true } : {}) })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Stop-loss" suffix="¢" min={0} max={99} step={1}
           value={Math.round(num('crypto15mExitThreshold', C15_DEFAULTS.exitThreshold) * 100)}
-          hint="Executor sells if the held side falls to this price. 0 = hold to settlement."
+          hint="Executor sells if the held side falls to this price. 0 = hold to settlement. (Pairs never stop-loss — a matched pair pays $1 at settlement.)"
           onCommit={(v) => void update({ crypto15mExitThreshold: v / 100 })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Stop slippage" suffix="¢" min={0} max={50} step={1}
           value={num('crypto15mStopSlippageCents', C15_DEFAULTS.stopSlippageCents)}
           hint="When the stop-loss sells, price this many cents BELOW the bid so it sweeps the book and fills fast in a drop instead of resting unfilled. 0 = sell at the bid."
           onCommit={(v) => void update({ crypto15mStopSlippageCents: Math.round(v) })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Take-profit" suffix="¢" min={0} max={99} step={1}
           value={num('crypto15mTakeProfitCents', C15_DEFAULTS.takeProfitCents)}
           hint="Sell a winning position once the held side reaches this price. Set it ABOVE your entry price, or it sells the instant a position fills. 0 = off (hold to settlement)."
           onCommit={(v) => void update({ crypto15mTakeProfitCents: Math.round(v) })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Stop-loss %" suffix="%" min={0} max={100} step={1}
           value={Math.round(num('crypto15mStopLossPct', C15_DEFAULTS.stopLossPct) * 100)}
           hint="Sell once a position is down this % from what it cost (e.g. 20 = exit at −20%). Works alongside the cents Stop-loss above — whichever hits first exits. 0 = off."
           onCommit={(v) => void update({ crypto15mStopLossPct: Math.max(0, Math.min(100, Math.round(v))) / 100 })}
         />
+        </div>
         <NumField
           label="Stop at profit" suffix="$ / session" min={0} max={1000000} step={5}
           value={num('crypto15mSessionTakeProfitUsd', C15_DEFAULTS.sessionTakeProfitUsd)}
-          hint="Once this session's realized 15m profit reaches this many dollars, stop opening new 15m bets (open positions keep being managed). Resets when the app restarts. 0 = off."
+          hint="Once this session's realized 15m profit reaches this many dollars, stop opening new 15m bets (open positions keep being managed). Applies to Pairs too. Resets when the app restarts. 0 = off."
           onCommit={(v) => void update({ crypto15mSessionTakeProfitUsd: v })}
         />
+        <div className={dimCls} title={dimTitle}>
         <SelectField
           label="Entry style" value={entryStyle}
           options={[['maker', 'Rest at bid (maker)'], ['taker', 'Cross spread (taker)']]}
-          hint="Maker rests a limit at the bid: no spread paid, ~zero Kalshi fee, but it may not fill. Taker crosses the ask: always fills, pays spread + the full taker fee."
+          hint="Maker rests a limit at the bid: no spread paid, ~zero Kalshi fee, but it may not fill. Taker crosses the ask: always fills, pays spread + the full taker fee. (Pairs always buys marketable at the ask.)"
           onCommit={(v) => void update({ crypto15mEntryStyle: v as 'maker' | 'taker' })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         {entryStyle === 'maker' ? (
           <NumField
             label="Cancel unfilled" suffix="min left" min={0} max={15} step={0.5}
@@ -576,6 +684,7 @@ function StrategySettings({
             onCommit={(v) => void update({ crypto15mEntryDiff: v / 100 })}
           />
         )}
+        </div>
         <NumField
           label="Trade from" suffix="UTC h" min={0} max={24} step={1}
           value={num('crypto15mHoursStartUtc', C15_DEFAULTS.hoursStartUtc)}
@@ -588,12 +697,15 @@ function StrategySettings({
           hint="End of the UTC entry window. A start later than the end wraps overnight (e.g. 22 → 6)."
           onCommit={(v) => void update({ crypto15mHoursEndUtc: Math.round(v) })}
         />
+        <div className={dimCls} title={dimTitle}>
         <SelectField
           label="Bet size by" value={sizingMode}
           options={[['fixed', 'Fixed contracts'], ['balance_pct', '% of balance']]}
-          hint="Buy a fixed number of contracts, or spend a % of your balance each bet."
+          hint="Buy a fixed number of contracts, or spend a % of your balance each bet. (Pairs sizes with its own Leg size below.)"
           onCommit={(v) => void update({ crypto15mSizingMode: v as 'fixed' | 'balance_pct' })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         {sizingMode === 'balance_pct' ? (
           <NumField
             label="Per bet" suffix="% bal" min={0.1} max={100} step={0.1}
@@ -609,22 +721,33 @@ function StrategySettings({
             onCommit={(v) => void update({ crypto15mOrderSize: Math.round(v) })}
           />
         )}
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Max loss / bet" suffix="% bal" min={0} max={100} step={0.5}
           value={+(num('crypto15mMaxLossPct', 0) * 100).toFixed(2)}
           hint="Never risk more than this % of balance on one bet (it's bought outright, so cost = max loss). 0 = off."
           onCommit={(v) => void update({ crypto15mMaxLossPct: v / 100 })}
         />
+        </div>
+        <div className={dimCls} title={dimTitle}>
         <NumField
           label="Max concurrent" min={1} max={50} step={1}
           value={num('crypto15mMaxConcurrent', C15_DEFAULTS.maxConcurrent)}
-          hint="Most open 15-min positions at once (across the 7 assets)."
+          hint="Most open 15-min positions at once. The 7 assets move together — several concurrent favorites are ONE correlated crypto bet, not diversification. (Pairs has its own cap: 2 unmatched windows.)"
           onCommit={(v) => void update({ crypto15mMaxConcurrent: Math.round(v) })}
+        />
+        </div>
+        <NumField
+          label="Max total 15m" suffix="% bal" min={0} max={100} step={1}
+          value={+(num('crypto15mMaxTotalPct', 0.10) * 100).toFixed(1)}
+          hint="Aggregate cap: total money committed to open 15m bets can't exceed this % of your bankroll (order sizes are trimmed to fit). 0 = off."
+          onCommit={(v) => void update({ crypto15mMaxTotalPct: Math.max(0, Math.min(100, v)) / 100 })}
         />
       </div>
 
       <SizingPreview sizing={sizing} mode={sizingMode} />
-      {dir === 'contrarian' && (
+      {dir === 'contrarian' && config?.crypto15mDirectionalEnabled !== false && (
         <p className="mt-2 text-[11px] text-krypt-warn/90">
           Contrarian: when a side is an extreme favorite (≥ threshold) the executor buys the CHEAP opposite side — a low-win, high-payoff longshot. Set stop-loss to 0 to hold to settlement.
         </p>
@@ -632,20 +755,28 @@ function StrategySettings({
 
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
         <Switch
+          checked={config?.crypto15mStrictThreshold ?? true}
+          onChange={(v) => void update({ crypto15mStrictThreshold: v })}
+          label="Strict entry threshold"
+          description={'Hard floor: only enter when the price actually paid is at least "Favorite ≥" (and the market has both a bid and an ask). Off = the threshold checks the mid-market probability only, so thin books can fill below your number.'}
+        />
+        <Switch
           checked={config?.crypto15mIndicatorDetect ?? true}
           onChange={(v) => void update({ crypto15mIndicatorDetect: v })}
           label="Underlying MACD / RSI"
           description="Compute MACD & RSI on the 1-min underlying (Hyperliquid). Detection-only — surfaced per asset and usable as rule fields."
         />
         <Switch
-          checked={config?.crypto15mArbDetect ?? true}
-          onChange={(v) => void update({ crypto15mArbDetect: v })}
-          label="Arbitrage detector"
-          description="Flag when the Up + Down asks sum below $1 (market-neutral edge, gross of fees). Detection-only."
+          checked={config?.crypto15mSpotWs ?? true}
+          onChange={(v) => void update({ crypto15mSpotWs: v })}
+          label="Live spot feed (Coinbase)"
+          description="Real-time spot prices from Coinbase — a constituent of the CF Benchmarks index Kalshi settles against — plus a final-minute settlement-average tracker that sharpens the model. Off = slower REST price polling only."
         />
       </div>
 
       <RuleBuilder config={config} update={update} />
+
+      <BacktestPanel />
 
       <NameDialog
         open={saveOpen}
@@ -984,11 +1115,13 @@ function Foot({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** Compact MACD/RSI + arbitrage chips, shown only when the detectors populate them. */
+/** Compact MACD/RSI + settlement-model chips, shown only when the detectors populate them.
+ * (No arb chip: Kalshi runs ONE complementary book per market — yes_ask + no_ask
+ * can never sum below $1, so instant both-sides arb is structurally impossible.) */
 function IndicatorStrip({ a }: { a: Crypto15mAsset }) {
   const hasInd = a.macdHist != null || a.rsi != null;
-  const hasArb = a.arbEdgeCents != null && a.arbEdgeCents > 0;
-  if (!hasInd && !hasArb) return null;
+  const hasModel = a.modelProb != null;
+  if (!hasInd && !hasModel) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
       {a.rsi != null && (
@@ -1009,12 +1142,23 @@ function IndicatorStrip({ a }: { a: Crypto15mAsset }) {
           {a.macdCross === -1 && <span className="ml-0.5 text-krypt-loss">▼</span>}
         </span>
       )}
-      {hasArb && (
+      {hasModel && (
         <span
-          className="rounded bg-krypt-win/10 px-1.5 py-0.5 font-semibold text-krypt-win"
-          title="Up + Down asks sum below $1 — buyable arbitrage (gross of fees)"
+          className="rounded bg-krypt-surface2 px-1.5 py-0.5 text-krypt-dim"
+          title="Settlement model: P(up) from the spot's distance to the strike scaled by realized 1-min volatility. The ¢ value is the best fee-adjusted edge the model sees vs the current asks (detection-only — gate on it via the rule builder)."
         >
-          arb +{a.arbEdgeCents!.toFixed(1)}¢
+          model{' '}
+          <span className="font-mono text-white">{((a.modelProb ?? 0) * 100).toFixed(0)}%↑</span>
+          {a.edgeNetCents != null && (
+            <span className={cls('ml-1 font-mono', a.edgeNetCents > 0 ? 'text-krypt-win' : 'text-krypt-dim')}>
+              {a.edgeNetCents > 0 ? '+' : ''}{a.edgeNetCents.toFixed(1)}¢
+            </span>
+          )}
+          {(a.settlePrints ?? 0) > 0 && (
+            <span className="ml-1 font-mono text-krypt-purple" title="Settlement prints already locked in — Kalshi averages ~60 once-per-second index prints over the final minute; these have been observed live.">
+              {a.settlePrints}/60
+            </span>
+          )}
         </span>
       )}
     </div>
@@ -1060,6 +1204,14 @@ function PositionRow({ p }: { p: Crypto15mPosition }) {
         )}>
           {p.side || p.direction}
         </span>
+        {p.strategy === 'pair' && (
+          <span
+            className="ml-1 rounded-md bg-krypt-purple/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-krypt-purple"
+            title="Complement-accumulation leg — held to settlement; a matched UP+DOWN pair pays $1 regardless of direction."
+          >
+            pair
+          </span>
+        )}
       </td>
       <td className="text-xs text-krypt-muted">
         {p.status}{p.exitReason === 'stop_loss' ? ' · stop' : p.exitReason === 'take_profit' ? ' · profit' : ''}

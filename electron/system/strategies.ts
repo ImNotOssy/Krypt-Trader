@@ -12,9 +12,8 @@ export const BUILTIN_STRATEGIES: StrategyPreset[] = [
     name: 'Edge Stack',
     tagline: 'Both backtested edges at once — crypto whales + sports momentum.',
     description:
-      "Our recommended pick — the best risk-adjusted edge. Runs the two signal sources that backtested net-POSITIVE after fees, each restricted to where it has an edge — whales in CRYPTO / EXOTICS / ENTERTAINMENT and contrarian momentum in SPORTS (confidence ≥ 40, since momentum scores run low) — with an 85¢ cap that drops the loss-making high-price favorites. Sports Momentum has a higher raw edge, but this diversifies across two independent sources, so it's the most reliable (highest-confidence positive result, less exposed to any one category's luck). In-sample +15.6¢/contract (t=3.2, n=81) vs the unfiltered default's net-NEGATIVE edge. EXPERIMENTAL / in-sample — paper-trade first to confirm it holds forward.",
+      "EXPERIMENTAL — a later audit over 13,700 resolved signals measured this preset's whale leg net-NEGATIVE after fees (crypto whales underperform their own entry price) and its momentum leg at exactly zero. The early +15.6¢ result (n=81) did not survive the larger sample. Kept for experimentation only; do not size real money on it, and paper-trade anything before arming.",
     riskLabel: 'experimental',
-    badge: 'recommended',
     backtest: { netCents: 15.6, t: 3.2, n: 81 },
     config: merge({
       tradeWhales: true,
@@ -56,7 +55,7 @@ export const BUILTIN_STRATEGIES: StrategyPreset[] = [
     name: 'Crypto Whale',
     tagline: 'Whale-following, crypto markets only.',
     description:
-      "Most reliable edge (highest t-stat, 97% win). Whale signals in CRYPTO backtested strongly positive net-of-fee while sports whales lost. Fixed from the old preset: the entry cap is raised to 98¢ because crypto whales follow high-price favorites — the old 85¢ cap was throwing away most of its own edge. In-sample +9.3¢/contract (t=3.5, n=36). EXPERIMENTAL / in-sample on a small sample — paper-trade to confirm.",
+      "Most reliable edge (highest t-stat, 97% win). Whale signals in CRYPTO backtested strongly positive net-of-fee while sports whales lost. Fixed from the old preset: the entry cap is raised to 98¢ because crypto whales follow high-price favorites — the old 85¢ cap was throwing away most of its own edge — and the edge gate is lowered to 2pts, because the scorer caps confidence at 97 so above ~92¢ the computable edge shrinks toward zero (a 5pt gate silently re-capped entries at 92¢). In-sample +9.3¢/contract (t=3.5, n=36). EXPERIMENTAL / in-sample on a small sample — paper-trade to confirm.",
     riskLabel: 'experimental',
     badge: 'new',
     backtest: { netCents: 9.3, t: 3.5, n: 36 },
@@ -65,7 +64,7 @@ export const BUILTIN_STRATEGIES: StrategyPreset[] = [
       tradeMomentum: false,
       allowedCategories: ['crypto'],
       minConfidenceWhale: 55.0,
-      minEdgePtsWhale: 5.0,
+      minEdgePtsWhale: 2.0,
       minEntryPriceCents: 15,
       maxEntryPriceCents: 98,
     }),

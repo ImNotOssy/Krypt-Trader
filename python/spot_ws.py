@@ -1,0 +1,317 @@
+"""Coinbase WebSocket spot feed — the BRTI-proxy price source for 15m crypto.
+
+Kalshi's crypto up/down markets settle on a 60-second AVERAGE of the CF
+Benchmarks Real-Time Index (BRTI): in the final minute before close the index
+is sampled about once per second and those ~60 prints are averaged into the
+settlement value. Coinbase is a BRTI constituent exchange (Binance is NOT),
+so its keyless public ticker stream is the closest free real-time proxy for
+the number Kalshi actually settles against — the REST spot chain
+(CryptoCompare → Coinbase → CoinGecko) mixes non-constituent venues and its
+cache makes model inputs up to ~14s stale.
+
+Two jobs:
+  1. Live spot prices for the Coinbase-listed assets (BTC/ETH/SOL/XRP/DOGE;
+     HYPE and BNB aren't listed and stay on the REST chain).
+  2. A once-per-second sample ring per asset, so the settlement model can
+     track the PARTIAL settlement average during a window's final minute —
+     with 30 of 60 prints in, only the remaining 30 are uncertain, which makes
+     the late-window probability far sharper than any terminal-spot model.
+
+STRICT ACCELERATOR like kalshi_ws: every consumer falls back to the REST
+chain per-asset whenever the socket is down, an asset isn't covered, or a
+price is stale. Never MORE fragile than pure REST — only fresher.
+
+Opt out with KRYPT_SPOT_WS=0 (env) or the `crypto15m_spot_ws` config key.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import random
+import time
+from collections import deque
+from typing import Optional
+
+logger = logging.getLogger("spot_ws")
+
+try:
+    import websockets  # type: ignore
+    _WS_IMPORT_OK = True
+except Exception:  # pragma: no cover - websockets missing
+    websockets = None  # type: ignore
+    _WS_IMPORT_OK = False
+
+_URL = os.environ.get("KRYPT_SPOT_WS_URL") or "wss://advanced-trade-ws.coinbase.com"
+
+_DISABLED = os.environ.get("KRYPT_SPOT_WS", "1").strip().lower() in (
+    "0", "off", "false", "no",
+)
+
+# Kalshi 15m assets listed on Coinbase. HYPE (Hyperliquid) and BNB are not —
+# they stay on the REST chain, which is exactly the per-asset fallback path.
+PRODUCTS: dict[str, str] = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+    "DOGE": "DOGE-USD",
+}
+_ASSET_BY_PRODUCT = {v: k for k, v in PRODUCTS.items()}
+
+# A price older than this is not served (consumer falls back to REST).
+_FRESH_SEC = 10.0
+_SILENT_TIMEOUT_SEC = 30.0  # no message for this long → force a reconnect
+_RECONNECT_MAX_SEC = 60.0
+# Sample ring: one print/second, sized to comfortably cover a settlement
+# window (60 prints) plus reconnect slop.
+_SAMPLES_MAX = 180
+_SETTLE_WINDOW_SEC = 60
+
+
+class _Client:
+    def __init__(self) -> None:
+        self.connected: bool = False
+        self._stop: bool = False
+        self._task: Optional[asyncio.Task] = None
+        self._sampler_task: Optional[asyncio.Task] = None
+        self._ws = None
+        self.last_msg_t: float = 0.0  # wall clock (time.time)
+        # asset -> (wall_ts, price). Wall clock throughout: settlement windows
+        # (close_time) are wall-clock UTC and samples must align with them.
+        self.prices: dict[str, tuple[float, float]] = {}
+        # asset -> deque[(epoch_sec:int, price)] — one entry per wall second.
+        self.samples: dict[str, deque] = {
+            a: deque(maxlen=_SAMPLES_MAX) for a in PRODUCTS
+        }
+
+    # ───────── lifecycle ─────────────────────────────────────────────
+
+    def start(self) -> None:
+        if _DISABLED or not _WS_IMPORT_OK:
+            if not _WS_IMPORT_OK and not _DISABLED:
+                logger.warning("spot_ws: `websockets` not installed — staying on REST")
+            return
+        self._stop = False
+        loop = asyncio.get_event_loop()
+        if self._task is None or self._task.done():
+            self._task = loop.create_task(self._run(), name="spot_ws")
+            logger.info("spot_ws: starting (coinbase)")
+        if self._sampler_task is None or self._sampler_task.done():
+            self._sampler_task = loop.create_task(self._sampler(), name="spot_ws_sampler")
+
+    async def stop(self) -> None:
+        self._stop = True
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        for t in (self._task, self._sampler_task):
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = None
+        self._sampler_task = None
+        self.connected = False
+
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    # ───────── connection loop ───────────────────────────────────────
+
+    async def _run(self) -> None:
+        attempt = 0
+        while not self._stop:
+            try:
+                await self._connect_once()
+                attempt = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempt += 1
+                backoff = min(2.0 ** attempt, _RECONNECT_MAX_SEC)
+                backoff *= random.uniform(0.75, 1.25)
+                logger.warning(
+                    f"spot_ws: disconnected ({type(e).__name__}: {e}); "
+                    f"reconnect in {backoff:.0f}s"
+                )
+                self.connected = False
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    raise
+
+    async def _connect_once(self) -> None:
+        kwargs = dict(ping_interval=10, ping_timeout=10, close_timeout=5,
+                      max_size=2 ** 22)
+        async with websockets.connect(_URL, **kwargs) as ws:
+            self._ws = ws
+            self.connected = True
+            self.last_msg_t = time.time()
+            # Heartbeats keep the connection scored as live during quiet tapes;
+            # ticker delivers a message per trade batch for each product.
+            await ws.send(json.dumps({
+                "type": "subscribe", "channel": "heartbeats",
+            }))
+            await ws.send(json.dumps({
+                "type": "subscribe", "channel": "ticker",
+                "product_ids": sorted(PRODUCTS.values()),
+            }))
+            logger.info(f"spot_ws: connected → {_URL}")
+            while not self._stop:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if time.time() - self.last_msg_t > _SILENT_TIMEOUT_SEC:
+                        logger.warning("spot_ws: silent link — forcing reconnect")
+                        return
+                    continue
+                self.last_msg_t = time.time()
+                try:
+                    self.handle_message(json.loads(raw))
+                except Exception as e:
+                    logger.debug(f"spot_ws: handle error: {e}")
+        self.connected = False
+        self._ws = None
+
+    # ───────── inbound ────────────────────────────────────────────────
+
+    def handle_message(self, m: dict) -> None:
+        if not isinstance(m, dict) or m.get("channel") != "ticker":
+            return  # heartbeats / subscribe acks / errors — nothing to store
+        now = time.time()
+        for ev in m.get("events") or []:
+            for tk in (ev or {}).get("tickers") or []:
+                asset = _ASSET_BY_PRODUCT.get((tk or {}).get("product_id") or "")
+                if not asset:
+                    continue
+                try:
+                    px = float(tk.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if px > 0:
+                    self.prices[asset] = (now, px)
+
+    # ───────── once-per-second settlement sampler ─────────────────────
+
+    def _sample_once(self, now: Optional[float] = None) -> None:
+        """Append at most one (second, price) sample per asset per wall second
+        — mirroring BRTI's one-print-per-second cadence so window_partial's
+        count maps 1:1 onto settlement prints."""
+        if now is None:
+            import kalshi_auth
+            # close_epoch comes from Kalshi — attribute prints on the SERVER
+            # clock or a slow local clock shifts them into the wrong window.
+            now = kalshi_auth.server_now()
+        sec = int(now)
+        for asset, (ts, px) in list(self.prices.items()):
+            if now - ts > _FRESH_SEC:
+                continue  # stale quote — a gap in samples is honest
+            ring = self.samples[asset]
+            if ring and ring[-1][0] >= sec:
+                continue  # already sampled this second
+            ring.append((sec, px))
+
+    async def _sampler(self) -> None:
+        while not self._stop:
+            try:
+                self._sample_once()
+            except Exception as e:
+                logger.debug(f"spot_ws: sampler error: {e}")
+            await asyncio.sleep(1.0)
+
+    # ───────── sync read APIs ─────────────────────────────────────────
+
+    def spot(self, asset: str) -> Optional[float]:
+        rec = self.prices.get((asset or "").upper())
+        if not rec:
+            return None
+        ts, px = rec
+        if time.time() - ts > _FRESH_SEC:
+            return None
+        return px
+
+    def fresh_spots(self) -> dict[str, float]:
+        """Live prices fresh enough to trust, keyed by asset. Empty when the
+        socket is down/cold — callers then use the REST chain untouched."""
+        if not self.connected:
+            return {}
+        now = time.time()
+        return {
+            a: px for a, (ts, px) in self.prices.items()
+            if now - ts <= _FRESH_SEC
+        }
+
+    def window_partial(
+        self, asset: str, close_epoch: float, now: Optional[float] = None,
+    ) -> tuple[float, int]:
+        """(sum, count) of the one-per-second prints observed so far inside a
+        window's final-minute settlement span [close−60s, close). This is the
+        realized part of Kalshi's settlement average; (0, 0) when nothing has
+        been observed (model degrades to the buffer-free approximation)."""
+        ring = self.samples.get((asset or "").upper())
+        if not ring:
+            return 0.0, 0
+        if now is None:
+            import kalshi_auth
+            now = kalshi_auth.server_now()
+        start = close_epoch - _SETTLE_WINDOW_SEC
+        end = min(now, close_epoch)
+        total, count = 0.0, 0
+        for sec, px in ring:
+            if start <= sec < end:
+                total += px
+                count += 1
+        return total, count
+
+    def stats(self) -> dict:
+        return {
+            "enabled": not _DISABLED and _WS_IMPORT_OK,
+            "connected": self.connected,
+            "assets": sorted(self.fresh_spots()),
+            "lastMsgAgeSec": round(max(0.0, time.time() - self.last_msg_t), 1)
+            if self.connected else None,
+        }
+
+
+_client = _Client()
+
+
+# Module-level delegators.
+def start() -> None:
+    _client.start()
+
+
+async def stop() -> None:
+    await _client.stop()
+
+
+def is_connected() -> bool:
+    return _client.connected
+
+
+def is_running() -> bool:
+    return _client.is_running()
+
+
+def spot(asset: str) -> Optional[float]:
+    return _client.spot(asset)
+
+
+def fresh_spots() -> dict[str, float]:
+    return _client.fresh_spots()
+
+
+def window_partial(asset: str, close_epoch: float, now: Optional[float] = None) -> tuple[float, int]:
+    return _client.window_partial(asset, close_epoch, now)
+
+
+def stats() -> dict:
+    return _client.stats()

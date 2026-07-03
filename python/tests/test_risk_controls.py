@@ -355,3 +355,60 @@ def test_reconcile_marks_open_position_for_live_pnl(fresh_db, monkeypatch):
         row = dict(db.fetch_position_by_id(conn, pid))
     assert row["mark_price_cents"] == pytest.approx(60.0)
     assert service._live_pnl_usd(row) == pytest.approx(1.0)
+
+
+# ───────── daily stop-loss: mark-to-market + % of bankroll (Tier 2) ─────────
+
+
+def _risk_cfg(**over):
+    from config import merge_with_defaults
+    base = {"stop_loss_on_day": -50.0, "stop_loss_on_day_pct": 0.0}
+    base.update(over)
+    return merge_with_defaults(base)
+
+
+def test_daily_stop_counts_open_position_mark_to_market(fresh_db, monkeypatch):
+    # Realized delta is only -$10, but open positions are marked $45 under
+    # water — the stop must see -$55 and fire BEFORE settlement realizes it.
+    monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: -10.0)
+    monkeypatch.setattr(db, "open_unrealized_pnl_usd", lambda conn, env: -45.0)
+    cfg = _risk_cfg()
+    blocked, why = trader._is_blocked_by_daily_risk(cfg, "demo")
+    assert blocked is True and "mark-to-market" in why
+
+    monkeypatch.setattr(db, "open_unrealized_pnl_usd", lambda conn, env: 0.0)
+    assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
+
+
+def test_daily_stop_pct_binds_when_tighter_than_flat(fresh_db, monkeypatch):
+    # $400 day-start account, 5% stop = -$20. Down $22: the % limit fires even
+    # though the flat -$50 default wouldn't.
+    monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: -22.0)
+    monkeypatch.setattr(db, "open_unrealized_pnl_usd", lambda conn, env: 0.0)
+    monkeypatch.setattr(
+        db, "first_snapshot_of_today", lambda conn, env, off=0: {"total_usd": 400.0})
+    cfg = _risk_cfg(stop_loss_on_day_pct=0.05)
+    blocked, why = trader._is_blocked_by_daily_risk(cfg, "demo")
+    assert blocked is True and "stop-loss" in why
+    # With the % stop off, -22 is inside the flat -50 → not blocked.
+    assert trader._is_blocked_by_daily_risk(_risk_cfg(), "demo")[0] is False
+
+
+def test_open_unrealized_pnl_uses_marks(fresh_db):
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, {
+            "signal_source": "whale", "signal_id": 991, "ticker": "MTM-1",
+            "direction": "yes", "target_contracts": 10, "limit_price_cents": 80,
+            "filled_contracts": 10, "cost_usd": 8.0, "client_order_id": "mtm-1",
+            "status": "filled", "kalshi_env": "demo",
+        })
+        db.update_bot_position(conn, pid, mark_price_cents=55.0)
+        # A second position with NO mark yet must not contribute.
+        db.insert_bot_position(conn, {
+            "signal_source": "whale", "signal_id": 992, "ticker": "MTM-2",
+            "direction": "yes", "target_contracts": 5, "limit_price_cents": 60,
+            "filled_contracts": 5, "cost_usd": 3.0, "client_order_id": "mtm-2",
+            "status": "filled", "kalshi_env": "demo",
+        })
+        # 10 × $0.55 − $8.00 = −$2.50
+        assert db.open_unrealized_pnl_usd(conn, "demo") == pytest.approx(-2.50)

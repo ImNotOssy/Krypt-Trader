@@ -20,9 +20,13 @@ export const DEFAULT_CONFIG: TraderConfig = {
   minEdgePtsMomentum: 5.0,
   minConfidenceWhale: 55.0,
   minConfidenceMomentum: 55.0,
+  feeAwareEdge: true,
+  maxEntrySlippageCents: 5,
+  minMarketVolume: 100,
+  maxTradeAgeMin: 15,
   minEntryPriceCents: 15,
   maxEntryPriceCents: 85,
-  maxResolutionDays: 0,
+  maxResolutionDays: 30,
   allowedMomentumSignalTypes: ['trade_cluster'],
   allowedCategories: null,
   allowedWhaleCategories: null,
@@ -38,7 +42,7 @@ export const DEFAULT_CONFIG: TraderConfig = {
   minSizeFraction: 0.02,
   maxSizeFraction: 0.06,
   sizingBaseEdge: 5.0,
-  sizingMaxEdge: 20.0,
+  sizingMaxEdge: 10.0,
   hardMaxPositionUsd: 50.0,
   minCashReserveFraction: 0.05,
 
@@ -50,7 +54,7 @@ export const DEFAULT_CONFIG: TraderConfig = {
   maxPositionsPerEvent: 1,
   maxDailyNewPositions: 40,
   unlimitedDailyNewPositions: false,
-  maxTotalExposureFraction: 0.75,
+  maxTotalExposureFraction: 0.35,
 
   tradeScanInterval: 20,
   positionPollInterval: 30,
@@ -64,6 +68,7 @@ export const DEFAULT_CONFIG: TraderConfig = {
 
   startBankrollUsd: 0.0,
   stopLossOnDay: -50.0,
+  stopLossOnDayPct: 0.05,
   takeProfitOnDay: 0.0,
 
   tradingHoursEnabled: false,
@@ -73,10 +78,6 @@ export const DEFAULT_CONFIG: TraderConfig = {
   tradingTimezoneOffsetMin: 0,
 
   minWhaleUsd: 2500.0,
-  minWhaleConfidence: 30.0,
-  minWhaleEdge: 2.0,
-  minMomentumConfidence: 0.0,
-  minMomentumEdge: 5.0,
   minEntryPriceFrac: 0.5,
 
   eventWebhookUrl: '',
@@ -93,8 +94,13 @@ export const DEFAULT_CONFIG: TraderConfig = {
   crypto15mOrderSize: 1,
   crypto15mBalancePct: 0.02,
   crypto15mMaxLossPct: 0,
-  crypto15mMaxConcurrent: 7,
+  crypto15mMaxTotalPct: 0.10,
+  crypto15mMaxConcurrent: 3,
   crypto15mDirectionMode: 'favorite',
+  crypto15mModelMinProb: 0.97,
+  crypto15mModelMinEdgeCents: 2,
+  crypto15mModelFinalMinute: true,
+  crypto15mModelAutopause: true,
   crypto15mTimeDelayMin: 8,
   crypto15mEntryThreshold: 0.70,
   crypto15mEntryMax: 0.98,
@@ -106,6 +112,15 @@ export const DEFAULT_CONFIG: TraderConfig = {
   crypto15mHoursStartUtc: 0,
   crypto15mHoursEndUtc: 24,
   crypto15mRecordSignals: true,
+  mainRecordSignals: true,
+  crypto15mSpotWs: true,
+  crypto15mPairsEnabled: false,
+  crypto15mDirectionalEnabled: true,
+  crypto15mPairsCeilingCents: 95,
+  crypto15mPairsDipCents: 2,
+  crypto15mPairsClip: 5,
+  crypto15mPairsFirstLegMinCents: 35,
+  crypto15mPairsFirstLegMaxCents: 60,
 };
 
 export const DEFAULT_STATE: AppState = {

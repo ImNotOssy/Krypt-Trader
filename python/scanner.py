@@ -51,6 +51,47 @@ def _parse_days_to_close(close_time: str) -> float | None:
     return None
 
 
+def _trade_age_sec(t: dict, now: datetime | None = None) -> float | None:
+    """Age of a tape trade in seconds from its created_time, or None when the
+    timestamp is missing/unparseable (callers fail OPEN — better to score a
+    trade of unknown age than to silently drop the whole tape). Handles both
+    the REST ISO strings and the WS buffer's epoch timestamps (ts_ms)."""
+    ct = t.get("created_time")
+    if ct in (None, ""):
+        return None
+    now_dt = now or datetime.now(timezone.utc)
+    # WS trades stamp created_time with ts_ms (epoch millis) or ts (epoch secs).
+    if isinstance(ct, (int, float)) or (isinstance(ct, str) and ct.isdigit()):
+        try:
+            v = float(ct)
+        except (TypeError, ValueError):
+            return None
+        if v <= 0:
+            return None
+        if v > 1e11:  # millis (≈1.7e12 today) vs seconds (≈1.7e9)
+            v /= 1000.0
+        return now_dt.timestamp() - v
+    if not isinstance(ct, str):
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            ts = datetime.strptime(ct, fmt)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (now_dt - ts).total_seconds()
+        except ValueError:
+            continue
+    return None
+
+
+def _max_trade_age_sec(cfg: dict) -> float:
+    try:
+        return max(1.0, float(cfg.get("max_trade_age_min", 15) or 15)) * 60.0
+    except (TypeError, ValueError):
+        return 15 * 60.0
+
+
 
 
 async def _resolve_category(ticker: str, title: str = "") -> str:
@@ -91,8 +132,10 @@ def compute_whale_score(
         elif price >= 0.35: edge -= 5
         else:               edge -= 8
 
+    # Monotonic in size — the old table gave $10-25k LESS than $5-10k (+1 vs
+    # +1.5), so a bigger whale scored lower.
     if dollar_value >= 25_000:   edge += 2
-    elif dollar_value >= 10_000: edge += 1
+    elif dollar_value >= 10_000: edge += 1.5
     elif dollar_value >= 5_000:  edge += 1.5
     elif dollar_value >= 2_500:  edge += 0.5
 
@@ -259,9 +302,17 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
 
     min_usd = float(cfg.get("min_whale_usd", 2500))
     min_entry = float(cfg.get("min_entry_price_frac", 0.50))
+    max_age = _max_trade_age_sec(cfg)
+    now = datetime.now(timezone.utc)
 
     candidates: list[dict] = []
     for t in raw:
+        # Age-gate the tape: the REST snapshot (and a WS buffer surviving a
+        # long stall) can hold hours-old trades — "discovering" those after a
+        # restart chases whales at prices that no longer exist.
+        age = _trade_age_sec(t, now)
+        if age is not None and age > max_age:
+            continue
         count_fp = _to_float(t.get("count_fp", 0))
         yes_p = _to_float(t.get("yes_price_dollars", 0))
         no_p = _to_float(t.get("no_price_dollars", 0))
@@ -308,12 +359,16 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
     # OUTSIDE any transaction, so the SQLite write lock is never held across an
     # await — which previously caused intermittent 'database is locked' failures
     # for concurrent IPC writes (manual order, Sync, Resolve All, config save).
+    # Cache-miss market fetches run CONCURRENTLY (capped) — serially they cost
+    # ~0.3s × N fresh whales, paid on the hot tape-to-order path.
+    miss_tickers = {e["ticker"] for e in pending if not e["mkt"]}
+    api_markets = await kalshi_api.fetch_markets_map(miss_tickers) if miss_tickers else {}
     fetched_markets: dict[str, dict] = {}
     for entry in pending:
         ticker = entry["ticker"]
         mkt = entry["mkt"]
         if not mkt:
-            api_mkt = await kalshi_api.fetch_market(ticker)
+            api_mkt = api_markets.get(ticker)
             if api_mkt:
                 event_tk = api_mkt.get("event_ticker", "")
                 series_tk = event_tk.split("-")[0] if event_tk and "-" in event_tk else ""
@@ -409,11 +464,20 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
     recent_trades = kalshi_ws.recent_trades(limit=1000)
     if recent_trades is None:
         recent_trades = await kalshi_api.fetch_recent_trades(limit=1000)
+    # Cluster counting only sees trades inside the age window. The raw last-1000
+    # tape has NO time bound — in quiet hours 5 trades spread over 6+ hours
+    # would count as a "cluster", which is "market had volume", not momentum.
+    max_age = _max_trade_age_sec(cfg)
+    now_utc = datetime.now(timezone.utc)
     trades_by_ticker: dict[str, list[dict]] = defaultdict(list)
     for t in recent_trades:
         ticker = t.get("ticker", "")
-        if ticker and not is_micro_market(ticker):
-            trades_by_ticker[ticker].append(t)
+        if not ticker or is_micro_market(ticker):
+            continue
+        age = _trade_age_sec(t, now_utc)
+        if age is not None and age > max_age:
+            continue
+        trades_by_ticker[ticker].append(t)
 
     new_alerts: list[dict] = []
     contrarian_only = bool(cfg.get("contrarian_only", True))
@@ -491,11 +555,13 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 for t in no_trades
             )
 
-            if yes_count > no_count:
+            # Direction by DOLLARS, not trade count — five $10 lottery tickets
+            # must not outvote four $5k orders on which side the flow is on.
+            if yes_dollars > no_dollars:
                 cluster_dir = "yes"
                 cluster_count = yes_count
                 cluster_dollars = yes_dollars
-            elif no_count > yes_count:
+            elif no_dollars > yes_dollars:
                 cluster_dir = "no"
                 cluster_count = no_count
                 cluster_dollars = no_dollars
@@ -583,6 +649,74 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
     return len(new_alerts), new_alerts
 
 
+
+
+def compute_convergence_score(*, count: int, total_usd: float, implied: float) -> float:
+    """Score a convergence group (N whales, same market+side, within the
+    window). The bonus IS the edge (edge = confidence − implied), scaled by
+    conviction: 3 whales +4, 4 whales +6, 5+ whales +8, plus +1 for ≥$25k of
+    combined flow. Same 97 ceiling as the other scorers."""
+    implied = max(5.0, min(float(implied), 95.0))
+    if count >= 5:
+        bonus = 8.0
+    elif count == 4:
+        bonus = 6.0
+    else:
+        bonus = 4.0
+    if total_usd >= 25_000:
+        bonus += 1.0
+    bonus = min(bonus, 10.0)
+    return max(5, min(round(implied + bonus, 1), 97.0))
+
+
+def build_convergence_signals(
+    conn, *, max_signal_age_sec: int, min_count: int = 3, hours: int = 2,
+) -> list[dict]:
+    """Convergence candidates from the stored whale tape: >= min_count whales
+    on the SAME side of the SAME market within `hours`. Pure DB read — the
+    whale scanner (which runs regardless of trade_whales) keeps whale_trades
+    populated. A group only counts as FRESH while its newest whale is within
+    max_signal_age_sec, so a restart can't chase an hours-old pile-on. The
+    signal id is the newest whale's row id (stable for dedup via
+    already_traded_signal_ids; a later whale re-arms the signal, and the
+    market/side-already-open gate stops double entries)."""
+    groups = db.get_recent_whales_for_convergence(conn, hours=hours)
+    out: list[dict] = []
+    for (ticker, side), whales in groups.items():
+        if not ticker or side not in ("yes", "no") or is_micro_market(ticker):
+            continue
+        if len(whales) < min_count:
+            continue
+        latest = max(whales, key=lambda w: (w.get("created_at") or "", w.get("id") or 0))
+        age = _trade_age_sec({"created_time": latest.get("created_at") or ""})
+        if age is None or age > max_signal_age_sec:
+            continue
+        total = sum(_to_float(w.get("dollar_value")) for w in whales)
+        weighted = sum(
+            _to_float(w.get("price")) * _to_float(w.get("dollar_value")) for w in whales
+        )
+        price = (weighted / total) if total > 0 else _to_float(latest.get("price"))
+        if not (0.0 < price < 1.0):
+            continue
+        confidence = compute_convergence_score(
+            count=len(whales), total_usd=total, implied=price * 100.0,
+        )
+        out.append({
+            "id": int(latest.get("id") or 0),
+            "ticker": ticker,
+            "event_ticker": latest.get("event_ticker") or "",
+            "title": latest.get("title") or ticker,
+            "category": latest.get("category") or "",
+            "direction": side,
+            "taker_side": side,
+            "price": price,
+            "market_volume": latest.get("market_volume"),
+            "confidence": confidence,
+            "whale_count": len(whales),
+            "total_usd": total,
+            "signal_type": "convergence",
+        })
+    return out
 
 
 async def resolve_alerts_from_markets() -> int:

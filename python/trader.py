@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 import uuid
@@ -11,7 +12,8 @@ from typing import Optional
 import crypto15m
 import db
 from kalshi_api import (
-    KalshiAPIError, cancel_order, fetch_market, get_balance,
+    KalshiAPIError, cancel_order, fetch_market, find_order_by_client_id,
+    get_balance,
     get_fills_for_order, get_order, get_orderbook, get_positions,
     place_limit_order,
 )
@@ -36,34 +38,44 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
     interval = float(cfg.get("balance_poll_interval", 60))
     loop = asyncio.get_event_loop()
     now = loop.time()
-    # Hold the env lock across read-env → fetch → cache so a concurrent
-    # credential test (which briefly flips the global env) can't make us fetch
-    # the other account's balance and cache it under this env. Without this the
-    # displayed balance flickers between demo and production.
+    # Read the env + cache under ENV_LOCK (so a credential test's temporary env
+    # flip is waited out, never observed mid-flip), but do the fetch OUTSIDE the
+    # lock — holding it across get_balance's full timeout/retry ladder blocked
+    # every order placement behind a slow balance poll (worst case ~80s, exactly
+    # while a stop-loss wanted out). The cache write re-checks the env so a flip
+    # during the fetch can only ever DROP an update, not file it under the
+    # wrong env (the balance-flicker bug the lock originally fixed).
     async with ENV_LOCK:
         env = get_env()
         cached = _balance_cache.get(env)
         if not force and cached and (now - cached["at"]) < interval:
             return cached["cents"], cached["portfolio_cents"]
-        try:
-            data = await get_balance()
-            # A malformed/empty response (no 'balance' key) must NOT be cached as
-            # $0 — that poisons the cache and makes the displayed balance flash to
-            # zero. Treat it like a failed fetch and keep the last-known value.
-            if not isinstance(data, dict) or "balance" not in data:
-                raise ValueError("balance missing from response")
-            global _balance_shape_logged
-            if not _balance_shape_logged:
-                _balance_shape_logged = True
-                logger.info(f"Kalshi /portfolio/balance response shape: {dict(data)}")
-            cents = int(data.get("balance", 0))
-            port = int(data.get("portfolio_value", 0))
-            _balance_cache[env] = {"cents": cents, "portfolio_cents": port, "at": now}
-            return cents, port
-        except Exception as e:
-            logger.warning(f"balance fetch failed: {e}")
-            cached = _balance_cache.get(env)
-            return (cached["cents"], cached["portfolio_cents"]) if cached else (0, 0)
+    try:
+        # pin_env: if a credential test flips the env mid-fetch, the request
+        # ABORTS instead of returning the other account's balance (which the
+        # restored-env write guard below could not distinguish).
+        data = await get_balance(pin_env=env)
+        # A malformed/empty response (no 'balance' key) must NOT be cached as
+        # $0 — that poisons the cache and makes the displayed balance flash to
+        # zero. Treat it like a failed fetch and keep the last-known value.
+        if not isinstance(data, dict) or "balance" not in data:
+            raise ValueError("balance missing from response")
+        global _balance_shape_logged
+        if not _balance_shape_logged:
+            _balance_shape_logged = True
+            logger.info(f"Kalshi /portfolio/balance response shape: {dict(data)}")
+        cents = int(data.get("balance", 0))
+        port = int(data.get("portfolio_value", 0))
+        async with ENV_LOCK:
+            if get_env() == env:
+                _balance_cache[env] = {
+                    "cents": cents, "portfolio_cents": port, "at": now,
+                }
+        return cents, port
+    except Exception as e:
+        logger.warning(f"balance fetch failed: {e}")
+        cached = _balance_cache.get(env)
+        return (cached["cents"], cached["portfolio_cents"]) if cached else (0, 0)
 
 
 def cached_balance(env: str | None = None) -> dict | None:
@@ -173,6 +185,25 @@ def _compute_edge(signal: dict, source: str) -> float:
     return conf - implied
 
 
+def _taker_fee_cents(price_cents: int) -> float:
+    """Kalshi taker fee in cents per contract at `price_cents` — the continuous
+    marginal rate 7·p·(1−p) (per-order round-up is negligible at the main
+    engine's multi-contract sizes). ~1.75c at 50c, ~0.9c at 85c."""
+    p = max(1, min(99, int(price_cents))) / 100.0
+    return 7.0 * p * (1.0 - p)
+
+
+def _net_edge(signal: dict, source: str, cfg: dict) -> float:
+    """Signal edge with the taker fee subtracted (when fee_aware_edge is on),
+    so the min_edge gates compare NET expectation — a "5pt" gross edge at 50c
+    is really ~3.3pts after the ~1.75c fee."""
+    edge = _compute_edge(signal, source)
+    if cfg.get("fee_aware_edge", True):
+        _, cost_cents = _signal_cost_cents(signal, source)
+        edge -= _taker_fee_cents(cost_cents)
+    return edge
+
+
 def _days_until_close(close_time: str) -> Optional[float]:
     """Days from now until a market's close/resolution time (ISO8601). Returns None
     when the time is missing or unparseable, which callers treat as 'unknown' and
@@ -202,6 +233,12 @@ def _enrich_close_time(conn, sig: dict) -> None:
 
 
 def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
+    # The 15m-crypto executor owns its series (own table + booking); a main-engine
+    # position on the same ticker would double-count cost in the account total and
+    # book P&L twice at settlement. Mirror of the reconcile-import exclusion.
+    if (signal.get("ticker") or "").split("-")[0] in _CRYPTO15M_SERIES:
+        return False, "crypto15m series (owned by the 15m executor)"
+
     # "Secret Strategy" — pure gambling. Ignore every gate (confidence, edge,
     # category, price); each fresh signal just gets a flat random roll.
     if cfg.get("gambling_mode"):
@@ -212,7 +249,10 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
         return False, f"\U0001F3B0 gambling: no hit ({pct}%)"
 
     conf = float(signal.get("confidence") or 0.0)
-    edge = _compute_edge(signal, source)
+    # Gates compare NET edge (taker fee subtracted when fee_aware_edge is on) —
+    # a gross gate lets through trades whose whole edge goes to fees.
+    edge = _net_edge(signal, source, cfg)
+    edge_tag = "net edge" if cfg.get("fee_aware_edge", True) else "edge"
 
     if source == "whale":
         if not cfg.get("trade_whales", False):
@@ -220,14 +260,14 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
         if conf < cfg["min_confidence_whale"]:
             return False, f"conf {conf:.1f} < {cfg['min_confidence_whale']}"
         if edge < cfg["min_edge_pts_whale"]:
-            return False, f"edge {edge:.1f} < {cfg['min_edge_pts_whale']}"
+            return False, f"{edge_tag} {edge:.1f} < {cfg['min_edge_pts_whale']}"
     elif source == "momentum":
         if not cfg.get("trade_momentum", False):
             return False, "momentum disabled"
         if conf < cfg["min_confidence_momentum"]:
             return False, f"conf {conf:.1f} < {cfg['min_confidence_momentum']}"
         if edge < cfg["min_edge_pts_momentum"]:
-            return False, f"edge {edge:.1f} < {cfg['min_edge_pts_momentum']}"
+            return False, f"{edge_tag} {edge:.1f} < {cfg['min_edge_pts_momentum']}"
         sig_type = (signal.get("signal_type") or "")
         allowed = set(cfg.get("allowed_momentum_signal_types", []))
         if sig_type not in allowed:
@@ -237,6 +277,8 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
             return False, "convergence disabled"
         if conf < cfg["min_confidence_whale"]:
             return False, f"conf {conf:.1f} < {cfg['min_confidence_whale']}"
+        if edge < cfg["min_edge_pts_whale"]:
+            return False, f"{edge_tag} {edge:.1f} < {cfg['min_edge_pts_whale']}"
 
     cat = (signal.get("category") or "").lower()
     allowed_cats = cfg.get("allowed_categories")
@@ -257,6 +299,22 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
             return False, f"no {source} categories enabled"
         if cat not in {c.lower() for c in src_cats}:
             return False, f"category {cat!r} not in {source} set"
+
+    # Liquidity floor: thin markets mean wide spreads and adverse fills — the
+    # signal rows already carry the market's volume, so gate on it before
+    # paying to find out. Unknown volume fails OPEN (0 / missing).
+    min_vol = float(cfg.get("min_market_volume", 0) or 0)
+    if min_vol > 0:
+        vol = 0.0
+        for k in ("market_volume", "volume_24h"):
+            v = signal.get(k)
+            if v not in (None, ""):
+                try:
+                    vol = max(vol, float(v))
+                except (TypeError, ValueError):
+                    pass
+        if 0 < vol < min_vol:
+            return False, f"market volume {vol:.0f} < {min_vol:.0f}"
 
     _, cost_cents = _signal_cost_cents(signal, source)
     if cost_cents < cfg["min_entry_price_cents"]:
@@ -292,13 +350,49 @@ def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
 
 
 def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
-    pnl = _today_pnl_balance_delta(env, int(cfg.get("trading_timezone_offset_min", 0) or 0))
+    offset = int(cfg.get("trading_timezone_offset_min", 0) or 0)
+    pnl = _today_pnl_balance_delta(env, offset)
     if pnl is None:
         return False, ""
+
+    # The balance-delta P&L values open positions at COST — a day of positions
+    # bleeding toward zero shows $0 until settlement, so the stop-loss fired
+    # only after the money was gone. Add the live mark-to-market of open
+    # positions (marks written by the 30s reconcile) for the stop decision.
+    try:
+        with db.get_db() as conn:
+            unrealized = db.open_unrealized_pnl_usd(conn, env)
+    except Exception:
+        unrealized = 0.0
+    pnl_mtm = pnl + unrealized
+
+    # Two stop limits — flat dollars and % of the day-start account total —
+    # whichever is TIGHTER binds. The % limit is what makes one default fit a
+    # $100 account (flat -$50 = half the bankroll) and a $5000 one (noise).
+    sl_limits: list[float] = []
     sl = float(cfg.get("stop_loss_on_day", 0))
+    if sl < 0:
+        sl_limits.append(sl)
+    sl_pct = float(cfg.get("stop_loss_on_day_pct", 0) or 0)
+    if sl_pct > 0:
+        try:
+            with db.get_db() as conn:
+                first_today = db.first_snapshot_of_today(conn, env, offset)
+        except Exception:
+            first_today = None
+        if first_today:
+            day_start = float(first_today["total_usd"] or 0.0)
+            if day_start > 0:
+                sl_limits.append(-sl_pct * day_start)
+    if sl_limits:
+        limit = max(sl_limits)  # closest to zero = tighter
+        if pnl_mtm <= limit:
+            return True, (
+                f"daily stop-loss hit (today pnl=${pnl:+.2f}, "
+                f"open mark-to-market=${unrealized:+.2f}, limit=${limit:+.2f})"
+            )
+
     tp = float(cfg.get("take_profit_on_day", 0))
-    if sl < 0 and pnl <= sl:
-        return True, f"daily stop-loss hit (today pnl=${pnl:+.2f}, limit=${sl:+.2f})"
     if tp > 0 and pnl >= tp:
         return True, f"daily take-profit hit (today pnl=${pnl:+.2f}, target=${tp:+.2f})"
     return False, ""
@@ -409,6 +503,18 @@ async def execute_signal(
             f"(book moved since signal)"
         )
         return None
+    # Slippage cap: limit_cross pays whatever the live book asks — on a thin or
+    # fast-moving book that can be far past the price the signal's edge was
+    # computed at, silently spending the edge before settlement risk even
+    # starts. The edge gate was passed at signal_cost_cents; refuse to pay more
+    # than a few cents beyond it. 0 = off.
+    max_slip = int(cfg.get("max_entry_slippage_cents", 0) or 0)
+    if max_slip > 0 and limit_cents > signal_cost_cents + max_slip:
+        logger.info(
+            f"[skip] {signal['ticker']}: order price {limit_cents}c > signal "
+            f"{signal_cost_cents}c + {max_slip}c slippage cap (edge already spent)"
+        )
+        return None
     contracts = max(1, int(target_usd * 100 // limit_cents))
     expected_cost_usd = contracts * limit_cents / 100.0
     client_order_id = f"krypt-{source}-{signal['id']}-{uuid.uuid4().hex[:8]}"
@@ -455,21 +561,24 @@ async def execute_signal(
             client_order_id=client_order_id,
         )
     except KalshiAPIError as e:
-        row["status"] = "error"
-        row["error"] = f"HTTP {e.status}: {str(e.body)[:200]}"
-        logger.error(f"[ORDER-FAIL] {signal['ticker']}: {row['error']}")
-        with db.get_db() as conn:
-            pid = db.insert_bot_position(conn, row)
-            db.log_event(conn, pid, "error", note=row["error"])
-            return db.fetch_position_by_id(conn, pid)
+        # 4xx = Kalshi REJECTED the order (confirmed not placed). 5xx and
+        # transport errors may have DELIVERED it — look the coid up before
+        # booking an error, or the resting order becomes an invisible position
+        # that fills hours later on a stale limit while the engine re-fires
+        # the same signal (double position).
+        if e.status and 400 <= int(e.status) < 500:
+            row["status"] = "error"
+            row["error"] = f"HTTP {e.status}: {str(e.body)[:200]}"
+            logger.error(f"[ORDER-FAIL] {signal['ticker']}: {row['error']}")
+            with db.get_db() as conn:
+                pid = db.insert_bot_position(conn, row)
+                db.log_event(conn, pid, "error", note=row["error"])
+                return db.fetch_position_by_id(conn, pid)
+        return await _book_lost_entry(row, signal, client_order_id, f"HTTP {e.status}")
     except Exception as e:
-        row["status"] = "error"
-        row["error"] = f"{type(e).__name__}: {e}"
-        logger.error(f"[ORDER-EXC] {signal['ticker']}: {row['error']}")
-        with db.get_db() as conn:
-            pid = db.insert_bot_position(conn, row)
-            db.log_event(conn, pid, "error", note=row["error"])
-            return db.fetch_position_by_id(conn, pid)
+        return await _book_lost_entry(
+            row, signal, client_order_id, f"{type(e).__name__}: {str(e)[:160]}"
+        )
 
     order = (resp.get("order") if isinstance(resp, dict) else None) or resp or {}
     order_id = order.get("order_id") if isinstance(order, dict) else None
@@ -478,9 +587,42 @@ async def execute_signal(
     with db.get_db() as conn:
         pid = db.insert_bot_position(conn, row)
         db.log_event(
-            conn, pid, "placed", kalshi_status=order.get("status"),
+            conn, pid, "placed", kalshi_status=order.get("status") if isinstance(order, dict) else None,
             note=f"order_id={order_id}",
         )
+        return db.fetch_position_by_id(conn, pid)
+
+
+async def _book_lost_entry(
+    row: dict, signal: dict, client_order_id: str, err: str
+) -> Optional[dict]:
+    """An entry POST raised but may have been delivered. Adopt the live order
+    if the coid lookup finds it; book 'error' only on a confirmed miss. On an
+    unconfirmable lookup, book 'submitted' with no order id — the poll loop's
+    NULL-kid recovery resolves it rather than letting the signal re-fire."""
+    found = None
+    confirmed = False
+    try:
+        found = await find_order_by_client_id(client_order_id, ticker=signal["ticker"])
+        confirmed = True
+    except Exception:
+        pass
+    if found:
+        row["status"] = "submitted"
+        row["kalshi_order_id"] = found.get("order_id")
+        note = f"response lost ({err}); recovered via coid"
+    elif confirmed:
+        row["status"] = "error"
+        row["error"] = err
+        note = err
+    else:
+        row["status"] = "submitted"
+        row["error"] = f"UNCONFIRMED: {err}"
+        note = row["error"]
+    logger.warning(f"[ORDER-RECOVER] {signal['ticker']}: {note}")
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, row)
+        db.log_event(conn, pid, "error" if row["status"] == "error" else "placed", note=note)
         return db.fetch_position_by_id(conn, pid)
 
 
@@ -491,10 +633,17 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
     now_ts = time.time()
 
     def _skip_log(reason: str) -> None:
-        last = _last_scan_skip_log.get(reason, 0)
+        last_cycle["skipReason"] = reason
+        last_cycle["at"] = time.time()
+        # Dedup on the stable prefix — reasons embed live values ("today
+        # pnl=$-51.37") that change every snapshot, which defeated the dedup
+        # and spammed thousands of identical lines per blocked day (rotating
+        # real errors out of the log window).
+        key = reason.split(" (", 1)[0]
+        last = _last_scan_skip_log.get(key, 0)
         if now_ts - last < 60:
             return
-        _last_scan_skip_log[reason] = now_ts
+        _last_scan_skip_log[key] = now_ts
         logger.info(f"[skip-cycle] {reason}")
 
     if not cfg.get("enable_trading"):
@@ -518,7 +667,7 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
         return []
 
     candidates: list[tuple[dict, str]] = []
-    fetched_w = fetched_m = 0
+    fetched_w = fetched_m = fetched_c = 0
     # Only pay for the per-signal market lookup (close_time) when the resolution
     # cap is actually enabled.
     gate_resolution = int(cfg.get("max_resolution_days", 0) or 0) > 0
@@ -548,6 +697,18 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
                 if gate_resolution:
                     _enrich_close_time(conn, sig)
                 candidates.append((sig, "momentum"))
+        if cfg.get("trade_convergence"):
+            import scanner as _scanner
+            seen = db.already_traded_signal_ids(conn, "convergence", env)
+            for sig in _scanner.build_convergence_signals(
+                conn, max_signal_age_sec=int(cfg["max_signal_age_sec"]),
+            ):
+                if int(sig["id"]) in seen:
+                    continue
+                fetched_c += 1
+                if gate_resolution:
+                    _enrich_close_time(conn, sig)
+                candidates.append((sig, "convergence"))
 
     if not candidates:
         bits = []
@@ -565,7 +726,7 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
         _skip_log("no candidates: " + ", ".join(bits))
         return []
 
-    candidates.sort(key=lambda c: _compute_edge(c[0], c[1]), reverse=True)
+    candidates.sort(key=lambda c: _net_edge(c[0], c[1], cfg), reverse=True)
     inserted: list[dict] = []
     filter_counts: dict[str, int] = {}
     for sig, src in candidates:
@@ -576,25 +737,41 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
             if (now_ts - last) >= float(cfg.get("max_signal_age_sec", 120)):
                 logger.info(f"[filter] {sig['ticker']} {src}: {why}")
                 _last_filter_log[key] = now_ts
+                _cap_log_dict(_last_filter_log)
             filter_counts[why] = filter_counts.get(why, 0) + 1
             continue
         try:
             row = await execute_signal(sig, src, cfg, balance_usd)
             if row:
                 inserted.append(row)
+                # Deduct the committed notional LOCALLY instead of forcing a
+                # balance refresh per order (~0.3-0.5s each, serialized before
+                # the next candidate — exactly when several signals fire
+                # together and speed matters). Conservative: the real fill may
+                # cost less. One forced refresh after the loop trues up.
+                if row.get("status") != "error":
+                    balance_usd -= (
+                        int(row.get("target_contracts") or 0)
+                        * int(row.get("limit_price_cents") or 0) / 100.0
+                    )
         except Exception as e:
             logger.error(f"[exec-fail] {sig['ticker']} {src}: {e}", exc_info=True)
-        cents, _ = await refresh_balance(cfg, force=True)
-        balance_usd = cents / 100.0
         if balance_usd < 5.0:
             logger.info("[halt-cycle] balance now below $5")
             break
 
+    if inserted:
+        await refresh_balance(cfg, force=True)
+
+    last_cycle.update({
+        "skipReason": None, "filterCounts": dict(filter_counts),
+        "candidates": len(candidates), "placed": len(inserted), "at": time.time(),
+    })
     if candidates:
         rejected = sum(filter_counts.values())
         logger.info(
             f"[trade-cycle] candidates={len(candidates)} "
-            f"(whale={fetched_w}, momentum={fetched_m}) "
+            f"(whale={fetched_w}, momentum={fetched_m}, convergence={fetched_c}) "
             f"placed={len(inserted)} filtered={rejected}"
         )
 
@@ -602,10 +779,24 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
 
 
 _last_scan_skip_log: dict[str, float] = {}
+# Last scan cycle's outcome — cycle-level skip reason (hours/daily-stop/...)
+# and per-gate rejection counts. The "why isn't it trading" panel reads these;
+# before this they were computed every cycle and thrown away.
+last_cycle: dict = {"skipReason": None, "filterCounts": {}, "candidates": 0, "placed": 0, "at": None}
 
 _last_filter_log: dict[tuple[int, str], float] = {}
 
 _last_skip_import_log: dict[tuple[str, str], float] = {}
+
+
+def _cap_log_dict(d: dict, cap: int = 2000, keep: int = 1500) -> None:
+    """Bound the log-dedup dicts for multi-week runs: they gain a key per
+    filtered signal / skipped import forever. Evict oldest-inserted first
+    (dicts preserve insertion order; exact LRU isn't worth the bookkeeping
+    for a dedup cache — worst case an evicted key logs once more)."""
+    if len(d) > cap:
+        for k in list(d)[: len(d) - keep]:
+            d.pop(k, None)
 # Consecutive reconciles a filled position has been absent from Kalshi's
 # /portfolio/positions. Used to debounce orphan-closing against transient API
 # blips and fresh-fill lag before declaring a position truly gone.
@@ -619,6 +810,17 @@ def _f(v) -> float:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _order_fees_usd(order: dict) -> float:
+    """Kalshi trading fees on an order, in dollars. The order object reports
+    them as `taker_fees_dollars`/`maker_fees_dollars` (fp shape) or
+    `taker_fees`/`maker_fees` (integer cents). fill_cost EXCLUDES fees, so
+    P&L that ignores these overstates every round trip."""
+    fees = _f(order.get("taker_fees_dollars")) + _f(order.get("maker_fees_dollars"))
+    if fees:
+        return fees
+    return (_f(order.get("taker_fees")) + _f(order.get("maker_fees"))) / 100.0
 
 
 def _parse_kalshi_order(order: dict) -> dict:
@@ -643,6 +845,7 @@ def _parse_kalshi_order(order: dict) -> dict:
         "status": status,
         "place_count": place_count,
         "remaining": remaining,
+        "fees_usd": _order_fees_usd(order),
     }
 
 
@@ -667,6 +870,15 @@ def _parse_kalshi_fill(f: dict, default_side: str = "") -> dict:
     if price_cents is not None and not (1 <= price_cents <= 99):
         price_cents = None
     return {"count": count, "side": side, "price_cents": price_cents}
+
+
+def _position_fees_usd(p: dict) -> float:
+    """Trading fees a /portfolio/positions row reports for the market, in
+    dollars (`fees_paid_dollars`, or legacy `fees_paid` cents)."""
+    fees = _f(p.get("fees_paid_dollars"))
+    if fees:
+        return fees
+    return _f(p.get("fees_paid")) / 100.0
 
 
 def _parse_kalshi_position(p: dict) -> dict:
@@ -819,12 +1031,14 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
         ):
             return None
 
+        fees_usd = _position_fees_usd(live_p)
         with db.get_db() as conn:
             db.update_bot_position(
                 conn, pos["id"], status="filled",
                 filled_contracts=new_filled,
                 cost_usd=new_cost_usd,
                 avg_fill_price_cents=new_avg_cents,
+                **({"fees_usd": fees_usd} if fees_usd > 0 else {}),
             )
             db.log_event(
                 conn, pos["id"], "poll",
@@ -847,6 +1061,23 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
             continue
 
         if not kid:
+            # A lost-response entry (or odd order-response shape) left this row
+            # without an order id. The order may be LIVE — look it up by our
+            # client_order_id and adopt it before any give-up path runs.
+            coid = pos.get("client_order_id")
+            if coid:
+                try:
+                    found = await find_order_by_client_id(coid, ticker=pos.get("ticker") or "")
+                except Exception:
+                    found = None
+                if found and found.get("order_id"):
+                    with db.get_db() as conn:
+                        db.update_bot_position(
+                            conn, pos["id"], kalshi_order_id=found.get("order_id"),
+                        )
+                        db.log_event(conn, pos["id"], "poll", note="adopted order via coid")
+                    _clear_failure(pos["id"])
+                    continue
             row = _try_rescue_from_position_aggregate(pos)
             if row:
                 _clear_failure(pos["id"])
@@ -953,27 +1184,57 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
             if age_sec > float(cfg["order_expiration_sec"]):
                 try:
                     await cancel_order(kid)
-                    with db.get_db() as conn:
-                        db.update_bot_position(
-                            conn, pos["id"], status="canceled",
-                            error=f"auto-canceled after {age_sec:.0f}s",
-                        )
-                        db.log_event(conn, pos["id"], "cancel", note=f"age {age_sec:.0f}s")
-                        r = db.fetch_position_by_id(conn, pos["id"])
-                    if r:
-                        updated.append(r)
                 except KalshiAPIError as e:
-                    with db.get_db() as conn:
-                        db.update_bot_position(
-                            conn, pos["id"], status="gone",
-                            error=f"cancel 404: {str(e.body)[:100]}",
-                        )
-                        db.log_event(conn, pos["id"], "cancel", note="404 -> gone")
-                        r = db.fetch_position_by_id(conn, pos["id"])
-                    if r:
-                        updated.append(r)
+                    if e.status == 404:
+                        # Order unknown to Kalshi — genuinely gone.
+                        with db.get_db() as conn:
+                            db.update_bot_position(
+                                conn, pos["id"], status="gone",
+                                error=f"cancel 404: {str(e.body)[:100]}",
+                            )
+                            db.log_event(conn, pos["id"], "cancel", note="404 -> gone")
+                            r = db.fetch_position_by_id(conn, pos["id"])
+                        if r:
+                            updated.append(r)
+                    else:
+                        # 5xx/throttle — the order may still be RESTING. Booking
+                        # 'gone' here would untrack a live order; retry next poll.
+                        logger.warning(f"cancel {kid}: HTTP {e.status}, will retry")
+                    continue
                 except Exception as e:
                     logger.warning(f"cancel exception {kid}: {e}")
+                    continue
+                # Cancel accepted — but a fill may have RACED it (the exact
+                # shape that produced an off-book 15m settlement). Book
+                # 'canceled' only from a CONFIRMED post-cancel zero-fill read;
+                # if the re-read shows fills or fails, leave 'submitted' so the
+                # next poll books the truth (a resolved 'canceled 0-fill' row
+                # also blocks the reconcile import for this ticker, so a wrong
+                # write here is unrecoverable).
+                final = None
+                for _ in range(3):
+                    try:
+                        resp2 = await get_order(kid)
+                        final = _parse_kalshi_order(
+                            (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
+                        )
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.5)
+                if final is None:
+                    logger.warning(f"cancel {kid}: fill state unconfirmed, retrying next poll")
+                    continue
+                if int(final.get("filled") or 0) > 0:
+                    continue  # next poll's normal path books the fills
+                with db.get_db() as conn:
+                    db.update_bot_position(
+                        conn, pos["id"], status="canceled",
+                        error=f"auto-canceled after {age_sec:.0f}s",
+                    )
+                    db.log_event(conn, pos["id"], "cancel", note=f"age {age_sec:.0f}s")
+                    r = db.fetch_position_by_id(conn, pos["id"])
+                if r:
+                    updated.append(r)
 
     return updated
 
@@ -1109,13 +1370,16 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
         direction = pos["direction"]
         filled = int(pos["filled_contracts"] or 0)
         cost_usd = float(pos["cost_usd"] or 0.0)
+        fees_usd = float(pos.get("fees_usd") or 0.0)
         our_payout = yes_payout if direction == "yes" else (1.0 - yes_payout)
         settlement_usd = filled * our_payout
-        pnl_usd = settlement_usd - cost_usd
+        # Realized P&L is NET of Kalshi trading fees — fill_cost excludes them,
+        # so gross settlement−cost overstates every position by the fee paid.
+        pnl_usd = settlement_usd - cost_usd - fees_usd
 
         max_settlement = float(filled)
-        max_pnl = max_settlement - cost_usd
-        min_pnl = -cost_usd
+        max_pnl = max_settlement - cost_usd - fees_usd
+        min_pnl = -cost_usd - fees_usd
         if pnl_usd > max_pnl + 0.01 or pnl_usd < min_pnl - 0.01:
             logger.warning(
                 f"[resolve-clamp] {pos['ticker']} pnl=${pnl_usd:+.2f} "
@@ -1125,7 +1389,7 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
                 f"run Reconcile Fills."
             )
             pnl_usd = max(min_pnl, min(max_pnl, pnl_usd))
-            settlement_usd = pnl_usd + cost_usd
+            settlement_usd = pnl_usd + cost_usd + fees_usd
 
         if our_payout >= 0.99:
             correct: Optional[int] = 1
@@ -1260,7 +1524,7 @@ async def audit_pnl(limit: int = 200) -> dict:
     with db.get_db() as conn:
         rows = conn.execute(
             """SELECT id, ticker, direction, filled_contracts, cost_usd,
-                      pnl_usd, settlement_usd, outcome_correct
+                      fees_usd, pnl_usd, settlement_usd, outcome_correct
                FROM bot_positions
                WHERE kalshi_env=? AND resolved=1
                ORDER BY resolved_at DESC LIMIT ?""",
@@ -1279,10 +1543,11 @@ async def audit_pnl(limit: int = 200) -> dict:
         direction = r["direction"]
         filled = int(r["filled_contracts"] or 0)
         cost = float(r["cost_usd"] or 0)
+        fees = float(r.get("fees_usd") or 0)
         our = yes_payout if direction == "yes" else (1.0 - yes_payout)
         settle = filled * our
-        pnl_fresh = settle - cost
-        pnl_fresh = max(-cost, min(filled - cost, pnl_fresh))
+        pnl_fresh = settle - cost - fees
+        pnl_fresh = max(-cost - fees, min(filled - cost - fees, pnl_fresh))
         pnl_stored = float(r["pnl_usd"] or 0)
         sum_stored += pnl_stored
         sum_recompute += pnl_fresh
@@ -1471,6 +1736,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             ):
                 continue
 
+            live_fees_usd = _position_fees_usd(live_p)
             with db.get_db() as conn:
                 db.update_bot_position(
                     conn, target["id"], status="filled",
@@ -1480,6 +1746,8 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     error=None if was_terminal else target.get("error"),
                     **({"mark_price_cents": cur_mark}
                        if cur_mark is not None else {}),
+                    **({"fees_usd": live_fees_usd}
+                       if live_fees_usd > 0 else {}),
                 )
                 db.log_event(
                     conn, target["id"], "reconcile",
@@ -1520,6 +1788,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                             f"(Kalshi cash-settlement still pending)"
                         )
                         _last_skip_import_log[key] = time.time()
+                        _cap_log_dict(_last_skip_import_log)
                     continue
             now_ms = int(time.time() * 1000)
             signal_id = (
@@ -1611,6 +1880,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
 
                 filled = int(r["filled_contracts"] or 0)
                 cost_usd = float(r["cost_usd"] or 0.0)
+                fees_usd = float(r.get("fees_usd") or 0.0)
                 is_c15 = ticker.split("-")[0] in _CRYPTO15M_SERIES
                 # crypto15m externals carry their real P&L in their own table;
                 # close them flat to avoid double-counting. Everything else
@@ -1635,9 +1905,10 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                 if yes_payout is not None:
                     our_payout = yes_payout if side == "yes" else (1.0 - yes_payout)
                     settlement_usd = filled * our_payout
-                    pnl_usd = settlement_usd - cost_usd
-                    pnl_usd = max(-cost_usd, min(float(filled) - cost_usd, pnl_usd))
-                    settlement_usd = pnl_usd + cost_usd
+                    pnl_usd = settlement_usd - cost_usd - fees_usd
+                    pnl_usd = max(-cost_usd - fees_usd,
+                                  min(float(filled) - cost_usd - fees_usd, pnl_usd))
+                    settlement_usd = pnl_usd + cost_usd + fees_usd
                     if our_payout >= 0.99:
                         correct: Optional[int] = 1
                     elif our_payout <= 0.01:

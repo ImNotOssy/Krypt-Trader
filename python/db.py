@@ -29,6 +29,11 @@ def get_db():
     conn = sqlite3.connect(str(db_path()), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # NORMAL is durable-enough under WAL (a power cut can lose the last txn but
+    # never corrupts) and skips the per-commit fsync FULL forces — the trading
+    # loop opens/commits dozens of these per tick on the event-loop thread,
+    # each fsync stalling every coroutine 5-30ms.
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
     try:
@@ -231,6 +236,7 @@ CREATE TABLE IF NOT EXISTS crypto15m_positions (
     entry_limit_cents INTEGER NOT NULL,
     avg_entry_cents REAL DEFAULT NULL,
     cost_usd REAL DEFAULT 0,
+    fees_usd REAL DEFAULT 0,            -- Kalshi trading fees on the entry order
     client_order_id TEXT UNIQUE NOT NULL,
     kalshi_order_id TEXT DEFAULT NULL,
     -- stop-loss exit leg
@@ -239,6 +245,7 @@ CREATE TABLE IF NOT EXISTS crypto15m_positions (
     exit_limit_cents INTEGER DEFAULT NULL,
     exit_filled_contracts INTEGER DEFAULT 0,
     proceeds_usd REAL DEFAULT NULL,
+    exit_fees_usd REAL DEFAULT 0,       -- Kalshi trading fees on the exit order
     -- lifecycle
     status TEXT NOT NULL,               -- dry_run|submitted|filled|exiting|exited|settled|canceled|error
     exit_reason TEXT DEFAULT NULL,      -- 'stop_loss' | 'settlement' | 'unfilled_expired'
@@ -369,6 +376,10 @@ CREATE INDEX IF NOT EXISTS idx_oe_pos ON order_events(position_id, created_at DE
 CREATE INDEX IF NOT EXISTS idx_pnl_at ON pnl_snapshots(at DESC);
 CREATE INDEX IF NOT EXISTS idx_c15_open ON crypto15m_positions(resolved, status);
 CREATE INDEX IF NOT EXISTS idx_c15_asset ON crypto15m_positions(asset, kalshi_env, resolved);
+-- the executor tick reads errored/stopped ticker sets every ~4s; without this
+-- both are full-table DISTINCT scans that grow with history
+CREATE INDEX IF NOT EXISTS idx_c15_env_status ON crypto15m_positions(kalshi_env, status);
+CREATE INDEX IF NOT EXISTS idx_c15_env_exit ON crypto15m_positions(kalshi_env, exit_reason);
 """
 
 
@@ -401,6 +412,28 @@ def init_db() -> None:
             "ALTER TABLE crypto15m_ticks ADD COLUMN macd_hist REAL",
             "ALTER TABLE crypto15m_ticks ADD COLUMN macd_cross INTEGER",
             "ALTER TABLE crypto15m_ticks ADD COLUMN rsi REAL",
+            "ALTER TABLE crypto15m_positions ADD COLUMN fees_usd REAL DEFAULT 0",
+            "ALTER TABLE crypto15m_positions ADD COLUMN exit_fees_usd REAL DEFAULT 0",
+            # spot-vs-strike settlement model (detection-only recorded fields)
+            "ALTER TABLE crypto15m_ticks ADD COLUMN strike REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN delta_signed_pct REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN sigma1m REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN model_prob REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN edge_net_cents REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN strike REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN model_prob REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN edge_net_cents REAL",
+            # Final-minute settlement context — settle_prints gates the
+            # largest validated edge; spot_source says whether model_prob was
+            # computed off the exact CF settlement feed or a REST fallback.
+            # Without these, final-minute strategies can't be backtested and
+            # recorded model_prob can't be stratified by input quality.
+            "ALTER TABLE crypto15m_ticks ADD COLUMN settle_prints INTEGER",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN no_ask REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN spot_source TEXT",
+            # '' = directional (favorite/contrarian); 'pair' = complement-
+            # accumulation legs (no stop-loss/TP; hold to settlement).
+            "ALTER TABLE crypto15m_positions ADD COLUMN strategy TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(migration)
@@ -409,6 +442,9 @@ def init_db() -> None:
 
 
 def factory_reset(*, wipe_markets: bool = False) -> dict:
+    # The research tables are irreplaceable evidence — snapshot them before
+    # the wipe so "reset" is never "destroy the dataset".
+    backup_research()
     targets = [
         "bot_positions",
         "bot_runs",
@@ -755,7 +791,8 @@ def get_recent_whales_for_convergence(conn, hours: int = 2) -> dict:
     rows = conn.execute(
         """
         SELECT ticker, taker_side, dollar_value, confidence, price,
-               count_fp, title, category, created_at
+               count_fp, title, category, created_at,
+               id, event_ticker, market_volume
         FROM whale_trades WHERE created_at >= ?
         ORDER BY created_at DESC
         """,
@@ -773,6 +810,9 @@ def get_recent_whales_for_convergence(conn, hours: int = 2) -> dict:
                 "title": r[6],
                 "category": r[7],
                 "created_at": r[8],
+                "id": r[9],
+                "event_ticker": r[10],
+                "market_volume": r[11],
             }
         )
     return groups
@@ -1122,17 +1162,59 @@ def open_filled_cost_usd(conn, env: str) -> float:
     return float(row[0] or 0.0)
 
 
-def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
-    """Cost basis of currently-held 15m-crypto positions (its own table). Added
-    to the account total because those positions are excluded from the main
-    bot_positions reconcile import — without this the total would under-count by
-    the crypto cash that's already been spent."""
+def open_unrealized_pnl_usd(conn, env: str) -> float:
+    """Mark-to-market P&L of open FILLED positions with a live mark (written by
+    the 30s reconcile). Feeds the daily stop-loss so a day of positions bleeding
+    toward zero can trigger it BEFORE settlement — the balance-delta measure
+    alone values open positions at cost and sees nothing until cash moves."""
     row = conn.execute(
-        """SELECT COALESCE(SUM(cost_usd), 0) FROM crypto15m_positions
-           WHERE resolved=0 AND filled_contracts > 0 AND kalshi_env=?""",
+        """SELECT COALESCE(SUM(
+              filled_contracts * mark_price_cents / 100.0 - COALESCE(cost_usd, 0)
+           ), 0) FROM bot_positions
+           WHERE resolved=0 AND status='filled' AND kalshi_env=?
+             AND mark_price_cents IS NOT NULL AND filled_contracts > 0""",
         (env,),
     ).fetchone()
     return float(row[0] or 0.0)
+
+
+def _c15_matched_adjusted_cost(conn, env: str) -> float:
+    """Open 15m cost basis with MATCHED pairs excluded. Kalshi nets opposing
+    positions: the moment both sides of one market are held, the matched
+    contracts are redeemed for $1×matched CASH on the spot — the position is
+    flat and its basis is no longer held value. Counting it anyway double-
+    counts against the cash credit, inflating the account total while a pair
+    is open and then 'crashing' it at settlement when the rows resolve."""
+    rows = conn.execute(
+        """SELECT ticker, direction,
+                  SUM(filled_contracts) f, SUM(COALESCE(cost_usd, 0)) c
+           FROM crypto15m_positions
+           WHERE resolved=0 AND filled_contracts > 0 AND kalshi_env=?
+           GROUP BY ticker, direction""",
+        (env,),
+    ).fetchall()
+    by_ticker: dict[str, dict[str, tuple[int, float]]] = {}
+    for r in rows:
+        d = by_ticker.setdefault(r["ticker"], {})
+        d[r["direction"]] = (int(r["f"] or 0), float(r["c"] or 0.0))
+    total = 0.0
+    for sides in by_ticker.values():
+        fy, cy = sides.get("yes", (0, 0.0))
+        fn, cn = sides.get("no", (0, 0.0))
+        matched = min(fy, fn)
+        # Residual (unmatched) contracts stay valued at their average cost.
+        total += (cy * (fy - matched) / fy if fy else 0.0)
+        total += (cn * (fn - matched) / fn if fn else 0.0)
+    return total
+
+
+def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
+    """Held value of currently-open 15m-crypto positions (its own table),
+    matched-pair aware (see _c15_matched_adjusted_cost). Added to the account
+    total because those positions are excluded from the main bot_positions
+    reconcile import — without this the total would under-count by the crypto
+    cash that's already been spent."""
+    return _c15_matched_adjusted_cost(conn, env)
 
 
 def get_pending_bot_positions(conn) -> list[dict]:
@@ -1140,7 +1222,6 @@ def get_pending_bot_positions(conn) -> list[dict]:
         """SELECT * FROM bot_positions
            WHERE resolved=0
              AND signal_source != 'external'
-             AND kalshi_order_id IS NOT NULL
              AND (
                status IN ('submitted','partial')
                OR (status='filled' AND (cost_usd IS NULL OR cost_usd=0))
@@ -1194,8 +1275,8 @@ def insert_crypto15m_position(conn, row: dict) -> int:
               asset, series, ticker, side, direction, target_contracts,
               filled_contracts, entry_limit_cents, avg_entry_cents, cost_usd,
               client_order_id, kalshi_order_id, status, exit_reason, close_time,
-              confidence, entry_delta_usd, kalshi_env, dry_run, error
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              confidence, entry_delta_usd, kalshi_env, dry_run, error, strategy
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["asset"], row["series"], row["ticker"], row["side"],
             row["direction"], int(row["target_contracts"]),
@@ -1210,6 +1291,7 @@ def insert_crypto15m_position(conn, row: dict) -> int:
             row.get("kalshi_env", "demo"),
             1 if row.get("dry_run") else 0,
             row.get("error"),
+            row.get("strategy", "") or "",
         ),
     )
     return cur.lastrowid
@@ -1270,6 +1352,37 @@ def crypto15m_errored_tickers(conn, env: str) -> set:
         (env,),
     ).fetchall()
     return {r["ticker"] for r in rows}
+
+
+def crypto15m_stopped_tickers(conn, env: str) -> set:
+    """Tickers whose position exited via stop-loss — excluded from re-entry so
+    chop can't churn stop → re-enter → stop within one window (each ticker IS
+    one 15-minute window, so the exclusion expires naturally with it)."""
+    rows = conn.execute(
+        """SELECT DISTINCT ticker FROM crypto15m_positions
+           WHERE kalshi_env=? AND exit_reason='stop_loss' AND ticker IS NOT NULL""",
+        (env,),
+    ).fetchall()
+    return {r["ticker"] for r in rows}
+
+
+def open_crypto15m_committed_usd(conn, env: str) -> float:
+    """Capital committed to open 15m positions: matched-pair-adjusted cost of
+    filled contracts (matched pairs already redeemed to cash — see
+    _c15_matched_adjusted_cost) plus the committed notional of still-resting
+    entry remainders. Drives the aggregate 15m cap (crypto15m_max_total_pct);
+    without the adjustment, completed pairs kept 'using' budget they had
+    already returned."""
+    filled_cost = _c15_matched_adjusted_cost(conn, env)
+    row = conn.execute(
+        """SELECT COALESCE(SUM(
+              MAX(0, COALESCE(target_contracts, 0) - COALESCE(filled_contracts, 0))
+              * COALESCE(entry_limit_cents, 0) / 100.0
+           ), 0) FROM crypto15m_positions
+           WHERE resolved=0 AND status='submitted' AND kalshi_env=?""",
+        (env,),
+    ).fetchone()
+    return filled_cost + float(row[0] or 0.0)
 
 
 def recent_crypto15m(conn, env: str, limit: int = 50) -> list[dict]:
@@ -1334,8 +1447,8 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
               ticker, asset, series, close_time, mins_left, favorite,
               favorite_price, entry_cost, up_prob, delta_pct, open_spot,
               obs_spot, macd, macd_signal, macd_hist, macd_cross, rsi,
-              kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              strike, model_prob, edge_net_cents, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("series", ""),
             row.get("close_time", ""), row.get("mins_left"),
@@ -1344,6 +1457,7 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
             row.get("open_spot"), row.get("obs_spot"),
             row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
             row.get("macd_cross"), row.get("rsi"),
+            row.get("strike"), row.get("model_prob"), row.get("edge_net_cents"),
             row.get("kalshi_env", "demo"),
         ),
     )
@@ -1392,7 +1506,10 @@ def crypto15m_signal_counts(conn) -> dict:
     }
 
 
-_C15_TICKS_KEEP_DAYS = 14
+# 60, not 14: ticks+outcomes are the research dataset every strategy verdict
+# came from (sniper validated, pairs killed) — deleting them at 14 days
+# starves user backtests of sample.
+_C15_TICKS_KEEP_DAYS = 60
 
 
 def insert_crypto15m_tick(conn, row: dict) -> None:
@@ -1400,17 +1517,52 @@ def insert_crypto15m_tick(conn, row: dict) -> None:
         """INSERT INTO crypto15m_ticks (
               ticker, asset, mins_left, yes_bid, yes_ask, up_prob,
               spot, open_spot, delta_pct, macd, macd_signal, macd_hist,
-              macd_cross, rsi, kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              macd_cross, rsi, strike, delta_signed_pct, sigma1m,
+              model_prob, edge_net_cents, settle_prints, no_ask, spot_source,
+              kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("mins_left"),
             row.get("yes_bid"), row.get("yes_ask"), row.get("up_prob"),
             row.get("spot"), row.get("open_spot"), row.get("delta_pct"),
             row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
             row.get("macd_cross"), row.get("rsi"),
+            row.get("strike"), row.get("delta_signed_pct"), row.get("sigma1m"),
+            row.get("model_prob"), row.get("edge_net_cents"),
+            row.get("settle_prints"), row.get("no_ask"), row.get("spot_source"),
             row.get("kalshi_env", "demo"),
         ),
     )
+
+
+def crypto15m_strategy_stats(conn, env: str) -> list[dict]:
+    """Fee-true P&L per strategy (favorite/contrarian/model/model_fm/rules/
+    pair). Only real fills; the attribution column is stamped at entry."""
+    rows = conn.execute(
+        """SELECT COALESCE(NULLIF(strategy, ''), 'directional') strategy,
+                  COUNT(*) n,
+                  SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) wins,
+                  SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) losses,
+                  ROUND(SUM(pnl_usd), 4) pnl_usd,
+                  ROUND(SUM(COALESCE(fees_usd,0) + COALESCE(exit_fees_usd,0)), 4) fees_usd
+           FROM crypto15m_positions
+           WHERE kalshi_env=? AND resolved=1 AND filled_contracts>0
+             AND dry_run=0 AND pnl_usd IS NOT NULL
+           GROUP BY 1 ORDER BY SUM(pnl_usd) DESC""",
+        (env,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def recent_crypto15m_resolved(conn, env: str, limit: int = 200) -> list[dict]:
+    """Resolved 15m trades for the History page (newest first)."""
+    rows = conn.execute(
+        """SELECT * FROM crypto15m_positions
+           WHERE kalshi_env=? AND resolved=1 AND filled_contracts>0 AND dry_run=0
+           ORDER BY resolved_at DESC, id DESC LIMIT ?""",
+        (env, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def crypto15m_tick_count(conn) -> int:
@@ -1579,17 +1731,32 @@ def get_recent_runs(conn, env: str | None = None, limit: int = 50) -> list[dict]
     return [dict(r) for r in rows]
 
 
-def get_pnl_snapshots(conn, *, since_hours: int = 168, env: str | None = None) -> list[dict]:
-    sql = (
-        "SELECT * FROM pnl_snapshots WHERE (julianday('now')-julianday(at))*24 <= ?"
-    )
-    args: list = [int(since_hours)]
+def get_pnl_snapshots(
+    conn, *, since_hours: int = 168, env: str | None = None,
+    max_points: int = 2000,
+) -> list[dict]:
+    # Sargable predicate: the old per-row julianday() arithmetic could never
+    # use idx_pnl_at — a full table scan (hundreds of thousands of rows after
+    # weeks of 24/7 snapshots) on the event-loop thread, every 30s, for every
+    # dashboard pull.
+    since_hours = max(1, min(int(since_hours), 24 * 365))
+    sql = "SELECT * FROM pnl_snapshots WHERE at >= datetime('now', ?)"
+    args: list = [f"-{since_hours} hours"]
     if env:
         sql += " AND kalshi_env = ?"
         args.append(env)
     sql += " ORDER BY at ASC"
-    rows = conn.execute(sql, args).fetchall()
-    return [dict(r) for r in rows]
+    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+    # Downsample by stride to a renderable series — a 7-day window of 15s
+    # snapshots is ~40k points, i.e. ~5MB of JSON over stdio into a chart that
+    # can't show more than a few thousand anyway. Keep the newest point exact.
+    if max_points and len(rows) > max_points:
+        stride = -(-len(rows) // max_points)  # ceil
+        sampled = rows[::stride]
+        if sampled[-1] is not rows[-1]:
+            sampled.append(rows[-1])
+        rows = sampled
+    return rows
 
 
 def aggregate_stats(conn, env: str | None = None) -> dict:
@@ -1654,7 +1821,7 @@ def _delete_batched(
 
 def cleanup_old_data(
     conn=None, *, trade_hours: int = 48, alert_days: int = 45,
-    snapshot_hours: int = 6, pnl_days: int = 120,
+    snapshot_hours: int = 6, pnl_days: int = 45,
     event_days: int = 30, c15_signal_days: int = 60,
 ) -> int:
     now = datetime.now(timezone.utc)
@@ -1690,8 +1857,22 @@ def cleanup_old_data(
         deleted += c.execute(
             "DELETE FROM whale_trades WHERE resolved = 1 AND created_at < ?", (alert_cutoff,)
         ).rowcount or 0
+        # UNRESOLVED alerts/whales must age out too: the resolvers only look
+        # back 30 days, so a signal on a delisted/never-settling market stays
+        # resolved=0 FOREVER — permanent growth the resolved-only sweep missed.
+        deleted += c.execute(
+            "DELETE FROM alerts WHERE resolved = 0 AND created_at < ?", (alert_cutoff,)
+        ).rowcount or 0
+        deleted += c.execute(
+            "DELETE FROM whale_trades WHERE resolved = 0 AND created_at < ?", (alert_cutoff,)
+        ).rowcount or 0
         deleted += c.execute(
             "DELETE FROM pnl_snapshots WHERE at < ?", (pnl_cutoff,)
+        ).rowcount or 0
+        # events had NO pruning rule at all (sync_events upserts every 10 min
+        # forever); anything not touched in `event_days` is long closed.
+        deleted += c.execute(
+            "DELETE FROM events WHERE last_updated < ?", (event_cutoff,)
         ).rowcount or 0
     return deleted
 
@@ -1716,11 +1897,48 @@ def vacuum() -> None:
         conn.close()
 
 
+def backup_research(keep: int = 7) -> str | None:
+    """Nightly copy of the whole DB into data/backups (rotated). The research
+    tables (ticks/signals/positions) are the irreplaceable evidence every
+    strategy verdict came from — before this there was NO backup anywhere and
+    factory_reset wiped them permanently. sqlite3's online backup API is safe
+    against concurrent writers."""
+    try:
+        src = str(db_path())
+        bdir = os.path.join(os.path.dirname(src), "backups")
+        os.makedirs(bdir, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%d")
+        dest = os.path.join(bdir, f"research-{stamp}.db")
+        if os.path.exists(dest):
+            return dest  # already taken today
+        with get_db() as conn:
+            out = sqlite3.connect(dest)
+            try:
+                conn.backup(out)
+            finally:
+                out.close()
+        # rotate: keep the newest `keep`
+        snaps = sorted(
+            f for f in os.listdir(bdir)
+            if f.startswith("research-") and f.endswith(".db")
+        )
+        for old_f in snaps[:-keep]:
+            try:
+                os.remove(os.path.join(bdir, old_f))
+            except OSError:
+                pass
+        return dest
+    except Exception:
+        return None
+
+
 def run_maintenance(*, vacuum_min_free_mb: float = 50.0, force_vacuum: bool = False) -> dict:
     deleted = cleanup_old_data()
+    backed_up = backup_research()
     free_mb = _reclaimable_mb()
     vacuumed = False
     if force_vacuum or free_mb >= vacuum_min_free_mb:
         vacuum()
         vacuumed = True
-    return {"deleted": deleted, "reclaimable_mb": round(free_mb, 1), "vacuumed": vacuumed}
+    return {"deleted": deleted, "reclaimable_mb": round(free_mb, 1), "vacuumed": vacuumed,
+            "backup": backed_up}

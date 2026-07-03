@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os as _os
+
+# Stamped into leaderboard/stats payloads so krypt.cc can key results by build.
+APP_VERSION = _os.environ.get("KRYPT_APP_VERSION", "")
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -342,6 +347,9 @@ async def send_stats(url: str, snap: dict, env: str) -> None:
         return
     payload = {
         "username": "Krypt Trader · Stats",
+        # Machine-readable version for the krypt.cc leaderboard — lets it key
+        # results by build and nudge users off releases with known bugs.
+        "appVersion": APP_VERSION,
         "embeds": [stats_embed(snap, env)],
     }
     await _post(url, payload)

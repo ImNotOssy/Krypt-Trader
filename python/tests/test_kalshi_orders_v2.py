@@ -34,7 +34,7 @@ def test_v2_fields_no_sell_mirrors_to_yes_bid():
 def test_place_limit_order_posts_v2_events_path(monkeypatch):
     captured: dict = {}
 
-    async def fake_signed(method, path, *, json=None, params=None):
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
         captured.update(method=method, path=path, json=json)
         return {"order_id": "ord_1", "fill_count": "0", "remaining_count": "5"}
 
@@ -62,7 +62,7 @@ def test_place_limit_order_posts_v2_events_path(monkeypatch):
 def test_place_limit_order_yes_buy_body(monkeypatch):
     captured: dict = {}
 
-    async def fake_signed(method, path, *, json=None, params=None):
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
         captured.update(json=json)
         return {"order_id": "ord_2"}
 
@@ -81,7 +81,7 @@ def test_place_limit_order_yes_buy_body(monkeypatch):
 def test_cancel_order_uses_v2_events_path(monkeypatch):
     captured: dict = {}
 
-    async def fake_signed(method, path, *, json=None, params=None):
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
         captured.update(method=method, path=path)
         return {"order_id": "ord_1", "reduced_by": "5"}
 

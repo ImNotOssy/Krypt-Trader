@@ -78,3 +78,72 @@ def test_run_maintenance_compacts_when_forced(fresh_db):
     assert summary["deleted"] >= 1000
     with db.get_db() as c:
         assert c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+
+
+# ───────── Tier 4: unresolved-signal + events pruning, pnl series ───────────
+
+
+def test_unresolved_alerts_and_whales_age_out(fresh_db):
+    with db.get_db() as conn:
+        conn.execute(
+            """INSERT INTO alerts (ticker, title, signal_type, direction, price,
+                                   confidence, resolved, created_at)
+               VALUES ('OLD-A', 't', 'trade_cluster', 'yes', 0.4, 60, 0,
+                       datetime('now', '-60 days'))"""
+        )
+        conn.execute(
+            """INSERT INTO whale_trades (trade_id, ticker, title, taker_side,
+                                         count_fp, price, dollar_value, confidence,
+                                         resolved, created_at)
+               VALUES ('OLD-W', 'OLD-W-T', 't', 'yes', 100, 0.5, 5000, 70, 0,
+                       datetime('now', '-60 days'))"""
+        )
+        # Fresh unresolved rows must survive.
+        conn.execute(
+            """INSERT INTO alerts (ticker, title, signal_type, direction, price,
+                                   confidence, resolved)
+               VALUES ('NEW-A', 't', 'trade_cluster', 'yes', 0.4, 60, 0)"""
+        )
+
+    db.cleanup_old_data()
+
+    with db.get_db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM alerts WHERE ticker='OLD-A'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM whale_trades WHERE trade_id='OLD-W'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM alerts WHERE ticker='NEW-A'").fetchone()[0] == 1
+
+
+def test_events_table_is_pruned(fresh_db):
+    with db.get_db() as conn:
+        conn.execute(
+            """INSERT INTO events (event_ticker, title, last_updated)
+               VALUES ('OLD-EV', 'old', datetime('now', '-45 days'))"""
+        )
+        conn.execute(
+            """INSERT INTO events (event_ticker, title, last_updated)
+               VALUES ('NEW-EV', 'new', datetime('now'))"""
+        )
+    db.cleanup_old_data()
+    with db.get_db() as conn:
+        rows = {r[0] for r in conn.execute("SELECT event_ticker FROM events").fetchall()}
+    assert rows == {"NEW-EV"}
+
+
+def test_pnl_snapshots_query_downsamples(fresh_db):
+    with db.get_db() as conn:
+        for i in range(500):
+            conn.execute(
+                """INSERT INTO pnl_snapshots (at, kalshi_env, cash_usd,
+                                              portfolio_usd, total_usd)
+                   VALUES (datetime('now', ?), 'demo', 100, 0, ?)""",
+                (f"-{500 - i} minutes", 100.0 + i),
+            )
+    with db.get_db() as conn:
+        rows = db.get_pnl_snapshots(conn, since_hours=24, env="demo", max_points=100)
+    assert 0 < len(rows) <= 101
+    # Newest point is always kept exact (the chart's live tip).
+    assert rows[-1]["total_usd"] == pytest.approx(599.0)
+    # Old rows outside the window are excluded via the indexable predicate.
+    with db.get_db() as conn:
+        rows_1h = db.get_pnl_snapshots(conn, since_hours=1, env="demo", max_points=0)
+    assert 55 <= len(rows_1h) <= 62  # ~one per minute for the last hour

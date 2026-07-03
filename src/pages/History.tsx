@@ -1,20 +1,28 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { History as HistoryIcon, Play, Receipt, Square, Trash2, Trophy } from 'lucide-react';
-import type { BotRun } from '@shared/types';
+import type { BotRun, Crypto15mPosition } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Card, ConfirmDialog, Empty, Page, ShareableStat, StatCard } from '../components/common';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtPct, fmtUsd, fmtDateTime } from '../utils/format';
 
-type HistoryTab = 'runs' | 'trades';
+type HistoryTab = 'runs' | 'trades' | 'crypto15m';
 
 export function HistoryPage() {
   const { positions, account, config } = useApp();
   const toast = useToast();
   const [tab, setTab] = useState<HistoryTab>('runs');
   const [runs, setRuns] = useState<BotRun[]>([]);
+  const [c15Rows, setC15Rows] = useState<Crypto15mPosition[]>([]);
+
+  useEffect(() => {
+    if (tab !== 'crypto15m') return;
+    void window.krypt.crypto15m.history({ limit: 300 })
+      .then((r) => setC15Rows(r?.rows ?? []))
+      .catch(() => setC15Rows([]));
+  }, [tab]);
   const [showWipe, setShowWipe] = useState(false);
   const [wiping, setWiping] = useState(false);
 
@@ -99,10 +107,14 @@ export function HistoryPage() {
           Trade history
           <span className="ml-1.5 rounded bg-krypt-surface px-1.5 py-0.5 text-[10px]">{resolved.length}</span>
         </TabButton>
+        <TabButton active={tab === 'crypto15m'} onClick={() => setTab('crypto15m')} icon={<Receipt className="h-3.5 w-3.5" />}>
+          15m trades
+        </TabButton>
       </div>
 
       {tab === 'runs' && <RunHistory runs={runs} env={config?.kalshiEnv} />}
       {tab === 'trades' && <TradeHistory resolved={resolved} account={account} />}
+      {tab === 'crypto15m' && <Crypto15mHistory rows={c15Rows} />}
 
       <ConfirmDialog
         open={showWipe}
@@ -586,5 +598,55 @@ function EnvStat({ env, v }: { env: string; v?: { wins: number; losses: number; 
         {v?.wins ?? 0}W / {v?.losses ?? 0}L · {wr.toFixed(1)}%
       </div>
     </div>
+  );
+}
+
+
+function Crypto15mHistory({ rows }: { rows: Crypto15mPosition[] }) {
+  const total = rows.reduce((a, r) => a + (r.pnlUsd ?? 0), 0);
+  const wins = rows.filter((r) => (r.pnlUsd ?? 0) > 0).length;
+  if (rows.length === 0) {
+    return <Empty title="No resolved 15m trades yet" description="Settled 15-minute crypto trades appear here — P&L shown net of fees." />;
+  }
+  return (
+    <Card>
+      <div className="mb-3 flex flex-wrap gap-4 text-xs text-krypt-dim">
+        <span>{rows.length} trades</span>
+        <span>{wins}W / {rows.length - wins}L</span>
+        <span>Net P&L <span className={cls('font-mono', total >= 0 ? 'text-krypt-win' : 'text-krypt-loss')}>{fmtUsd(total, { sign: true })}</span></span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-krypt-dim">
+              <th className="py-1 pr-3 font-normal">When</th>
+              <th className="py-1 pr-3 font-normal">Asset</th>
+              <th className="py-1 pr-3 font-normal">Side</th>
+              <th className="py-1 pr-3 font-normal">Strategy</th>
+              <th className="py-1 pr-3 font-normal">Size</th>
+              <th className="py-1 pr-3 font-normal">Entry</th>
+              <th className="py-1 pr-3 font-normal">Exit</th>
+              <th className="py-1 font-normal">P&L (net)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id} className="border-t border-krypt-border/50">
+                <td className="py-1.5 pr-3 text-krypt-dim">{fmtDateTime(r.resolvedAt ?? r.createdAt)}</td>
+                <td className="py-1.5 pr-3 font-mono text-white">{r.asset}</td>
+                <td className="py-1.5 pr-3 text-krypt-dim">{r.side}</td>
+                <td className="py-1.5 pr-3 text-krypt-dim">{r.strategy || 'directional'}</td>
+                <td className="py-1.5 pr-3 font-mono text-krypt-dim">{r.filledContracts}</td>
+                <td className="py-1.5 pr-3 font-mono text-krypt-dim">{r.avgEntryCents != null ? `${Math.round(r.avgEntryCents)}¢` : '—'}</td>
+                <td className="py-1.5 pr-3 text-krypt-dim">{r.exitReason || r.status}</td>
+                <td className={cls('py-1.5 font-mono', (r.pnlUsd ?? 0) >= 0 ? 'text-krypt-win' : 'text-krypt-loss')}>
+                  {fmtUsd(r.pnlUsd ?? 0, { sign: true })}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
   );
 }

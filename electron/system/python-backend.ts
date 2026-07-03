@@ -17,6 +17,13 @@ type LogCallback = (entry: LogEntry) => void;
 
 const STABLE_UPTIME_MS = 30_000;
 const MAX_RAPID_RESTARTS = 5;
+// Hang watchdog: ping the backend on this cadence; after this many consecutive
+// ping timeouts, force-kill + restart. Catches a WEDGED-but-alive backend
+// (event loop blocked, deadlock) that the exit handler can never see — the
+// status stayed 'running' forever while all trading was dead.
+const PING_INTERVAL_MS = 60_000;
+const PING_TIMEOUT_MS = 15_000;
+const PING_FAILS_TO_RESTART = 3;
 
 class PythonBackend {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -28,6 +35,9 @@ class PythonBackend {
   private authOk = false;
   private pythonOk = false;
   private restartTimer: NodeJS.Timeout | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
+  private pingFails = 0;
+  private pingInFlight = false;
   private restartAttempts = 0;
   private childStartedAtMs = 0;
   private gaveUp = false;
@@ -54,6 +64,7 @@ class PythonBackend {
 
   async stop(): Promise<void> {
     this.requestedStop = true;
+    this.stopPingWatchdog();
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -257,6 +268,7 @@ class PythonBackend {
         env: {
           ...process.env,
           KRYPT_TRADER_USERDATA: userData,
+          KRYPT_APP_VERSION: app.getVersion(),
           PYTHONUNBUFFERED: '1',
           PYTHONIOENCODING: 'utf-8',
         },
@@ -295,6 +307,7 @@ class PythonBackend {
       // spawn — that left two live Python backends both placing real orders.
       if (this.child !== child) return;
       this.child = null;
+      this.stopPingWatchdog();
       this.rejectPending('backend exited');
       if (this.requestedStop) {
         this.setStatus('stopped');
@@ -306,6 +319,55 @@ class PythonBackend {
       this.scheduleRestart(uptime < STABLE_UPTIME_MS);
     });
 
+    this.startPingWatchdog(child);
+  }
+
+  private stopPingWatchdog(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    this.pingFails = 0;
+    this.pingInFlight = false;
+  }
+
+  private startPingWatchdog(child: ChildProcessWithoutNullStreams): void {
+    this.stopPingWatchdog();
+    this.pingTimer = setInterval(() => {
+      // Only watch the child we were started for; a restart re-arms its own.
+      if (this.child !== child || this.status !== 'running' || this.requestedStop) return;
+      if (this.pingInFlight) return; // previous ping still deciding
+      this.pingInFlight = true;
+      this.request('ping', {}, PING_TIMEOUT_MS)
+        .then(() => {
+          this.pingFails = 0;
+        })
+        .catch(() => {
+          if (this.child !== child || this.requestedStop) return;
+          this.pingFails++;
+          if (this.pingFails >= PING_FAILS_TO_RESTART) {
+            // Wedged-but-alive: the process exists but its event loop is not
+            // answering. Force-kill; the exit handler owns the restart path
+            // (identity-guarded, so this can never double-spawn).
+            this.lastError = `backend unresponsive (${this.pingFails} pings timed out) — force-restarting`;
+            const entry: LogEntry = {
+              ts: new Date().toISOString(),
+              level: 'ERROR',
+              source: 'backend',
+              msg: this.lastError,
+            };
+            for (const h of this.logHandlers) h(entry);
+            this.stopPingWatchdog();
+            try {
+              child.kill('SIGKILL');
+            } catch {
+            }
+          }
+        })
+        .finally(() => {
+          this.pingInFlight = false;
+        });
+    }, PING_INTERVAL_MS);
   }
 
   private scheduleRestart(quickCrash: boolean): void {

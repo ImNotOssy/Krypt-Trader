@@ -22,7 +22,11 @@ def test_size_above_max_edge_capped_by_hard_max(cfg):
 
 
 def test_size_interpolates_between_edges(cfg):
-    assert trader._compute_position_usd(1000.0, 12.5, cfg) == pytest.approx(40.0)
+    # sizing_max_edge default is 10 (the scorer's edge ceiling): edge 7.5 is the
+    # midpoint of [5, 10] -> midpoint of [2%, 6%] = 4% of $1000.
+    assert trader._compute_position_usd(1000.0, 7.5, cfg) == pytest.approx(40.0)
+    # At/above the ceiling the max fraction applies (6% = $60, capped at $50).
+    assert trader._compute_position_usd(1000.0, 12.5, cfg) == pytest.approx(50.0)
 
 
 def test_fixed_sizing_returns_flat_amount_ignoring_balance_and_edge(cfg):
@@ -102,7 +106,9 @@ def test_should_trade_resolution_days_gate(cfg):
     base = {"ticker": "X", "price": 0.60, "confidence": 70.0,
             "taker_side": "yes", "category": "sports"}
 
-    # Default (0) = off: a far-out market still passes.
+    # 0 = off: a far-out market still passes. (The DEFAULT is now 30 —
+    # long-dated markets silently freezing all 25 slots was a footgun.)
+    cfg["max_resolution_days"] = 0
     assert trader.should_trade({**base, "close_time": _iso_in_days(120)}, "whale", cfg)[0] is True
 
     cfg["max_resolution_days"] = 30
@@ -169,7 +175,7 @@ def test_balance_fetch_not_poisoned_by_concurrent_cred_test(monkeypatch):
     import asyncio
     import kalshi_auth
 
-    async def _bal():
+    async def _bal(*a, **k):
         return {"balance": 9999 if kalshi_auth.get_env() == "production" else 11,
                 "portfolio_value": 0}
     monkeypatch.setattr(trader, "get_balance", _bal)
@@ -347,3 +353,47 @@ def test_yes_payout_legacy_cents_field():
 
 def test_yes_payout_none_market_is_none():
     assert trader._market_yes_payout(None) is None
+
+
+# ───────── fee-aware edge gate + liquidity floor (Tier 2) ────────────────────
+
+
+def test_taker_fee_cents_shape():
+    assert trader._taker_fee_cents(50) == pytest.approx(1.75)   # max fee at 50c
+    assert trader._taker_fee_cents(85) == pytest.approx(0.8925)
+    assert trader._taker_fee_cents(95) < trader._taker_fee_cents(50)
+
+
+def test_fee_aware_edge_gate_subtracts_taker_fee(cfg):
+    # 50c whale with 9pts of gross edge: the ~1.75c taker fee nets it to ~7.25,
+    # which must fail an 8pt gate. Legacy (gross) gating still passes it.
+    sig = {"ticker": "X", "price": 0.50, "confidence": 59.0, "taker_side": "yes"}
+    cfg["min_edge_pts_whale"] = 8.0
+    ok, reason = trader.should_trade(sig, "whale", cfg)
+    assert ok is False and "net edge" in reason
+    cfg["fee_aware_edge"] = False
+    assert trader.should_trade(sig, "whale", cfg)[0] is True
+
+
+def test_min_market_volume_floor_fails_open_on_unknown(cfg):
+    base = {"ticker": "X", "price": 0.60, "confidence": 75.0, "taker_side": "yes"}
+    cfg["min_market_volume"] = 100.0
+    ok, reason = trader.should_trade({**base, "market_volume": 40}, "whale", cfg)
+    assert ok is False and "volume" in reason
+    assert trader.should_trade({**base, "market_volume": 5000}, "whale", cfg)[0] is True
+    # Unknown volume (missing or 0) must fail OPEN, not block everything.
+    assert trader.should_trade(base, "whale", cfg)[0] is True
+    assert trader.should_trade({**base, "market_volume": 0}, "whale", cfg)[0] is True
+
+
+def test_should_trade_convergence_gates_on_edge_too(cfg):
+    # The convergence branch used to check confidence ONLY — the preset's
+    # min_edge_pts_whale was silently ignored for its own source.
+    cfg["trade_convergence"] = True
+    cfg["min_confidence_whale"] = 55.0
+    cfg["min_edge_pts_whale"] = 4.0
+    weak = {"ticker": "X", "price": 0.60, "confidence": 64.0, "direction": "yes"}
+    ok, reason = trader.should_trade(weak, "convergence", cfg)
+    assert ok is False and "net edge" in reason        # gross 4 − 1.68 fee < 4
+    strong = {**weak, "confidence": 66.0}              # gross 6 − 1.68 ≥ 4
+    assert trader.should_trade(strong, "convergence", cfg)[0] is True

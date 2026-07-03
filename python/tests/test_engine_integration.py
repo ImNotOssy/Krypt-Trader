@@ -477,7 +477,7 @@ def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_demo, cfg, monkeypa
 def test_refresh_balance_is_per_env(monkeypatch):
     trader._balance_cache.clear()
 
-    async def fake_balance():
+    async def fake_balance(*a, **k):
         if trader.get_env() == "demo":
             return {"balance": 1000, "portfolio_value": 100}
         return {"balance": 5000, "portfolio_value": 500}

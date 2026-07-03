@@ -517,6 +517,36 @@ export function registerIpc(): void {
     }
     return await pythonBackend.request('crypto15mStatus', {});
   });
+  ipcMain.handle('crypto15m:backtest', async (_e, args?: { sinceDays?: number }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('c15Backtest', args || {});
+  });
+  ipcMain.handle('main:backtest', async (_e, args?: { sinceDays?: number; config?: Record<string, unknown> }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('mainBacktest', args || {});
+  });
+  ipcMain.handle('crypto15m:history', async (_e, args?: { limit?: number }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('c15History', args || {});
+  });
+  ipcMain.handle('backtest:export', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    const r = await pythonBackend.request('exportResearch', {}) as { dir?: string } | null;
+    if (r?.dir) shell.showItemInFolder(r.dir);
+    return r;
+  });
+  ipcMain.handle('backtest:collection', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('collectionStats', {});
+  });
+  ipcMain.handle('trading:status', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    try {
+      return await pythonBackend.request('tradingStatus', {});
+    } catch {
+      return null;
+    }
+  });
   ipcMain.handle(
     'kalshi:marketUrl',
     async (_e, args?: { eventTicker?: string; ticker?: string; env?: string }) => {

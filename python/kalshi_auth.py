@@ -205,6 +205,16 @@ _SERVER_BASES = {
 _cached_api_key: Optional[str] = None
 _cached_private_key: Optional[rsa.RSAPrivateKey] = None
 _server_offset_ms: int = 0
+
+
+def server_now() -> float:
+    """Kalshi-server epoch seconds: local clock corrected by the measured
+    signing offset. Every money-relevant time comparison (seconds-to-close
+    guards, entry windows, settlement-print attribution) must use THIS, not
+    time.time() — a consumer Windows box 20-30s slow turns "12s to close"
+    into 2s and recreates the T-2s entry bug straight through its fix."""
+    import time as _time
+    return _time.time() + _server_offset_ms / 1000.0
 _last_sync: float = 0.0
 _RESYNC_INTERVAL_SEC = 300
 # Guards the background clock-resync so the interval-triggered HEAD never runs on

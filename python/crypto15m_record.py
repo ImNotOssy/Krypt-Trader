@@ -62,6 +62,15 @@ def _capture_ticks(snap: dict, env: str) -> int:
                 "macd_hist": a.get("macdHist"),
                 "macd_cross": a.get("macdCross"),
                 "rsi": a.get("rsi"),
+                "strike": a.get("strikeUsd"),
+                "delta_signed_pct": a.get("deltaSignedPct"),
+                "sigma1m": a.get("sigma1m"),
+                "model_prob": a.get("modelProb"),
+                "edge_net_cents": a.get("edgeNetCents"),
+                "settle_prints": a.get("settlePrints"),
+                "no_ask": a.get("downAsk"),
+                # snapshot-level: one spot chain per fetch, not per asset
+                "spot_source": snap.get("spotSource"),
                 "kalshi_env": env,
             })
             captured += 1
@@ -95,6 +104,9 @@ def _capture(snap: dict, env: str) -> int:
             "macd_hist": a.get("macdHist"),
             "macd_cross": a.get("macdCross"),
             "rsi": a.get("rsi"),
+            "strike": a.get("strikeUsd"),
+            "model_prob": a.get("modelProb"),
+            "edge_net_cents": a.get("edgeNetCents"),
             "kalshi_env": env,
         }
         with db.get_db() as conn:

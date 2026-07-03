@@ -239,6 +239,28 @@ export function SettingsPage() {
               <NumberInput value={config.maxSignalAgeSec} step={10} suffix="s"
                 onChange={(v) => void update('maxSignalAgeSec', v)} />
             </Field>
+            <Field label="Max tape-trade age"
+              hint="Only trades younger than this feed whale signals and momentum clusters — stops restarts from chasing hours-old whales.">
+              <NumberInput value={config.maxTradeAgeMin ?? 15} step={5} min={1} suffix="min"
+                onChange={(v) => void update('maxTradeAgeMin', v)} />
+            </Field>
+            <Field label="Max entry slippage"
+              hint="Skip the entry when the live book is priced more than this past the signal price (thin/fast books silently eat the edge). 0 = off.">
+              <NumberInput value={config.maxEntrySlippageCents ?? 5} step={1} min={0} max={99} suffix="¢"
+                onChange={(v) => void update('maxEntrySlippageCents', v)} />
+            </Field>
+            <Field label="Min market volume"
+              hint="Skip signals on markets that have traded fewer than this many contracts (thin books = wide spreads). 0 = off.">
+              <NumberInput value={config.minMarketVolume ?? 0} step={50} min={0} suffix="ct"
+                onChange={(v) => void update('minMarketVolume', v)} />
+            </Field>
+            <Field label="Fee-aware edge">
+              <Switch
+                checked={config.feeAwareEdge ?? true}
+                label="Subtract the Kalshi taker fee from edge before the min-edge gates (edge means NET edge)"
+                onChange={(v) => void update('feeAwareEdge', v)}
+              />
+            </Field>
             <Field label="Max resolution time"
               hint="Skip markets that won't resolve for longer than this (e.g. long-dated politics bets that tie up capital for months). 0 = no limit.">
               <NumberInput value={config.maxResolutionDays ?? 0} step={1} min={0} suffix="days"
@@ -404,9 +426,15 @@ export function SettingsPage() {
                 />
               </div>
             </Field>
-            <Field label="Daily stop-loss" hint="Halts new entries if today's P&L falls below">
+            <Field label="Daily stop-loss ($)"
+              hint="Halts new entries if today's P&L (incl. open-position mark-to-market) falls below. 0 = off.">
               <NumberInput value={config.stopLossOnDay} step={5} prefix="$"
                 onChange={(v) => void update('stopLossOnDay', v)} />
+            </Field>
+            <Field label="Daily stop-loss (%)"
+              hint="Same stop as a % of the day-start account total — the tighter of the two limits binds. 0 = off.">
+              <PercentInput value={config.stopLossOnDayPct ?? 0} step={1} min={0} max={100}
+                onChange={(v) => void update('stopLossOnDayPct', v)} />
             </Field>
             <Field label="Daily take-profit" hint="Halts new entries when reached. 0 = disabled">
               <NumberInput value={config.takeProfitOnDay} step={5} prefix="$"
@@ -472,7 +500,7 @@ export function SettingsPage() {
 
       <Section
         title="Loop cadence"
-        description="How often each subsystem runs. Lower = more API calls; higher = laggier."
+        description="With the WebSocket feed connected (the normal state), the hot paths are PUSHED in real time — whale prints wake the scanner instantly, fills wake the order poll, settlements wake resolution, and 15m prices stream live. These intervals are then safety-net fallbacks, plus the true cadence for what has no WebSocket channel: balance, the market catalog sweep, and order-status truth. Lower = more API calls; higher = laggier when the socket is down."
       >
         <Card>
           <div className="grid gap-4 md:grid-cols-3">
@@ -517,10 +545,6 @@ export function SettingsPage() {
             <Field label="Min whale $">
               <NumberInput value={config.minWhaleUsd} step={500} prefix="$"
                 onChange={(v) => void update('minWhaleUsd', v)} />
-            </Field>
-            <Field label="Min whale confidence">
-              <NumberInput value={config.minWhaleConfidence} step={1} suffix="%"
-                onChange={(v) => void update('minWhaleConfidence', v)} />
             </Field>
             <Field label="Min entry price (whale)">
               <NumberInput value={config.minEntryPriceFrac} step={0.05} min={0} max={1}

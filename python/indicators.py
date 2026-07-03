@@ -128,6 +128,31 @@ def rsi(closes: list[float], period: int = RSI_PERIOD) -> Optional[float]:
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
 
+SIGMA_WINDOW = 30
+
+
+def sigma1m(closes: list[float], window: int = SIGMA_WINDOW) -> Optional[float]:
+    """Realized 1-minute volatility: sample std-dev of the last `window`
+    one-minute simple returns, as a FRACTION per √minute. This is the σ the
+    spot-vs-strike settlement model scales by √(minutes left) to judge how
+    far the current spot really is from the strike. None until there are
+    `window + 1` closes or when the series is degenerate."""
+    vals = _floats(closes)
+    if len(vals) < window + 1:
+        return None
+    rets = []
+    for i in range(len(vals) - window, len(vals)):
+        prev = vals[i - 1]
+        if prev <= 0:
+            return None
+        rets.append((vals[i] - prev) / prev)
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    if var < 0:
+        return None
+    return var ** 0.5
+
+
 def compute(closes) -> dict:
     """Convenience bundle for the snapshot: every indicator field at once,
     each None when there isn't enough history. Keys mirror the snapshot /
@@ -140,4 +165,5 @@ def compute(closes) -> dict:
         "macdHist": m["hist"] if m else None,
         "macdCross": m["cross"] if m else None,
         "rsi": rsi(vals),
+        "sigma1m": sigma1m(vals),
     }
