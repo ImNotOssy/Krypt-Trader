@@ -161,9 +161,11 @@ export function Crypto15mPage() {
         </div>
         {enabled && status?.modelCalibration && !status.modelCalibration.ok && (
           <div className="mt-2 text-[11px] text-krypt-loss">
-            ⛔ Model calibration degraded — recent high-confidence predictions hit only{' '}
-            {Math.round((status.modelCalibration.rate ?? 0) * 100)}% over the last {status.modelCalibration.n} windows.
-            Sniper entries are auto-paused and resume when calibration recovers.
+            ⛔ Model calibration degraded — high-confidence predictions hit{' '}
+            {Math.round((status.modelCalibration.rate ?? 0) * 100)}% over the last {status.modelCalibration.n} windows,
+            and the statistical floor on that record ({Math.round((status.modelCalibration.lb ?? 0) * 100)}%)
+            is below the bar the sniper needs to stay armed. Entries are auto-paused and resume as
+            newer windows restore calibration.
           </div>
         )}
         {enabled && (status?.byStrategy?.length ?? 0) > 0 && (

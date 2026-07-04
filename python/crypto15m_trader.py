@@ -36,8 +36,18 @@ _CAL_CACHE: dict = {"at": 0.0, "ok": True, "n": 0, "rate": None, "lb": None}
 _CAL_CHECK_SEC = 300.0
 _CAL_WINDOW = 40          # rolling windows considered
 _CAL_MIN_N = 20           # below this, not enough evidence to pause
-_CAL_PAUSE_LB = 0.955     # ~break-even hit rate at ~93c entries + fee
-_CAL_RESUME_LB = 0.965    # hysteresis so it doesn't flap
+# Bounds are on the WILSON LOWER BOUND, which sits well under the observed
+# rate at these sample sizes: a PERFECT record's LB is n/(n+z²) — 0.886 at
+# 21/21 and only 0.937 at 40/40 (the rolling-window ceiling). The old bars
+# (pause 0.955 / resume 0.965) were ABOVE that ceiling, so the sniper
+# auto-paused forever once n reached 20 even at a 100% hit rate (observed
+# live 2026-07-03: "hit only 100% over the last 21 windows"). Correct
+# framing: break-even at ~93c entries + fee is ~94% observed; 0.85 LB ≈
+# observed ~95% at n=40, so a record at/under ~90% observed (a real
+# money-loser) pauses while a healthy 97%+ record clears with room.
+# Resume needs LB 0.90 ≈ observed ~99%+ at n=40 (hysteresis).
+_CAL_PAUSE_LB = 0.85
+_CAL_RESUME_LB = 0.90
 
 
 def _wilson_lb(wins: int, n: int, z: float = 1.645) -> float:

@@ -1893,3 +1893,19 @@ def test_wilson_lower_bound_sanity():
     assert ct._wilson_lb(0, 0) == 0.0
     # more evidence tightens the bound upward at the same rate
     assert ct._wilson_lb(97, 100) > ct._wilson_lb(29, 30)
+
+
+def test_perfect_record_never_pauses_and_can_resume():
+    # Regression (live 2026-07-03): the old bars (pause LB 0.955 / resume
+    # 0.965) sat ABOVE the ceiling a PERFECT record can reach inside the
+    # 40-window cap — a flawless model's LB is n/(n+z²): 0.886 at 21/21,
+    # 0.937 at 40/40 — so the sniper paused FOREVER at a 100% hit rate
+    # ("hit only 100% over the last 21 windows"). A perfect record must
+    # clear the pause bar at every reachable n, and clear the RESUME bar
+    # by the time the rolling window fills.
+    for n in range(ct._CAL_MIN_N, ct._CAL_WINDOW + 1):
+        assert ct._wilson_lb(n, n) >= ct._CAL_PAUSE_LB, f"perfect {n}/{n} would pause"
+    assert ct._wilson_lb(ct._CAL_WINDOW, ct._CAL_WINDOW) >= ct._CAL_RESUME_LB
+    # …while a genuinely degraded record (90% observed at n=40, a real
+    # money-loser at 93c entries) still pauses.
+    assert ct._wilson_lb(36, 40) < ct._CAL_PAUSE_LB
