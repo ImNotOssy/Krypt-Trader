@@ -359,17 +359,20 @@ def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
 # settlement. A genuine drawdown keeps breaching and gates ~3 minutes
 # later; a money-in-flight dip self-heals first.
 _DAY_RISK_PERSIST_SEC = 180.0
-_day_risk_breach: dict = {"sl": None, "tp": None}  # kind -> monotonic first-breach
+# (env, kind) -> monotonic first-breach. Keyed by env so a demo<->production
+# switch can't transfer or destroy a live breach streak.
+_day_risk_breach: dict = {}
 
 
-def _breach_persists(kind: str, breached: bool) -> bool:
+def _breach_persists(env: str, kind: str, breached: bool) -> bool:
     now = time.monotonic()
+    key = (env, kind)
     if not breached:
-        _day_risk_breach[kind] = None
+        _day_risk_breach[key] = None
         return False
-    if _day_risk_breach[kind] is None:
-        _day_risk_breach[kind] = now
-    return (now - _day_risk_breach[kind]) >= _DAY_RISK_PERSIST_SEC
+    if _day_risk_breach.get(key) is None:
+        _day_risk_breach[key] = now
+    return (now - _day_risk_breach[key]) >= _DAY_RISK_PERSIST_SEC
 
 
 def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
@@ -408,9 +411,9 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
             if day_start > 0:
                 sl_limits.append(-sl_pct * day_start)
     limit = max(sl_limits) if sl_limits else None  # closest to zero = tighter
-    sl_hit = _breach_persists("sl", limit is not None and pnl_mtm <= limit)
+    sl_hit = _breach_persists(env, "sl", limit is not None and pnl_mtm <= limit)
     tp = float(cfg.get("take_profit_on_day", 0))
-    tp_hit = _breach_persists("tp", tp > 0 and pnl >= tp)
+    tp_hit = _breach_persists(env, "tp", tp > 0 and pnl >= tp)
     if sl_hit:
         return True, (
             f"daily stop-loss hit (today pnl=${pnl:+.2f}, "

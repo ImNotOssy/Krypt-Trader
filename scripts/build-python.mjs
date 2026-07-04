@@ -37,6 +37,14 @@ run(VENV_PY, [
   '--hidden-import', 'crypto15m_trader',
   '--hidden-import', 'crypto15m_record',
   '--hidden-import', 'backtest',
+  // Currently caught by static analysis, but pinned explicitly so a future
+  // lazy-import refactor can't silently drop them from the frozen bundle
+  // (replay is ALREADY lazy-imported inside the backtest RPC handlers).
+  '--hidden-import', 'spot_ws',
+  '--hidden-import', 'cf_ws',
+  '--hidden-import', 'indicators',
+  '--hidden-import', 'replay',
+  '--hidden-import', 'rules',
   '--collect-submodules', 'cryptography',
   '--collect-submodules', 'httpx',
   '--collect-submodules', 'websockets',

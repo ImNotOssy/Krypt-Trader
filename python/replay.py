@@ -61,21 +61,36 @@ def tick_to_asset(row: dict, cfg: dict, close_iso: str) -> dict:
         hour = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S").hour
     except Exception:
         pass
-    # Rebuild the built-in favorite signal the way the snapshot does: window +
-    # threshold + hours. (The delta filter needs open-vs-obs context the gate
-    # reads from `signal` only in favorite mode; approximation noted in
-    # caveats.)
-    signal = bool(
-        in_window
-        and fav_price is not None
-        and fav_price >= crypto15m._const(cfg, "entry_threshold")
-        and (hour is None or crypto15m.hours_ok(cfg, hour=hour))
-    )
     entry_cost = None
     if fav == "up":
         entry_cost = yes_ask
     elif fav == "down":
         entry_cost = no_ask
+    # Rebuild the built-in favorite signal EXACTLY as the live snapshot does
+    # (crypto15m.py signal expression): window + hours + threshold + the
+    # entry_max cap + direction-aware min-delta + strict-threshold (the
+    # executable ask must itself clear the threshold on a two-sided book).
+    # Omitting the last three made replay trade entries live would reject.
+    strict = bool(cfg.get("crypto15m_strict_threshold", True))
+    two_sided = bool(yes_bid and yes_ask)
+    min_dp = crypto15m._const(cfg, "min_delta_pct")
+    ds = row.get("delta_signed_pct")
+    if ds is None or min_dp <= 0:
+        delta_ok = True
+    elif fav == "up":
+        delta_ok = float(ds) >= min_dp
+    else:
+        delta_ok = float(ds) <= -min_dp
+    signal = bool(
+        in_window
+        and fav_price is not None
+        and fav_price >= crypto15m._const(cfg, "entry_threshold")
+        and entry_cost is not None
+        and float(entry_cost) <= crypto15m._const(cfg, "entry_max")
+        and delta_ok
+        and (hour is None or crypto15m.hours_ok(cfg, hour=hour))
+        and (not strict or (two_sided and float(entry_cost) >= crypto15m._const(cfg, "entry_threshold")))
+    )
     return {
         "asset": row.get("asset"), "ticker": row.get("ticker"),
         "series": f"KX{row.get('asset')}15M", "hasMarket": True,
@@ -114,8 +129,11 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
     Returns aggregate stats + per-asset breakdown + honesty caveats."""
     cfg = dict(cfg)
     # The replayed strategy is hypothetical — the live enable/arm switches
-    # must not zero the backtest.
+    # must not zero the backtest. Same for the calibration autopause:
+    # historical pause state can't be reconstructed, so applying TODAY'S
+    # pause/resume to the whole window is wrong in both directions.
     cfg["crypto15m_enabled"] = True
+    cfg["crypto15m_model_autopause"] = False
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
     with dbmod.get_db() as conn:
         rows = conn.execute(
@@ -137,6 +155,11 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
     trades: list[dict] = []
     n_windows = 0
     for ticker, ticks in by_window.items():
+        # Honor the per-asset Trade toggles: live entries are filtered by
+        # asset_enabled in run_tick, so a "My current settings" replay must
+        # skip disabled assets too (they don't count as scanned either).
+        if not crypto15m.asset_enabled(cfg, str(ticks[0].get("asset") or "")):
+            continue
         n_windows += 1
         up_won = int(ticks[0].get("up_won") or 0)
         close_iso = str(ticks[0].get("sig_close") or "")
@@ -174,6 +197,7 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
         "Positions are held to settlement — stop-loss/take-profit exits are NOT simulated.",
         f"Ticks are 4-25s apart over {since_days} days of app uptime only; the gate could have fired between ticks.",
         "In-sample: any threshold tuned against this panel is fit to the past. Paper-trade before arming.",
+        "Live model-calibration auto-pause is NOT simulated — live trading can pause where this replay keeps trading.",
     ]
     missing = _missing_rule_fields(cfg)
     if missing:
@@ -220,7 +244,13 @@ def _summarize(trades: list[dict], contracts: int, n_windows: int,
     n = len(trades)
     wins = sum(1 for t in trades if t["won"])
     total = sum(t["pnlUsd"] for t in trades)
-    ev_ct = (total / (n * contracts) * 100.0) if n else 0.0
+    # Per-contract EV must divide by the contracts each trade ACTUALLY sized
+    # (replay_main sizes n_ct = fixed_usd/cost per signal, ~2x the flat
+    # default at mid prices — the hardcoded denominator inflated the FE
+    # "Edge / contract" stat accordingly). Trades without a size fall back
+    # to the flat `contracts` (the crypto15m path, which sizes uniformly).
+    denom = sum(int(t.get("contracts", contracts) or contracts) for t in trades)
+    ev_ct = (total / denom * 100.0) if denom else 0.0
     by_asset: dict[str, dict] = {}
     for t in trades:
         a = by_asset.setdefault(t.get("asset") or "?", {"n": 0, "wins": 0, "pnlUsd": 0.0})
@@ -290,6 +320,7 @@ def replay_main(cfg: dict, *, since_days: int = 60,
             "side": sig.get("taker_side") or sig.get("direction") or "?",
             "costCents": round(cost * 100, 1), "minsLeft": None,
             "won": bool(won), "pnlUsd": round(pnl_ct * n_ct, 4),
+            "contracts": n_ct,
             "at": sig.get("created_at"),
         })
 
@@ -322,5 +353,6 @@ def replay_main(cfg: dict, *, since_days: int = 60,
         "One simulated trade per accepted signal; live caps (max open, per-event, daily) are NOT applied, so hot events stack correlated trades.",
         "Whale outcomes cluster (one game prints many whale signals) - day/hour buckets share that clustering.",
         "In-sample: signals were only recorded while the app was running.",
+        "contrarianOnly and maxResolutionDays are NOT re-simulated: alerts inherit whatever filter was live when they were RECORDED (contrarianOnly gates at record time), and signal rows carry no close_time for the resolution-days gate to read.",
     ]
     return _summarize(trades, contracts, scanned, caveats)

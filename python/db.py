@@ -374,6 +374,7 @@ CREATE INDEX IF NOT EXISTS idx_bp_resolved ON bot_positions(resolved, status);
 CREATE INDEX IF NOT EXISTS idx_bp_created ON bot_positions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_oe_pos ON order_events(position_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pnl_at ON pnl_snapshots(at DESC);
+CREATE INDEX IF NOT EXISTS idx_pnl_env_at ON pnl_snapshots(kalshi_env, at);
 CREATE INDEX IF NOT EXISTS idx_c15_open ON crypto15m_positions(resolved, status);
 CREATE INDEX IF NOT EXISTS idx_c15_asset ON crypto15m_positions(asset, kalshi_env, resolved);
 -- the executor tick reads errored/stopped ticker sets every ~4s; without this
@@ -1619,12 +1620,20 @@ def earliest_pnl_total(conn, env: str) -> float | None:
 def first_snapshot_of_today(conn, env: str, offset_min: int = 0) -> dict | None:
     # Ignore any $0/unknown-balance rows so they can never become today's baseline.
     # offset_min shifts the day boundary to the user's local day (default 0 = UTC).
-    mod = f"{int(offset_min):+d} minutes"
+    # The day-start boundary is computed in Python so the predicate is a
+    # SARGABLE range (`at >= ?`) served by idx_pnl_env_at — the old
+    # `date(at, ?) = date('now', ?)` form full-scanned + temp-sorted the
+    # whole snapshot history on every daily-risk check and account build.
+    now_local = datetime.utcnow() + timedelta(minutes=int(offset_min))
+    day_start_utc = (
+        datetime(now_local.year, now_local.month, now_local.day)
+        - timedelta(minutes=int(offset_min))
+    )
     row = conn.execute(
         """SELECT * FROM pnl_snapshots
-           WHERE kalshi_env = ? AND date(at, ?) = date('now', ?) AND total_usd > 0
+           WHERE kalshi_env = ? AND at >= ? AND total_usd > 0
            ORDER BY at ASC LIMIT 1""",
-        (env, mod, mod),
+        (env, day_start_utc.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1759,7 +1768,7 @@ def get_pnl_snapshots(
     return rows
 
 
-def recent_balance_transition(conn, env: str, within_sec: int = 90) -> bool:
+def recent_balance_transition(conn, env: str, within_sec: int = 180) -> bool:
     """True when a bot position was OPENED or RESOLVED within the last
     `within_sec` seconds — the window where the exchange's cash ledger and
     our position ledger can disagree (an entry's debit / a settlement's
@@ -1767,7 +1776,9 @@ def recent_balance_transition(conn, env: str, within_sec: int = 90) -> bool:
     transiently dip by ~one position (the "-$3.00 balance" reports) or lag
     a win. Consumers show a 'syncing' hint instead of the scary number.
     Keys on created_at / resolved_at, NOT last_updated — the 30s mark
-    reconcile touches last_updated constantly on open rows."""
+    reconcile touches last_updated constantly on open rows. Default window
+    matches the measured worst settlement-payout gap (~130s observed) and
+    the daily-risk persistence window (180s)."""
     args = (env, f"-{int(within_sec)} seconds", f"-{int(within_sec)} seconds")
     # bot_positions has no dry_run column; crypto15m_positions does (its
     # dry-run rows never move real money, so they must not flag syncing).

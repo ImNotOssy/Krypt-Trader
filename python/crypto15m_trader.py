@@ -45,9 +45,13 @@ _CAL_MIN_N = 20           # below this, not enough evidence to pause
 # framing: break-even at ~93c entries + fee is ~94% observed; 0.85 LB ≈
 # observed ~95% at n=40, so a record at/under ~90% observed (a real
 # money-loser) pauses while a healthy 97%+ record clears with room.
-# Resume needs LB 0.90 ≈ observed ~99%+ at n=40 (hysteresis).
+# Resume: 0.90 was itself unreachable (wilson_lb(39,40)=0.8954 — only a
+# literally perfect 40/40 cleared it, so one miss anywhere in the trailing
+# 40 kept a recovered model paused for days). 0.88 resumes at 39/40
+# (observed 97.5%, healthy) while 38/40 (LB 0.8597) stays paused —
+# hysteresis preserved: pause at ≤37/40, resume at ≥39/40.
 _CAL_PAUSE_LB = 0.85
-_CAL_RESUME_LB = 0.90
+_CAL_RESUME_LB = 0.88
 
 
 def _wilson_lb(wins: int, n: int, z: float = 1.645) -> float:
@@ -73,6 +77,7 @@ def check_model_calibration(env: str) -> dict:
                      ON s.ticker = t.ticker AND s.kalshi_env = t.kalshi_env
                    WHERE s.resolved = 1 AND s.up_won IS NOT NULL
                      AND t.kalshi_env = ? AND t.model_prob IS NOT NULL
+                     AND t.observed_at >= datetime('now', '-3 days')
                      AND t.mins_left <= 5 AND t.mins_left >= 0.5
                      AND (t.model_prob >= 0.97 OR t.model_prob <= 0.03)
                    ORDER BY t.observed_at""",
@@ -264,8 +269,11 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
     # The trading-hours gate is a HARD time control and always applies — even
     # with custom rules, which replace only the favorite/signal EDGE (the rule
     # vocabulary can't express a wrapping overnight window). Without this,
-    # use_rules would silently trade 24h.
-    if not crypto15m.hours_ok(cfg):
+    # use_rules would silently trade 24h. The snapshot's hourUtc is passed
+    # through so REPLAY evaluates each tick's recorded hour, not the wall
+    # clock at backtest run time (live snapshots always stamp hourUtc, and
+    # hours_ok falls back to now() when it's None).
+    if not crypto15m.hours_ok(cfg, hour=asset.get("hourUtc")):
         return False, "outside trading hours"
     # Custom rule-set (rule builder): the user's composed conditions REPLACE the
     # built-in favorite/signal gate. The side bought still comes from
@@ -786,16 +794,20 @@ def _entry_expired(pos: dict, cfg: dict) -> bool:
     return kalshi_auth.server_now() >= close_epoch - lead
 
 
-# A pair entry is a MARKETABLE limit (ask + 1c): if it hasn't filled within
-# this long, the book moved away and it's now a resting bid that only fills
-# when price comes DOWN through it — adverse by construction. Cancel and let
-# a fresh gate pass re-enter on a genuine dip (partials keep their fills via
-# the normal expiry path).
+# A MARKETABLE entry limit (ask + markup) that hasn't filled within this
+# long means the book moved away and the order is now a resting bid that
+# only fills when price comes DOWN through it — adverse by construction.
+# Cancel and let a fresh gate pass re-enter on a genuine dip (partials keep
+# their fills via the normal expiry path). Applies to pair entries AND
+# model/sniper entries: the sniper's edge is the stale-quote NOW — a snipe
+# that rested 4 minutes is no longer the trade the model priced (it was
+# left exposed until close−cancel_min before this generalization).
 _PAIR_ENTRY_TTL_SEC = 30.0
+_MARKETABLE_STRATEGIES = ("pair", "model", "model_fm")
 
 
 def _pair_entry_stale(pos: dict) -> bool:
-    if (pos.get("strategy") or "") != "pair":
+    if (pos.get("strategy") or "") not in _MARKETABLE_STRATEGIES:
         return False
     ca = str(pos.get("created_at") or "")
     try:

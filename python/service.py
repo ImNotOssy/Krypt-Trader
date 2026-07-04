@@ -1009,11 +1009,11 @@ async def _crypto15m_loop() -> None:
                     # A fill/exit/settlement just moved money — refresh the
                     # cash cache NOW instead of waiting out the balance poll,
                     # shrinking the "balance dipped by one position" window
-                    # from ~60s to seconds.
-                    try:
-                        await trader.refresh_balance(cfg, force=True)
-                    except Exception:
-                        pass
+                    # from ~60s to seconds. Fire-and-forget: an inline await
+                    # would ride the 25s×3 retry ladder (~80s worst case)
+                    # during a Kalshi API storm and stall THIS loop — exactly
+                    # the stop-loss cadence it exists to protect.
+                    _fire_and_forget(trader.refresh_balance(cfg, force=True))
         except Exception as e:
             logger.error(f"crypto15m tick error: {e}", exc_info=True)
         await asyncio.sleep(0.5)

@@ -370,7 +370,7 @@ def _risk_cfg(**over):
 def _reset_breach(monkeypatch, persist_sec=0.0):
     """Make daily-risk breaches gate immediately (persistence tested on its own)."""
     monkeypatch.setattr(trader, "_DAY_RISK_PERSIST_SEC", persist_sec)
-    trader._day_risk_breach.update({"sl": None, "tp": None})
+    trader._day_risk_breach.clear()
 
 
 def test_daily_stop_counts_open_position_mark_to_market(fresh_db, monkeypatch):
@@ -408,20 +408,23 @@ def test_daily_stop_ignores_transient_settlement_gap(fresh_db, monkeypatch):
     # settlement (live 2026-07-03: "today pnl=$-9.67" on an account that was
     # UP on the day). A single breaching observation must NOT gate…
     monkeypatch.setattr(trader, "_DAY_RISK_PERSIST_SEC", 180.0)
-    trader._day_risk_breach.update({"sl": None, "tp": None})
+    trader._day_risk_breach.clear()
     monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: -10.0)
     monkeypatch.setattr(db, "open_unrealized_pnl_usd", lambda conn, env: 0.0)
     cfg = _risk_cfg(stop_loss_on_day=-5.0)
     assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
     # …but one that has PERSISTED past the window does gate…
-    trader._day_risk_breach["sl"] = trader.time.monotonic() - 181.0
+    trader._day_risk_breach[("demo", "sl")] = trader.time.monotonic() - 181.0
     blocked, why = trader._is_blocked_by_daily_risk(cfg, "demo")
     assert blocked is True and "stop-loss" in why
+    # …breach streaks are per-env: production is untouched by demo's streak…
+    monkeypatch.setattr(db, "first_snapshot_of_today", lambda conn, env, off=0: None)
+    assert trader._is_blocked_by_daily_risk(cfg, "production")[0] is False
     # …and recovery (cash lands) clears the streak immediately.
     monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: +0.3)
     assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
-    assert trader._day_risk_breach["sl"] is None
-    trader._day_risk_breach.update({"sl": None, "tp": None})
+    assert trader._day_risk_breach[("demo", "sl")] is None
+    trader._day_risk_breach.clear()
 
 
 def test_open_unrealized_pnl_uses_marks(fresh_db):

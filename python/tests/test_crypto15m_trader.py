@@ -1394,12 +1394,14 @@ def test_model_up_prob_shape():
 
 
 def test_model_edge_net_cents_picks_best_side_after_fees():
-    # Model says 97% up; up ask 90c → up edge = 97 − 90 − fee(90) ≈ +6.4c.
+    # Fees are CEIL-aware at 1-lot (the real Kalshi fee, not the continuous
+    # curve): fee(90c) = ceil($0.0063) = 1.0c, so 97% up vs a 90c ask nets
+    # 97 − 90 − 1.0 = +6.0c (the continuous 0.63c model overstated it).
     e = crypto15m.model_edge_net_cents(0.97, 0.90, 0.12)
-    assert e == pytest.approx(97 - 90 - 7 * 0.9 * 0.1, abs=0.05)
-    # Model says 10% up; down side is the value: 90 − 85 − fee(85) ≈ +4.1c.
+    assert e == pytest.approx(97 - 90 - 1.0, abs=0.05)
+    # Model says 10% up; down side is the value: 90 − 85 − ceil-fee(85c)=1.0c.
     e = crypto15m.model_edge_net_cents(0.10, 0.20, 0.85)
-    assert e == pytest.approx(90 - 85 - 7 * 0.85 * 0.15, abs=0.05)
+    assert e == pytest.approx(90 - 85 - 1.0, abs=0.05)
     # Fairly-priced market → negative edge (fees).
     e = crypto15m.model_edge_net_cents(0.50, 0.51, 0.51)
     assert e is not None and e < 0
@@ -1906,6 +1908,13 @@ def test_perfect_record_never_pauses_and_can_resume():
     for n in range(ct._CAL_MIN_N, ct._CAL_WINDOW + 1):
         assert ct._wilson_lb(n, n) >= ct._CAL_PAUSE_LB, f"perfect {n}/{n} would pause"
     assert ct._wilson_lb(ct._CAL_WINDOW, ct._CAL_WINDOW) >= ct._CAL_RESUME_LB
+    # The resume bar must be reachable WITHOUT a literally perfect trailing
+    # window: one miss in 40 (97.5% observed — healthy and profitable) must
+    # resume. The first fix set resume=0.90 > wilson_lb(39,40)=0.8954, which
+    # kept a recovered model paused until a full 40-window miss-free streak.
+    assert ct._wilson_lb(ct._CAL_WINDOW - 1, ct._CAL_WINDOW) >= ct._CAL_RESUME_LB
     # …while a genuinely degraded record (90% observed at n=40, a real
-    # money-loser at 93c entries) still pauses.
+    # money-loser at 93c entries) still pauses, and 38/40 stays below resume
+    # (hysteresis intact).
     assert ct._wilson_lb(36, 40) < ct._CAL_PAUSE_LB
+    assert ct._wilson_lb(38, 40) < ct._CAL_RESUME_LB

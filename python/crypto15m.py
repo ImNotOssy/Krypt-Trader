@@ -446,9 +446,16 @@ def settlement_up_prob(
     return max(0.0, min(1.0, _norm_cdf((mean - strike) / math.sqrt(var))))
 
 
-def _fee_cents(price_cents: float) -> float:
+def _fee_cents(price_cents: float, contracts: int = 1) -> float:
+    """Kalshi taker fee in cents/contract, CEIL-aware: Kalshi rounds the
+    per-order fee UP to the next cent, so a 1-lot at 97c pays 1.0c — not the
+    0.20c the continuous 7·p·(1−p) curve claims. The continuous model
+    overstated net edge by up to ~0.8c exactly at the deep-favorite prices
+    the sniper buys. Defaults to the 1-lot (worst, most conservative) fee;
+    per-contract fee only falls as size grows."""
+    import backtest as _bt
     p = max(1.0, min(99.0, price_cents)) / 100.0
-    return 7.0 * p * (1.0 - p)
+    return _bt.kalshi_fee_per_contract(p, contracts=max(1, int(contracts))) * 100.0
 
 
 def model_edge_net_cents(
