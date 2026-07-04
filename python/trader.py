@@ -349,6 +349,29 @@ def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
     return today_total - today_baseline
 
 
+# A daily-limit breach must PERSIST before it gates. The balance heartbeat
+# reads cash and portfolio value at different moments, so around every
+# settlement the payout is in flight between ledgers for a minute or two
+# and the account total transiently reads low — observed live 2026-07-03:
+# "today pnl=$-9.67, limit=$-1.45" fired inside the 2-minute window between
+# the portfolio zeroing (00:16:03Z) and the cash payout landing (00:18:13Z)
+# on an account that was UP on the day, blocking entries after EVERY
+# settlement. A genuine drawdown keeps breaching and gates ~3 minutes
+# later; a money-in-flight dip self-heals first.
+_DAY_RISK_PERSIST_SEC = 180.0
+_day_risk_breach: dict = {"sl": None, "tp": None}  # kind -> monotonic first-breach
+
+
+def _breach_persists(kind: str, breached: bool) -> bool:
+    now = time.monotonic()
+    if not breached:
+        _day_risk_breach[kind] = None
+        return False
+    if _day_risk_breach[kind] is None:
+        _day_risk_breach[kind] = now
+    return (now - _day_risk_breach[kind]) >= _DAY_RISK_PERSIST_SEC
+
+
 def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
     offset = int(cfg.get("trading_timezone_offset_min", 0) or 0)
     pnl = _today_pnl_balance_delta(env, offset)
@@ -384,16 +407,16 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
             day_start = float(first_today["total_usd"] or 0.0)
             if day_start > 0:
                 sl_limits.append(-sl_pct * day_start)
-    if sl_limits:
-        limit = max(sl_limits)  # closest to zero = tighter
-        if pnl_mtm <= limit:
-            return True, (
-                f"daily stop-loss hit (today pnl=${pnl:+.2f}, "
-                f"open mark-to-market=${unrealized:+.2f}, limit=${limit:+.2f})"
-            )
-
+    limit = max(sl_limits) if sl_limits else None  # closest to zero = tighter
+    sl_hit = _breach_persists("sl", limit is not None and pnl_mtm <= limit)
     tp = float(cfg.get("take_profit_on_day", 0))
-    if tp > 0 and pnl >= tp:
+    tp_hit = _breach_persists("tp", tp > 0 and pnl >= tp)
+    if sl_hit:
+        return True, (
+            f"daily stop-loss hit (today pnl=${pnl:+.2f}, "
+            f"open mark-to-market=${unrealized:+.2f}, limit=${limit:+.2f})"
+        )
+    if tp_hit:
         return True, f"daily take-profit hit (today pnl=${pnl:+.2f}, target=${tp:+.2f})"
     return False, ""
 
