@@ -1759,6 +1759,34 @@ def get_pnl_snapshots(
     return rows
 
 
+def recent_balance_transition(conn, env: str, within_sec: int = 90) -> bool:
+    """True when a bot position was OPENED or RESOLVED within the last
+    `within_sec` seconds — the window where the exchange's cash ledger and
+    our position ledger can disagree (an entry's debit / a settlement's
+    payout is in flight), so account totals built from cash + open-cost
+    transiently dip by ~one position (the "-$3.00 balance" reports) or lag
+    a win. Consumers show a 'syncing' hint instead of the scary number.
+    Keys on created_at / resolved_at, NOT last_updated — the 30s mark
+    reconcile touches last_updated constantly on open rows."""
+    args = (env, f"-{int(within_sec)} seconds", f"-{int(within_sec)} seconds")
+    # bot_positions has no dry_run column; crypto15m_positions does (its
+    # dry-run rows never move real money, so they must not flag syncing).
+    for table, extra in (("bot_positions", ""),
+                         ("crypto15m_positions", "AND dry_run = 0")):
+        row = conn.execute(
+            f"""SELECT 1 FROM {table}
+                WHERE kalshi_env = ? {extra}
+                  AND ((resolved_at IS NOT NULL AND resolved_at >= datetime('now', ?))
+                    OR (created_at >= datetime('now', ?)
+                        AND status IN ('submitted', 'partial', 'filled')))
+                LIMIT 1""",
+            args,
+        ).fetchone()
+        if row:
+            return True
+    return False
+
+
 def aggregate_stats(conn, env: str | None = None) -> dict:
     cond = ""
     args: list = []

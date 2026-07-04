@@ -214,6 +214,7 @@ export interface AccountSnapshot {
   cashUsd: number;
   portfolioUsd: number;
   totalUsd: number;
+  balanceSyncing?: boolean;  // an order just filled or settled — ledgers catching up; totals may transiently dip
   startBankrollUsd: number;
   bankrollSource?: 'user' | 'auto' | 'live';
   roiPct: number;

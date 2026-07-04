@@ -213,6 +213,10 @@ async def _build_account_snapshot() -> dict:
         stats_demo = db.aggregate_stats(conn, "demo")
         stats_prod = db.aggregate_stats(conn, "production")
         crypto_open_cost = db.open_crypto15m_filled_cost_usd(conn, env)
+        # A just-filled entry or just-resolved settlement means the exchange's
+        # cash and our open-cost ledger are momentarily out of step — flag it
+        # so the UI can say "syncing" instead of flashing a phantom dip.
+        balance_syncing = db.recent_balance_transition(conn, env)
     open_cost = stats_env["open_cost"]
     # Include 15m-crypto held cost (those positions are excluded from the main
     # bot_positions reconcile import, so add their cost here or the total would
@@ -280,6 +284,7 @@ async def _build_account_snapshot() -> dict:
         "cashUsd": cash_usd,
         "portfolioUsd": port_usd,
         "totalUsd": total,
+        "balanceSyncing": balance_syncing,
         "startBankrollUsd": baseline,
         "bankrollSource": baseline_source,
         "roiPct": roi,
@@ -996,10 +1001,19 @@ async def _crypto15m_loop() -> None:
             )
             if due:
                 STATE.ws_c15_pending = False
-                await crypto15m_trader.run_tick(
+                changed = await crypto15m_trader.run_tick(
                     cfg, authed=STATE.auth_ok, session_start=STATE.started_at
                 )
                 last_tick = asyncio.get_event_loop().time()
+                if changed:
+                    # A fill/exit/settlement just moved money — refresh the
+                    # cash cache NOW instead of waiting out the balance poll,
+                    # shrinking the "balance dipped by one position" window
+                    # from ~60s to seconds.
+                    try:
+                        await trader.refresh_balance(cfg, force=True)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"crypto15m tick error: {e}", exc_info=True)
         await asyncio.sleep(0.5)

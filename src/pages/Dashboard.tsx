@@ -110,7 +110,9 @@ export function DashboardPage({ onNav }: DashboardProps) {
         <ShareableStat
           label="Total Balance"
           value={fmtUsd(account?.totalUsd)}
-          hint={`cash ${fmtUsd(account?.cashUsd)} · port ${fmtUsd(account?.portfolioUsd)}`}
+          hint={account?.balanceSyncing
+            ? '⏳ syncing — an order just filled or settled; Kalshi reflects it in a moment'
+            : `cash ${fmtUsd(account?.cashUsd)} · port ${fmtUsd(account?.portfolioUsd)}`}
           shareText={`Krypt Trader balance: ${fmtUsd(account?.totalUsd)} `
             + `(${fmtUsd(alltimePnl, { sign: true })} since I started). `
             + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
@@ -119,11 +121,13 @@ export function DashboardPage({ onNav }: DashboardProps) {
           label="Session P&L"
           value={fmtUsd(sessionPnl, { sign: true })}
           hint={
-            sessionBaseline
-              ? `${fmtUsd(sessionBaseline)} → ${fmtUsd(account?.totalUsd)} · ${fmtPct(sessionRoi)} · since ${fmtRelative(sessionStartedAt)}`
-              : 'session baseline pending'
+            account?.balanceSyncing
+              ? '⏳ syncing — a fill/settlement is landing; this number self-corrects in a moment'
+              : sessionBaseline
+                ? `${fmtUsd(sessionBaseline)} → ${fmtUsd(account?.totalUsd)} · ${fmtPct(sessionRoi)} · since ${fmtRelative(sessionStartedAt)}`
+                : 'session baseline pending'
           }
-          accent={sessionPnl >= 0 ? 'good' : 'bad'}
+          accent={account?.balanceSyncing ? undefined : sessionPnl >= 0 ? 'good' : 'bad'}
           shareText={`This session on Krypt Trader: ${sessionPnl >= 0 ? '+' : ''}${fmtUsd(sessionPnl)} `
             + `(${fmtPct(sessionRoi)} ROI). `
             + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
