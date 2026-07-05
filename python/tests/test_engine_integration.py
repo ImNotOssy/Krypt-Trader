@@ -474,6 +474,332 @@ def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_demo, cfg, monkeypa
 
 
 
+# ───────── swarm-audit regressions: order lifecycle races ─────────
+
+
+def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, cfg, monkeypatch):
+    # The transport layer retries a timed-out POST with the SAME
+    # client_order_id; Kalshi rejects the retry as a duplicate (4xx). That
+    # means attempt 1 WAS delivered — the order is live. Booking 'error'
+    # (the old blanket-4xx path) hid a live resting order from the
+    # exposure/open-count/dup-market caps.
+    cfg["enable_trading"] = True
+    monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
+
+    async def _place(**_kw):
+        raise KalshiAPIError(400, {"error": {
+            "code": "duplicate_client_order_id",
+            "message": "an order with this client_order_id already exists",
+        }})
+
+    async def _find(coid, ticker="", pin_env=None):
+        return {"order_id": "OID-DUP", "status": "resting"}
+
+    monkeypatch.setattr(trader, "place_limit_order", _place)
+    monkeypatch.setattr(trader, "find_order_by_client_id", _find)
+
+    row = run_async(
+        trader.execute_signal(whale_signal(id=301, ticker="DUP-COID"), "whale", cfg, 1000.0)
+    )
+    assert row["status"] == "submitted"
+    assert row["kalshi_order_id"] == "OID-DUP"
+    with db.get_db() as conn:
+        assert db.count_open_bot_positions(conn, "demo") == 1
+
+
+def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo, cfg, monkeypatch):
+    # Same rejection shape but the coid lookup CONFIRMS no such order exists
+    # -> 'error' is correct (and the row stays out of the caps).
+    cfg["enable_trading"] = True
+    monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
+
+    async def _place(**_kw):
+        raise KalshiAPIError(400, {"error": {
+            "code": "duplicate_client_order_id",
+            "message": "an order with this client_order_id already exists",
+        }})
+
+    async def _find(coid, ticker="", pin_env=None):
+        return None
+
+    monkeypatch.setattr(trader, "place_limit_order", _place)
+    monkeypatch.setattr(trader, "find_order_by_client_id", _find)
+
+    row = run_async(
+        trader.execute_signal(whale_signal(id=302, ticker="DUP-MISS"), "whale", cfg, 1000.0)
+    )
+    assert row["status"] == "error"
+
+
+def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, monkeypatch):
+    # An env switch lands while the POST is in flight -> synthesized 409
+    # env_changed. The coid lookup would now sign for the OTHER account, where
+    # the order can never appear — a miss there is NOT a confirmed miss. The
+    # row must book 'submitted'/UNCONFIRMED (poll resolves it when its env is
+    # active again), not 'error' (which hides a possibly-live order).
+    cfg["enable_trading"] = True
+    monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
+
+    env_now = {"v": "demo"}
+    monkeypatch.setattr(trader, "get_env", lambda: env_now["v"])
+
+    async def _place(**_kw):
+        env_now["v"] = "prod"  # flip lands mid-POST
+        raise KalshiAPIError(409, {"error": {
+            "code": "env_changed",
+            "message": "environment switched mid-request; aborted",
+        }})
+
+    async def _find(coid, ticker="", pin_env=None):
+        raise AssertionError("lookup must not run against the wrong env")
+
+    monkeypatch.setattr(trader, "place_limit_order", _place)
+    monkeypatch.setattr(trader, "find_order_by_client_id", _find)
+
+    row = run_async(
+        trader.execute_signal(whale_signal(id=303, ticker="ENV-FLIP"), "whale", cfg, 1000.0)
+    )
+    assert row["status"] == "submitted"
+    assert row["kalshi_order_id"] is None
+    assert "UNCONFIRMED" in (row["error"] or "")
+    with db.get_db() as conn:
+        # The row still occupies a cap slot in ITS env.
+        assert db.count_open_bot_positions(conn, "demo") == 1
+
+
+def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
+    # Cancel-all used to write 'canceled' blind — a fill that raced the cancel
+    # left held contracts outside the open-count/exposure caps, and the
+    # resolution pass could flat-resolve the 0-fill row (unrecoverable).
+    pid = seed_position(status="submitted", kalshi_order_id="OID-CA1",
+                        target_contracts=5, limit_price_cents=50)
+
+    async def _cancel(_oid):
+        return {}
+
+    async def _order(_oid):
+        return {"order": {
+            "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
+            "taker_fill_cost": 100, "maker_fill_cost": 0,   # 2 @ 50c
+            "place_count": 5, "remaining_count": 0,
+        }}
+
+    monkeypatch.setattr(trader, "cancel_order", _cancel)
+    monkeypatch.setattr(trader, "get_order", _order)
+
+    n = run_async(trader.cancel_all_open())
+    assert n == 1
+    row = fetch(pid)
+    assert row["status"] == "partial"            # fills kept, not 'canceled'
+    assert row["filled_contracts"] == 2
+    assert row["target_contracts"] == 2          # dead remainder collapsed
+    assert row["cost_usd"] == pytest.approx(1.0)
+    with db.get_db() as conn:
+        assert db.count_open_bot_positions(conn, "demo") == 1  # still in the cap
+
+
+def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monkeypatch):
+    pid = seed_position(status="submitted", kalshi_order_id="OID-CA2",
+                        target_contracts=5)
+
+    async def _cancel(_oid):
+        return {}
+
+    async def _order(_oid):
+        return {"order": {
+            "status": "canceled", "taker_fill_count": 0, "maker_fill_count": 0,
+            "taker_fill_cost": 0, "maker_fill_cost": 0,
+            "place_count": 5, "remaining_count": 5,
+        }}
+
+    monkeypatch.setattr(trader, "cancel_order", _cancel)
+    monkeypatch.setattr(trader, "get_order", _order)
+
+    n = run_async(trader.cancel_all_open())
+    assert n == 1
+    assert fetch(pid)["status"] == "canceled"
+
+
+def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, monkeypatch):
+    # Post-cancel fill read fails -> DON'T guess: leave 'submitted' so the
+    # poll loop books the truth next cycle.
+    pid = seed_position(status="submitted", kalshi_order_id="OID-CA3",
+                        target_contracts=5)
+
+    async def _cancel(_oid):
+        return {}
+
+    async def _order(_oid):
+        raise KalshiAPIError(500, "boom")
+
+    monkeypatch.setattr(trader, "cancel_order", _cancel)
+    monkeypatch.setattr(trader, "get_order", _order)
+
+    n = run_async(trader.cancel_all_open())
+    assert n == 1                                # the cancel itself succeeded
+    assert fetch(pid)["status"] == "submitted"   # row untouched
+
+
+def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_demo, cfg, monkeypatch):
+    # UI Refresh's runOnce('pollOrders') races the loop's poll; the second
+    # entrant must no-op instead of double-cancelling the same expired order.
+    def _boom(conn, env=None):
+        raise AssertionError("a second poll ran while one was active")
+
+    monkeypatch.setattr(db, "get_pending_bot_positions", _boom)
+    trader._poll_orders_active = True
+    try:
+        assert run_async(trader.poll_open_orders(cfg)) == []
+    finally:
+        trader._poll_orders_active = False
+
+
+def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monkeypatch):
+    # cancel 404s (another poll's cancel won, or a fill consumed the order) —
+    # the fill state must be re-read before booking a terminal status. Here a
+    # raced FILL exists: the row must stay 'submitted' for the next poll, not
+    # be killed as 'gone' at 0 fills.
+    trader._poll_failures.clear()
+    cfg["order_expiration_sec"] = 90
+    pid = seed_position(status="submitted", kalshi_order_id="OID-R404",
+                        target_contracts=5, created_at_offset_sec=-200)
+
+    async def _no_positions(*_a, **_k):
+        return []
+
+    calls = {"n": 0}
+
+    async def _order(_oid):
+        calls["n"] += 1
+        if calls["n"] == 1:  # pre-cancel read: still resting, 0 fills
+            return {"order": {
+                "status": "resting", "taker_fill_count": 0, "maker_fill_count": 0,
+                "taker_fill_cost": 0, "maker_fill_cost": 0,
+                "place_count": 5, "remaining_count": 5,
+            }}
+        return {"order": {  # post-404 re-read: the fill that raced the cancel
+            "status": "executed", "taker_fill_count": 5, "maker_fill_count": 0,
+            "taker_fill_cost": 300, "maker_fill_cost": 0,
+            "place_count": 5, "remaining_count": 0,
+        }}
+
+    async def _cancel_404(_oid):
+        raise KalshiAPIError(404, "order not found")
+
+    monkeypatch.setattr(trader, "get_positions", _no_positions)
+    monkeypatch.setattr(trader, "get_order", _order)
+    monkeypatch.setattr(trader, "cancel_order", _cancel_404)
+
+    run_async(trader.poll_open_orders(cfg))
+    assert fetch(pid)["status"] == "submitted"   # left for the next poll
+
+
+def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo, cfg, monkeypatch):
+    trader._poll_failures.clear()
+    cfg["order_expiration_sec"] = 90
+    pid = seed_position(status="submitted", kalshi_order_id="OID-R404B",
+                        target_contracts=5, created_at_offset_sec=-200)
+
+    async def _no_positions(*_a, **_k):
+        return []
+
+    calls = {"n": 0}
+
+    async def _order(_oid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"order": {
+                "status": "resting", "taker_fill_count": 0, "maker_fill_count": 0,
+                "taker_fill_cost": 0, "maker_fill_cost": 0,
+                "place_count": 5, "remaining_count": 5,
+            }}
+        raise KalshiAPIError(404, "not found")
+
+    async def _cancel_404(_oid):
+        raise KalshiAPIError(404, "order not found")
+
+    monkeypatch.setattr(trader, "get_positions", _no_positions)
+    monkeypatch.setattr(trader, "get_order", _order)
+    monkeypatch.setattr(trader, "cancel_order", _cancel_404)
+
+    run_async(trader.poll_open_orders(cfg))
+    assert fetch(pid)["status"] == "gone"
+
+
+def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cfg, monkeypatch):
+    # ~3 minutes of connectivity loss used to 'gone' rows whose orders were
+    # resting live: every failed coid lookup / order read bumped the shared
+    # give-up counter. Failures are not misses.
+    trader._poll_failures.clear()
+    pid_nokid = seed_position(status="submitted", kalshi_order_id=None,
+                              target_contracts=5)
+    pid_kid = seed_position(status="submitted", kalshi_order_id="OID-NET",
+                            target_contracts=5)
+
+    async def _net_down(*_a, **_k):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(trader, "get_positions", _net_down)
+    monkeypatch.setattr(trader, "find_order_by_client_id", _net_down)
+    monkeypatch.setattr(trader, "get_order", _net_down)
+
+    for _ in range(8):  # well past _POLL_FAILURE_THRESHOLD
+        run_async(trader.poll_open_orders(cfg))
+
+    assert fetch(pid_nokid)["status"] == "submitted"
+    assert fetch(pid_kid)["status"] == "submitted"
+
+
+def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkeypatch):
+    # A lookup that SUCCEEDS and finds nothing IS evidence — after the
+    # threshold the missing-kid row still retires to 'gone'.
+    trader._poll_failures.clear()
+    pid = seed_position(status="submitted", kalshi_order_id=None,
+                        target_contracts=5)
+
+    async def _no_positions(*_a, **_k):
+        return []
+
+    async def _find_none(coid, ticker=""):
+        return None
+
+    monkeypatch.setattr(trader, "get_positions", _no_positions)
+    monkeypatch.setattr(trader, "find_order_by_client_id", _find_none)
+
+    for _ in range(6):
+        run_async(trader.poll_open_orders(cfg))
+    assert fetch(pid)["status"] == "gone"
+
+
+def test_resolve_defers_fresh_gone_rows_to_poll_window(fresh_db, env_demo, cfg):
+    # 'gone' is a give-up, not a confirmed state: the resolution pass must
+    # not flat-resolve it while the 24h re-poll retention can still recover a
+    # live order (resolving also blocks the reconcile import for 24h more).
+    pid = seed_position(status="gone", filled_contracts=0, cost_usd=0.0)
+
+    run_async(trader.mark_resolved_positions(cfg))
+    assert fetch(pid)["resolved"] == 0           # left inside the window
+
+    with db.get_db() as conn:
+        conn.execute(
+            "UPDATE bot_positions SET created_at=datetime('now','-25 hours') WHERE id=?",
+            (pid,))
+    run_async(trader.mark_resolved_positions(cfg))
+    assert fetch(pid)["resolved"] == 1           # retention elapsed -> closed
+
+
+def test_pending_query_is_env_scoped(fresh_db):
+    # Cross-env leak: the poll signs for the CURRENT env; feeding it the
+    # other env's rows 404-killed live orders on every env switch.
+    seed_position(status="submitted", kalshi_order_id="OID-D1", kalshi_env="demo")
+    seed_position(status="submitted", kalshi_order_id="OID-P1", kalshi_env="production")
+    with db.get_db() as conn:
+        demo = db.get_pending_bot_positions(conn, "demo")
+        both = db.get_pending_bot_positions(conn)
+    assert [r["kalshi_order_id"] for r in demo] == ["OID-D1"]
+    assert len(both) == 2                        # no-env call keeps old shape
+
+
 def test_refresh_balance_is_per_env(monkeypatch):
     trader._balance_cache.clear()
 

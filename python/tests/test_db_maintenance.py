@@ -147,3 +147,37 @@ def test_pnl_snapshots_query_downsamples(fresh_db):
     with db.get_db() as conn:
         rows_1h = db.get_pnl_snapshots(conn, since_hours=1, env="demo", max_points=0)
     assert 55 <= len(rows_1h) <= 62  # ~one per minute for the last hour
+
+
+def test_pnl_prune_keeps_alltime_anchor_snapshot(fresh_db):
+    # The 45-day pnl_snapshots prune used to delete the first-ever snapshot,
+    # so earliest_pnl_total (the "all-time" P&L/ROI baseline) silently rotated
+    # into a trailing-45-day window. One anchor row per env — the first
+    # POSITIVE-total snapshot — must survive every prune ($0 cold-cache rows
+    # must not be anchored).
+    with db.get_db() as c:
+        for total, at in [
+            (0.0, "-100 days"),    # cold-cache row: prunable, never an anchor
+            (200.0, "-99 days"),   # first positive row: THE anchor
+            (180.0, "-98 days"),   # stale mid-history row: prunable
+        ]:
+            c.execute(
+                "INSERT INTO pnl_snapshots (at, kalshi_env, cash_usd, "
+                "portfolio_usd, total_usd) VALUES (datetime('now', ?), 'demo', ?, 0, ?)",
+                (at, total, total),
+            )
+        c.execute(
+            "INSERT INTO pnl_snapshots (kalshi_env, cash_usd, portfolio_usd, "
+            "total_usd) VALUES ('demo', 120.0, 0, 120.0)",
+        )
+
+    db.cleanup_old_data()
+
+    with db.get_db() as c:
+        totals = [
+            float(r["total_usd"])
+            for r in c.execute("SELECT total_usd FROM pnl_snapshots ORDER BY id")
+        ]
+        earliest = db.earliest_pnl_total(c, "demo")
+    assert totals == [200.0, 120.0]          # anchor + recent survive
+    assert earliest == pytest.approx(200.0)  # all-time baseline is stable

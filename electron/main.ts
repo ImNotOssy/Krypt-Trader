@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, screen, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, screen, session, shell } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendLog, broadcastState, registerIpc } from './ipc';
@@ -323,6 +323,19 @@ async function toggleTradingFromTray(): Promise<void> {
     try {
       await pythonBackend.request('setConfig', { config: next.config });
     } catch {
+      // The tray has no toast surface — without this the engine can keep
+      // trading (or stay stopped) while the tray checkmark says otherwise.
+      const msg =
+        'Trading toggle saved, but the backend did not confirm it — the engine may still be '
+        + (cur.config.enableTrading ? 'running' : 'stopped')
+        + '. Check the Logs page.';
+      appendLog({
+        ts: new Date().toISOString(), level: 'WARN', source: 'main',
+        msg: `tray toggle: ${msg}`,
+      });
+      if (Notification.isSupported()) {
+        new Notification({ title: 'Krypt Trader', body: msg }).show();
+      }
     }
   }
   rebuildTray({

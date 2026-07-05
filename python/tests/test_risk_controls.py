@@ -233,7 +233,6 @@ def test_reconcile_closes_orphan_gone_from_kalshi(fresh_db, monkeypatch):
         pid = db.insert_bot_position(conn, _pos(
             signal_id="orph", client_order_id="orph", ticker="KXBTC-OLD",
             direction="yes", status="filled", filled_contracts=10, cost_usd=5.0))
-        # Backdate so it isn't treated as a fresh fill (which needs a 2nd miss).
         conn.execute(
             "UPDATE bot_positions SET created_at=datetime('now','-1 hour') WHERE id=?",
             (pid,))
@@ -242,9 +241,16 @@ def test_reconcile_closes_orphan_gone_from_kalshi(fresh_db, monkeypatch):
         {"ticker": "KXOTHER-X", "position": 3, "market_exposure": 150},
     ], market=None)
 
-    summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+    # EVERY orphan-close now needs a confirming second consecutive miss — a
+    # single incomplete (but otherwise healthy-looking) positions response
+    # used to close real held positions on the spot.
+    s1, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+    assert s1["closed_orphans"] == 0
+    with db.get_db() as conn:
+        assert db.fetch_position_by_id(conn, pid)["resolved"] == 0
 
-    assert summary["closed_orphans"] == 1
+    s2, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+    assert s2["closed_orphans"] == 1
     with db.get_db() as conn:
         row = db.fetch_position_by_id(conn, pid)
     assert row["resolved"] == 1
@@ -266,9 +272,11 @@ def test_reconcile_defers_orphan_pending_settlement(fresh_db, monkeypatch):
         {"ticker": "KXOTHER-X", "position": 3, "market_exposure": 150},
     ], market={"status": "closed"})  # closed, no settlement_value yet
 
-    summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
-
-    assert summary["closed_orphans"] == 0  # deferred, not closed
+    # Two runs so the miss-streak passes the debounce and the DEFER branch
+    # itself is what keeps the position open.
+    for _ in range(2):
+        summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+        assert summary["closed_orphans"] == 0  # deferred, not closed
     with db.get_db() as conn:
         assert db.fetch_position_by_id(conn, pid)["resolved"] == 0
 
@@ -414,7 +422,7 @@ def test_daily_stop_ignores_transient_settlement_gap(fresh_db, monkeypatch):
     cfg = _risk_cfg(stop_loss_on_day=-5.0)
     assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
     # …but one that has PERSISTED past the window does gate…
-    trader._day_risk_breach[("demo", "sl")] = trader.time.monotonic() - 181.0
+    trader._day_risk_breach[("demo", "sl")] = trader.time.time() - 181.0
     blocked, why = trader._is_blocked_by_daily_risk(cfg, "demo")
     assert blocked is True and "stop-loss" in why
     # …breach streaks are per-env: production is untouched by demo's streak…
@@ -445,3 +453,223 @@ def test_open_unrealized_pnl_uses_marks(fresh_db):
         })
         # 10 × $0.55 − $8.00 = −$2.50
         assert db.open_unrealized_pnl_usd(conn, "demo") == pytest.approx(-2.50)
+
+
+# ───────── swarm-audit regressions: reconcile / caps / daily-stop ─────────
+
+
+def test_reconcile_treats_truncated_snapshot_as_failed(fresh_db, monkeypatch):
+    # get_positions raises KalshiTruncatedResult at its page cap instead of
+    # returning a partial list — reconcile must abort (no orphan-closing off
+    # an incomplete snapshot), no matter how many times it happens (the
+    # truncation is persistent across polls, so a miss-debounce can't help).
+    from kalshi_api import KalshiTruncatedResult
+
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="tr", client_order_id="tr", ticker="KXTRUNC-1",
+            direction="yes", status="filled", filled_contracts=10, cost_usd=5.0))
+        conn.execute(
+            "UPDATE bot_positions SET created_at=datetime('now','-1 hour') WHERE id=?",
+            (pid,))
+    monkeypatch.setattr(trader, "get_env", lambda: "demo")
+
+    async def _gp(limit=1000):
+        raise KalshiTruncatedResult("page cap hit with rows remaining")
+
+    monkeypatch.setattr(trader, "get_positions", _gp)
+    trader._orphan_miss_streak.clear()
+
+    for _ in range(3):
+        summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+        assert summary["closed_orphans"] == 0
+    with db.get_db() as conn:
+        assert db.fetch_position_by_id(conn, pid)["resolved"] == 0
+
+
+def test_reconcile_keeps_working_partial_as_partial(fresh_db, monkeypatch):
+    # A 6-of-10 partial whose remainder legitimately rests on Kalshi must NOT
+    # be flipped to 'filled': that freed the remainder's committed notional
+    # from the exposure cap and dropped the live order out of the poll's
+    # pending set (and out of cancel_all's selector).
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="wp", client_order_id="wp", ticker="KXPART-1",
+            direction="yes", status="submitted",
+            target_contracts=10, limit_price_cents=60,
+            filled_contracts=0, cost_usd=0.0))
+    _mock_kalshi(monkeypatch, [
+        {"ticker": "KXPART-1", "position": 6, "market_exposure": 360},
+    ])
+
+    asyncio.run(trader.reconcile_positions_with_kalshi())
+
+    with db.get_db() as conn:
+        row = db.fetch_position_by_id(conn, pid)
+        exposure = db.current_total_exposure_usd(conn, "demo")
+        pending_ids = [p["id"] for p in db.get_pending_bot_positions(conn, "demo")]
+    assert row["status"] == "partial"           # NOT 'filled'
+    assert row["filled_contracts"] == 6
+    assert row["cost_usd"] == pytest.approx(3.6)
+    assert exposure == pytest.approx(6.0)       # full committed notional (10 × 60c)
+    assert pid in pending_ids                   # poll keeps watching the order
+
+
+def test_reconcile_flips_completed_order_to_filled(fresh_db, monkeypatch):
+    # Sanity: once the held quantity reaches the target, the flip is correct.
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="fp", client_order_id="fp", ticker="KXPART-2",
+            direction="yes", status="partial",
+            target_contracts=10, limit_price_cents=60,
+            filled_contracts=6, cost_usd=3.6))
+    _mock_kalshi(monkeypatch, [
+        {"ticker": "KXPART-2", "position": 10, "market_exposure": 600},
+    ])
+
+    asyncio.run(trader.reconcile_positions_with_kalshi())
+
+    with db.get_db() as conn:
+        row = db.fetch_position_by_id(conn, pid)
+        exposure = db.current_total_exposure_usd(conn, "demo")
+    assert row["status"] == "filled"
+    assert row["filled_contracts"] == 10
+    assert exposure == pytest.approx(6.0)       # valued at cost once filled
+
+
+def test_reconcile_relinks_wrongly_resolved_row_instead_of_external(fresh_db, monkeypatch):
+    # A still-held position whose row was flat-resolved by mistake (orphan
+    # close of an active market / 0-fill give-up over a raced fill) used to
+    # re-import after 24h as signal_source='external' — permanently exempt
+    # from max_open_positions. It must re-link the original row instead.
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="rl", client_order_id="rl", ticker="KXRELINK-1",
+            direction="yes", status="filled", filled_contracts=10, cost_usd=5.0))
+        db.update_bot_position(
+            conn, pid, status="gone", resolved=1,
+            outcome_correct=None, pnl_usd=0.0, settlement_usd=0.0)
+        conn.execute(
+            "UPDATE bot_positions SET resolved_at=datetime('now','-2 days') WHERE id=?",
+            (pid,))
+    _mock_kalshi(monkeypatch, [
+        {"ticker": "KXRELINK-1", "position": 10, "market_exposure": 500},
+    ])
+
+    summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+
+    assert summary["imported_unknowns"] == 0
+    assert summary["resurrected"] == 1
+    with db.get_db() as conn:
+        row = db.fetch_position_by_id(conn, pid)
+        n_rows = conn.execute("SELECT COUNT(*) FROM bot_positions").fetchone()[0]
+        open_count = db.count_open_bot_positions(conn, "demo")
+    assert n_rows == 1                          # no external duplicate
+    assert row["resolved"] == 0
+    assert row["status"] == "filled"
+    assert open_count == 1                      # back inside the cap
+
+
+def test_reconcile_relinks_within_24h_window_too(fresh_db, monkeypatch):
+    # Inside the 24h skip-import window the position used to be fully
+    # invisible (no cap slot, no exposure, no stop management). The re-link
+    # must fire immediately instead.
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="rl2", client_order_id="rl2", ticker="KXRELINK-2",
+            direction="yes", status="gone", filled_contracts=10, cost_usd=5.0))
+        db.update_bot_position(
+            conn, pid, resolved=1, outcome_correct=None,
+            pnl_usd=0.0, settlement_usd=0.0)
+        conn.execute(
+            "UPDATE bot_positions SET resolved_at=datetime('now') WHERE id=?", (pid,))
+    _mock_kalshi(monkeypatch, [
+        {"ticker": "KXRELINK-2", "position": 10, "market_exposure": 500},
+    ])
+
+    summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+
+    assert summary["resurrected"] == 1
+    with db.get_db() as conn:
+        assert db.count_open_bot_positions(conn, "demo") == 1
+
+
+def test_reconcile_does_not_relink_genuinely_settled_row(fresh_db, monkeypatch):
+    # A row resolved with REAL P&L (a loss here) while Kalshi's book hasn't
+    # dropped the position yet is the legit cash-settlement-pending case: no
+    # re-link, no unresolve (the 24h skip-import guard handles it).
+    with db.get_db() as conn:
+        pid = db.insert_bot_position(conn, _pos(
+            signal_id="st", client_order_id="st", ticker="KXSETTLED-1",
+            direction="yes", status="filled", filled_contracts=10, cost_usd=5.0))
+        db.update_bot_position(
+            conn, pid, resolved=1, outcome_correct=0,
+            pnl_usd=-5.0, settlement_usd=0.0)
+        conn.execute(
+            "UPDATE bot_positions SET resolved_at=datetime('now') WHERE id=?", (pid,))
+    _mock_kalshi(monkeypatch, [
+        {"ticker": "KXSETTLED-1", "position": 10, "market_exposure": 500},
+    ])
+
+    summary, _ = asyncio.run(trader.reconcile_positions_with_kalshi())
+
+    assert summary["resurrected"] == 0
+    assert summary["imported_unknowns"] == 0    # skip-import (recent resolve)
+    with db.get_db() as conn:
+        row = db.fetch_position_by_id(conn, pid)
+        n_rows = conn.execute("SELECT COUNT(*) FROM bot_positions").fetchone()[0]
+    assert row["resolved"] == 1                 # untouched
+    assert n_rows == 1
+
+
+def test_c15_partial_exit_counts_residual_cost_only(fresh_db):
+    # 10 @ 90c ($9.00), stop-loss sells 6 before the chase cancels the rest:
+    # the 6 sold contracts' proceeds are already CASH in the Kalshi balance,
+    # so held value must drop to the 4 residual contracts ($3.60) — counting
+    # all $9.00 overstated the account total by sold × entry cost, reading as
+    # phantom profit to the daily stop-loss right after a half-failed stop.
+    with db.get_db() as conn:
+        pid = db.insert_crypto15m_position(conn, {
+            "asset": "BTC", "series": "KXBTC15M", "ticker": "KXBTC15M-T9",
+            "side": "yes", "direction": "yes", "target_contracts": 10,
+            "filled_contracts": 10, "entry_limit_cents": 90, "avg_entry_cents": 90,
+            "cost_usd": 9.0, "client_order_id": "c15-px", "kalshi_order_id": "E9",
+            "status": "filled", "close_time": "", "confidence": 0,
+            "entry_delta_usd": 0, "kalshi_env": "demo", "dry_run": 0, "error": None,
+        })
+        conn.execute(
+            "UPDATE crypto15m_positions SET exit_filled_contracts=6, "
+            "status='exiting', proceeds_usd=2.4 WHERE id=?", (pid,))
+        cost = db.open_crypto15m_filled_cost_usd(conn, "demo")
+    assert cost == pytest.approx(3.6)
+
+
+def test_daily_stop_breach_survives_restart(fresh_db, monkeypatch):
+    # The 180s persistence window lived only in a module dict — a backend
+    # restart mid-breach re-enabled both engines until the timer re-elapsed.
+    # The first-breach stamp is now persisted per (env, kind) and restored.
+    monkeypatch.setattr(trader, "_DAY_RISK_PERSIST_SEC", 180.0)
+    trader._day_risk_breach.clear()
+    monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: -60.0)
+    monkeypatch.setattr(db, "open_unrealized_pnl_usd", lambda conn, env: 0.0)
+    cfg = _risk_cfg()  # flat stop at -$50
+
+    # Breach observed; window just started -> not yet gated.
+    assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
+    with db.get_db() as conn:
+        assert db.get_risk_breach_start(conn, "demo", "sl") is not None
+
+    # Simulate a restart mid-breach: in-memory streak wiped; the persisted
+    # stamp (past the window) must keep the gate SHUT immediately.
+    trader._day_risk_breach.clear()
+    with db.get_db() as conn:
+        db.set_risk_breach_start(conn, "demo", "sl", trader.time.time() - 300.0)
+    blocked, why = trader._is_blocked_by_daily_risk(cfg, "demo")
+    assert blocked is True and "stop-loss" in why
+
+    # Recovery clears BOTH the in-memory and the persisted latch.
+    monkeypatch.setattr(trader, "_today_pnl_balance_delta", lambda env, off=0: +1.0)
+    assert trader._is_blocked_by_daily_risk(cfg, "demo")[0] is False
+    with db.get_db() as conn:
+        assert db.get_risk_breach_start(conn, "demo", "sl") is None
+    trader._day_risk_breach.clear()

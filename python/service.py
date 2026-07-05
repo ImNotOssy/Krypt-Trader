@@ -1100,10 +1100,17 @@ async def _h_setConfig(p: dict) -> dict:
         f"env={cfg.get('kalshi_env')}"
     )
     new_env = cfg.get("kalshi_env", "demo")
-    # Hold ENV_LOCK across the env flip + its verifying balance fetch so a
-    # concurrent credential test can't desync the global signing env (which would
-    # route a live order to the wrong account). refresh_balance below takes the
-    # same (non-reentrant) lock, so it must run AFTER this block, not inside it.
+    # Hold ENV_LOCK across the env flip so a concurrent credential test can't
+    # desync the global signing env (which would route a live order to the
+    # wrong account). Only the FAST parts run inside the lock: the clock-sync
+    # HEAD is a blocking 5s-timeout call that froze the whole event loop (all
+    # RPCs, WS handling, the 15m stop-loss cadence) when run inline here, so —
+    # mirroring _reverify_auth_if_needed — it runs via asyncio.to_thread after
+    # release, and the verifying balance fetch is pinned to new_env so a
+    # concurrent env flip aborts it instead of misrouting it. refresh_balance
+    # below takes the same (non-reentrant) lock, so it must also run AFTER
+    # this block, not inside it.
+    verify_auth = False
     async with kalshi_auth.ENV_LOCK:
         prev_env = kalshi_auth.get_env()
         kalshi_auth.set_env(new_env)
@@ -1112,15 +1119,23 @@ async def _h_setConfig(p: dict) -> dict:
             kalshi_auth.reset_credential_cache()
             if kalshi_auth.credentials_present(new_env):
                 try:
-                    kalshi_auth.prime_credentials(sync_time=True)
-                    bal = await kalshi_api.get_balance()
-                    int(bal.get("balance", 0))
-                    STATE.auth_ok = True
+                    kalshi_auth.prime_credentials(sync_time=False)
+                    verify_auth = True
                 except Exception as e:
                     logger.warning(f"env-switch auth failed: {e}")
                     STATE.auth_ok = False
             else:
                 STATE.auth_ok = False
+
+    if env_changed and verify_auth:
+        try:
+            await asyncio.to_thread(kalshi_auth.sync_server_time, True)
+            bal = await kalshi_api.get_balance(pin_env=new_env)
+            int(bal.get("balance", 0))
+            STATE.auth_ok = True
+        except Exception as e:
+            logger.warning(f"env-switch auth failed: {e}")
+            STATE.auth_ok = False
 
     if env_changed:
         await emit_event("backend:authChanged", {"authOk": STATE.auth_ok})
@@ -1181,7 +1196,14 @@ async def _h_testCredentials(p: dict) -> dict:
             kalshi_auth.set_env(target_env)
         kalshi_auth.reset_credential_cache()
         try:
-            kalshi_auth.prime_credentials(sync_time=True)
+            # Prime WITHOUT the inline clock-sync HEAD, then run the HEAD via
+            # asyncio.to_thread: the blocking 5s-timeout call froze the whole
+            # event loop (RPCs, WS, the 15m stop-loss cadence) for its full
+            # duration — exactly during the degraded-network conditions that
+            # make it slow. The lock stays held (the global env is temporarily
+            # flipped), but the loop keeps running.
+            kalshi_auth.prime_credentials(sync_time=False)
+            await asyncio.to_thread(kalshi_auth.sync_server_time, True)
             bal = await kalshi_api.get_balance()
         finally:
             if target_env != saved_env:

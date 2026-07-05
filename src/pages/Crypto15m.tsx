@@ -148,8 +148,16 @@ export function Crypto15mPage() {
           )}
           <ModePill mode={mode} />
           <div className="flex items-center gap-4 text-xs">
-            <KV label="Size" value={`${status?.orderSize ?? 1}c`} />
-            <KV label="Max open" value={`${status?.maxConcurrent ?? 7}`} />
+            {/* In balance_pct mode the engine sizes each entry from the live
+                bankroll and ignores orderSize — show the sizing it enforces. */}
+            <KV
+              label="Size"
+              value={status?.sizing?.mode === 'balance_pct'
+                ? `${(status.sizing.balancePct * 100).toFixed(1)}% bal`
+                  + (status.sizing.balanceUsd > 0 ? ` (~${status.sizing.estContracts}c)` : '')
+                : `${status?.orderSize ?? 1}c`}
+            />
+            <KV label="Max open" value={`${status?.maxConcurrent ?? 3}`} />
             <KV label="Open" value={`${status?.stats.openCount ?? 0}`} />
             <KV label="W / L" value={`${status?.stats.wins ?? 0} / ${status?.stats.losses ?? 0}`} />
             <KV

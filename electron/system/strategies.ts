@@ -14,7 +14,10 @@ export const BUILTIN_STRATEGIES: StrategyPreset[] = [
     description:
       "EXPERIMENTAL — a later audit over 13,700 resolved signals measured this preset's whale leg net-NEGATIVE after fees (crypto whales underperform their own entry price) and its momentum leg at exactly zero. The early +15.6¢ result (n=81) did not survive the larger sample. Kept for experimentation only; do not size real money on it, and paper-trade anything before arming.",
     riskLabel: 'experimental',
-    backtest: { netCents: 15.6, t: 3.2, n: 81 },
+    // The early +15.6c chip (t=3.2, n=81) did not survive the 13.7k-signal
+    // audit (whale leg net-negative, momentum leg zero) — no honest number to
+    // show, so no chip: null renders the card unranked like Secret Strategy.
+    backtest: null,
     config: merge({
       tradeWhales: true,
       tradeMomentum: true,

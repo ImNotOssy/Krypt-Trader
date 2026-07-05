@@ -1325,6 +1325,27 @@ def test_aggregate_15m_cap_blocks_when_exhausted(fresh_db, env_prod, cfg, monkey
     assert out is None and calls == []   # (100+12)·10% − 12 < one contract
 
 
+def test_aggregate_15m_cap_does_not_double_count_resting_orders(fresh_db, env_prod, cfg, monkeypatch):
+    _live_cfg(cfg)
+    cfg["crypto15m_max_total_pct"] = 0.10
+    cfg["crypto15m_order_size"] = 50
+    # $8.80 of entry notional RESTING (submitted, 0 filled) on another asset.
+    # Kalshi does not hold cash for resting orders, so that $8.80 is still
+    # inside balance_usd — the bankroll must stay $100, not $108.80.
+    _seed_c15(status="submitted", asset="ETH", ticker="KXETH15M-T9",
+              target_contracts=10, filled_contracts=0, cost_usd=0.0,
+              entry_limit_cents=88, kalshi_env="production")
+    calls = _capture_orders(monkeypatch)
+
+    run_async(ct._open_entry(signal_asset(), cfg, "production", 100.0))
+
+    # budget = 100·10% − 8.80 committed = 1.20 → 1 contract @ the 88c limit.
+    # The old (balance + committed)·pct math computed 2.08 → 2 contracts,
+    # overshooting the configured cap by resting_notional × cap_pct.
+    assert len(calls) == 1
+    assert calls[0]["count"] == 1
+
+
 def test_aggregate_15m_cap_off_without_balance(fresh_db, env_prod, cfg, monkeypatch):
     # No balance available (unauthed / cold cache) → the cap can't be computed;
     # sizing falls back to the per-bet limits rather than blocking everything.

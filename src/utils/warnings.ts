@@ -19,6 +19,21 @@ const MIN_CYCLE_BALANCE_USD = 5;
 
 const isEmptyArr = (a: unknown): boolean => Array.isArray(a) && a.length === 0;
 
+// Keep in sync with KRYPT_CATEGORIES in src/pages/Settings.tsx.
+const ALL_CATEGORIES = ['sports', 'politics', 'economics', 'crypto', 'climate', 'entertainment', 'world', 'exotics'];
+
+/**
+ * Categories the global toggles allow but a per-source preset list still blocks.
+ * The trader ANDs allowedWhaleCategories/allowedMomentumCategories with the
+ * global allowedCategories, so a non-null per-source list silently filters
+ * signals even when Settings shows every category enabled.
+ */
+const shadowBlocked = (perSource: string[] | null | undefined, global: string[] | null): string[] => {
+  if (!Array.isArray(perSource) || perSource.length === 0) return []; // null = no per-source filter; [] flagged as a block above
+  const allow = new Set(perSource);
+  return (global ?? ALL_CATEGORIES).filter((c) => !allow.has(c));
+};
+
 /**
  * Catch configurations/balances that would silently never trade, so the UI can
  * warn the user instead of leaving them staring at a quiet bot. Conservative:
@@ -53,6 +68,26 @@ export function computeTradeWarnings(
   if (config.tradeMomentum && isEmptyArr(config.allowedMomentumSignalTypes)) {
     out.push({ id: 'no-mom-types', severity: 'block', ...toSettings,
       message: 'Momentum is on but no signal types are allowed — momentum can never trade.' });
+  }
+
+  // Hidden per-source category lists installed by strategy presets: they AND
+  // with the global toggles, so signals drop even when Settings shows every
+  // category on. Surface them or the state is undiagnosable from the UI.
+  const whaleShadow = config.tradeWhales
+    ? shadowBlocked(config.allowedWhaleCategories, config.allowedCategories) : [];
+  if (whaleShadow.length > 0) {
+    out.push({ id: 'whale-cats-shadow', severity: 'warn', ...toSettings,
+      message: `A strategy preset limits whale trades to ${(config.allowedWhaleCategories ?? []).join(', ')} — `
+        + `${whaleShadow.join(', ')} whale signals are blocked even with their category toggles on. `
+        + 'Re-pick categories in Settings to clear it.' });
+  }
+  const momShadow = config.tradeMomentum
+    ? shadowBlocked(config.allowedMomentumCategories, config.allowedCategories) : [];
+  if (momShadow.length > 0) {
+    out.push({ id: 'mom-cats-shadow', severity: 'warn', ...toSettings,
+      message: `A strategy preset limits momentum trades to ${(config.allowedMomentumCategories ?? []).join(', ')} — `
+        + `${momShadow.join(', ')} momentum signals are blocked even with their category toggles on. `
+        + 'Re-pick categories in Settings to clear it.' });
   }
 
   // ── Inverted ranges ───────────────────────────────────────────────────────

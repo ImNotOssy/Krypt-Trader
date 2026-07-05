@@ -9,7 +9,8 @@ import db
 import kalshi_api
 import kalshi_ws
 from categorize import (
-    CATEGORY_EDGE, KALSHI_CATEGORY_MAP, categorize_by_keywords, is_micro_market,
+    CATEGORY_EDGE, KALSHI_CATEGORY_MAP, KALSHI_CATEGORY_MAP_CI,
+    categorize_by_keywords, is_micro_market,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,7 +102,23 @@ async def _resolve_category(ticker: str, title: str = "") -> str:
         if series:
             raw = series.get("category", "")
             if raw:
-                return KALSHI_CATEGORY_MAP.get(raw, raw.lower())
+                mapped = KALSHI_CATEGORY_MAP.get(raw) or KALSHI_CATEGORY_MAP_CI.get(
+                    raw.strip().lower()
+                )
+                if mapped:
+                    return mapped
+                # Unmapped Kalshi category: DON'T pass the raw string through.
+                # The category gate (trader.should_trade) and the Settings
+                # picker only know the canonical ids, so a raw slug became an
+                # untoggleable bucket that any specific category selection
+                # silently deny-listed. Bucket by keywords instead — always a
+                # representable, toggleable id — and say so in the log.
+                fallback = categorize_by_keywords(title)
+                logger.info(
+                    f"unmapped Kalshi category {raw!r} for series {series_ticker}; "
+                    f"bucketing as {fallback!r} via keywords"
+                )
+                return fallback
     return categorize_by_keywords(title)
 
 
@@ -316,7 +333,17 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
         count_fp = _to_float(t.get("count_fp", 0))
         yes_p = _to_float(t.get("yes_price_dollars", 0))
         no_p = _to_float(t.get("no_price_dollars", 0))
-        side = t.get("taker_side", "")
+        side = (t.get("taker_side") or "").lower()
+        if side not in ("yes", "no"):
+            # A side-less tape row (WS stamps '' when the field is absent)
+            # can't be handled consistently: this scorer would price it as NO
+            # while the executor (trader._signal_cost_cents) defaults '' to a
+            # YES buy — the wrong side at the wrong cost basis — and
+            # resolution could never mark it correct. Skip it outright.
+            logger.debug(
+                f"skip tape trade {t.get('trade_id', '')!r}: missing taker_side"
+            )
+            continue
         price = yes_p if side == "yes" else no_p
         dollar = count_fp * price
         if dollar < min_usd:
@@ -507,6 +534,17 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 )
 
     with db.get_db() as conn:
+        # Save THIS scan's snapshot for every market FIRST, so the rn=2 row the
+        # bulk baseline query returns is the PREVIOUS scan's snapshot. The old
+        # order (read rn=2, then save) meant rn=1 was already the previous scan
+        # at read time, so deltas were measured against the snapshot from TWO
+        # scans ago — a doubled window that fired the price-move/vol-spike
+        # thresholds on drifts half as fast as tuned, and delayed a fresh
+        # ticker's first delta by one scan.
+        for market in markets:
+            tk = market.get("ticker")
+            if tk and not is_micro_market(tk):
+                db.save_snapshot(conn, tk, market)
         # Bulk-load the previous snapshot for every market in ONE query instead
         # of a per-market lookup inside the loop (was a ~500× N+1 on a table
         # that grows every scan).
@@ -533,8 +571,6 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 if prev
                 else 0
             )
-
-            db.save_snapshot(conn, ticker, market)
 
             vol_spike = (vol_24h / prev_vol) if prev_vol > 10 else 0
             price_change = (cur_price - prev_price) if prev_price > 0 else 0

@@ -575,14 +575,19 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
         order_size=max(1, int(cfg.get("crypto15m_order_size", 1))),
     )
     # Aggregate 15m exposure cap: the assets' windows are one correlated crypto
-    # bet, so total committed 15m cost is capped at a fraction of the bankroll
-    # (cash + already-committed 15m cost). Trim the order to the remaining
-    # budget rather than skipping outright.
+    # bet, so total committed 15m cost is capped at a fraction of the bankroll.
+    # Bankroll = cash + FILLED 15m cost only: Kalshi's balance is NOT reduced
+    # by resting orders (see trader.refresh_balance), so counting resting entry
+    # notional in the bankroll too counted that cash twice and loosened the cap
+    # by resting_notional × cap_pct. The full committed total (filled + resting)
+    # still consumes the budget. Trim the order to the remaining budget rather
+    # than skipping outright.
     cap_pct = _clamp01(cfg.get("crypto15m_max_total_pct", 0.0))
     if cap_pct > 0 and balance_usd > 0:
         with db.get_db() as conn:
             committed = db.open_crypto15m_committed_usd(conn, env)
-        budget = (balance_usd + committed) * cap_pct - committed
+            filled_cost = db.open_crypto15m_filled_cost_usd(conn, env)
+        budget = (balance_usd + filled_cost) * cap_pct - committed
         price = max(0.01, limit_cents / 100.0)
         order_size = min(order_size, int(max(0.0, budget) // price))
         if order_size < 1:
@@ -1561,11 +1566,15 @@ async def _run_pairs(
             if not ok:
                 continue
             limit_cents = max(1, min(99, int(round(ask_c)) + 1))  # marketable taker
-            # Aggregate 15m budget applies to pair legs too.
+            # Aggregate 15m budget applies to pair legs too. Bankroll = cash +
+            # FILLED cost only (resting-order cash is still inside balance_usd
+            # — Kalshi doesn't hold cash for resting orders); the full
+            # committed total (filled + resting) still consumes the budget.
             if cap_pct > 0 and balance_usd > 0:
                 with db.get_db() as conn:
                     committed = db.open_crypto15m_committed_usd(conn, env)
-                budget = (balance_usd + committed) * cap_pct - committed
+                    filled_cost = db.open_crypto15m_filled_cost_usd(conn, env)
+                budget = (balance_usd + filled_cost) * cap_pct - committed
                 if count * limit_cents / 100.0 > budget:
                     logger.info(
                         f"[pairs] skip {sym} {direction}: aggregate 15m cap "

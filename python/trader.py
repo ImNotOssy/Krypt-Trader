@@ -359,20 +359,50 @@ def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
 # settlement. A genuine drawdown keeps breaching and gates ~3 minutes
 # later; a money-in-flight dip self-heals first.
 _DAY_RISK_PERSIST_SEC = 180.0
-# (env, kind) -> monotonic first-breach. Keyed by env so a demo<->production
-# switch can't transfer or destroy a live breach streak.
+# (env, kind) -> wall-clock (unix seconds) first-breach. Keyed by env so a
+# demo<->production switch can't transfer or destroy a live breach streak.
+# None = known-cleared; a MISSING key = unknown (fresh process), which is when
+# the persisted copy in db.risk_state is consulted — the in-memory dict alone
+# meant any backend restart mid-breach re-enabled both engines for another
+# 180s while the account sat past its daily limit (and restarting the app is
+# exactly what a user does after a losing streak).
 _day_risk_breach: dict = {}
 
 
 def _breach_persists(env: str, kind: str, breached: bool) -> bool:
-    now = time.monotonic()
+    now = time.time()
     key = (env, kind)
     if not breached:
-        _day_risk_breach[key] = None
+        # Clear the persisted latch too, but only on a transition (or on the
+        # first observation after boot) so the hot path stays DB-free.
+        if key not in _day_risk_breach or _day_risk_breach[key] is not None:
+            _day_risk_breach[key] = None
+            try:
+                with db.get_db() as conn:
+                    db.set_risk_breach_start(conn, env, kind, None)
+            except Exception:
+                pass
         return False
-    if _day_risk_breach.get(key) is None:
-        _day_risk_breach[key] = now
-    return (now - _day_risk_breach[key]) >= _DAY_RISK_PERSIST_SEC
+    first = _day_risk_breach.get(key)
+    if first is None:
+        persisted = None
+        if key not in _day_risk_breach:
+            # Fresh process observing an ongoing breach — restore the
+            # persisted first-breach stamp instead of restarting the window.
+            try:
+                with db.get_db() as conn:
+                    persisted = db.get_risk_breach_start(conn, env, kind)
+            except Exception:
+                persisted = None
+        first = float(persisted) if (persisted and persisted <= now) else now
+        _day_risk_breach[key] = first
+        if persisted != first:
+            try:
+                with db.get_db() as conn:
+                    db.set_risk_breach_start(conn, env, kind, first)
+            except Exception:
+                pass
+    return (now - first) >= _DAY_RISK_PERSIST_SEC
 
 
 def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
@@ -592,7 +622,22 @@ async def execute_signal(
         # booking an error, or the resting order becomes an invisible position
         # that fills hours later on a stale limit while the engine re-fires
         # the same signal (double position).
-        if e.status and 400 <= int(e.status) < 500:
+        #
+        # EXCEPTION: a duplicate client_order_id rejection is NOT "not
+        # placed" — the transport layer retries a timed-out POST with the
+        # SAME coid, so "duplicate" means attempt 1 WAS delivered and the
+        # order is live (the exact shape crypto15m's entry path guards
+        # against). Same for the synthesized env-flip 409: attempt 1 may have
+        # been delivered before the abort. Route both through the coid-lookup
+        # recovery instead of booking a phantom 'error' row that hides a live
+        # order from the exposure/open-count/dup-market caps.
+        body_l = str(e.body).lower()
+        maybe_delivered = (
+            "duplicate" in body_l
+            or ("client_order_id" in body_l and "exist" in body_l)
+            or (e.status == 409 and "env_changed" in body_l)
+        )
+        if e.status and 400 <= int(e.status) < 500 and not maybe_delivered:
             row["status"] = "error"
             row["error"] = f"HTTP {e.status}: {str(e.body)[:200]}"
             logger.error(f"[ORDER-FAIL] {signal['ticker']}: {row['error']}")
@@ -625,14 +670,24 @@ async def _book_lost_entry(
     """An entry POST raised but may have been delivered. Adopt the live order
     if the coid lookup finds it; book 'error' only on a confirmed miss. On an
     unconfirmable lookup, book 'submitted' with no order id — the poll loop's
-    NULL-kid recovery resolves it rather than letting the signal re-fire."""
+    NULL-kid recovery resolves it rather than letting the signal re-fire.
+
+    A confirmed miss requires looking in the env the order was SENT to: after
+    an env flip the current credentials query the other account, where the
+    order can never appear — that's an unconfirmable lookup, not a miss. The
+    row stays 'submitted' and the env-scoped poll resolves it when its env is
+    active again."""
     found = None
     confirmed = False
-    try:
-        found = await find_order_by_client_id(client_order_id, ticker=signal["ticker"])
-        confirmed = True
-    except Exception:
-        pass
+    row_env = row.get("kalshi_env")
+    if not row_env or row_env == get_env():
+        try:
+            found = await find_order_by_client_id(
+                client_order_id, ticker=signal["ticker"], pin_env=row_env,
+            )
+            confirmed = True
+        except Exception:
+            pass
     if found:
         row["status"] = "submitted"
         row["kalshi_order_id"] = found.get("order_id")
@@ -953,10 +1008,31 @@ def _db_status_from_order(parsed: dict, target: int) -> str:
 _poll_failures: dict[int, int] = {}
 _POLL_FAILURE_THRESHOLD = 6
 
+# Reentrancy guard: the UI's Refresh triggers runOnce('pollOrders') as its own
+# asyncio task, concurrent with the main loop's poll. Two unserialized polls
+# read the same expired 'submitted' row, both cancel it, and the loser's 404
+# used to book 'gone' over the winner's carefully-confirmed outcome (a raced
+# fill left terminal at 0 fills). One poll at a time; extras no-op.
+_poll_orders_active = False
+
 
 async def poll_open_orders(cfg: dict) -> list[dict]:
+    global _poll_orders_active
+    if _poll_orders_active:
+        logger.debug("poll_open_orders already running; skipping concurrent run")
+        return []
+    _poll_orders_active = True
+    try:
+        return await _poll_open_orders_inner(cfg)
+    finally:
+        _poll_orders_active = False
+
+
+async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
     with db.get_db() as conn:
-        pending = db.get_pending_bot_positions(conn)
+        # Current env only: rows from the other env would 404 against this
+        # env's API and get killed as 'gone' while their orders live on.
+        pending = db.get_pending_bot_positions(conn, get_env())
     if not pending:
         return []
 
@@ -1091,9 +1167,11 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
             # without an order id. The order may be LIVE — look it up by our
             # client_order_id and adopt it before any give-up path runs.
             coid = pos.get("client_order_id")
+            lookup_ok = False
             if coid:
                 try:
                     found = await find_order_by_client_id(coid, ticker=pos.get("ticker") or "")
+                    lookup_ok = True
                 except Exception:
                     found = None
                 if found and found.get("order_id"):
@@ -1108,6 +1186,18 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
             if row:
                 _clear_failure(pos["id"])
                 updated.append(row)
+                continue
+            if coid and not lookup_ok:
+                # The coid lookup FAILED (network/API) — that is not evidence
+                # the order doesn't exist. Missing-kid rows exist precisely
+                # because they were created during an outage; counting outage
+                # cycles toward the give-up threshold 'gone'd live orders
+                # after ~3 minutes of a router flap. Only a lookup that
+                # SUCCEEDED and found nothing counts as a miss.
+                logger.debug(
+                    f"poll #{pos['id']}: coid lookup failed; not counting "
+                    f"toward give-up"
+                )
                 continue
             n = _bump_failure(pos["id"])
             if n >= _POLL_FAILURE_THRESHOLD:
@@ -1133,6 +1223,13 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
                 _clear_failure(pos["id"])
                 updated.append(row)
                 continue
+            # Only a genuine 404 (Kalshi says "no such order") counts toward
+            # the give-up threshold — 5xx/throttle responses are transient and
+            # used to pre-charge the counter so the first real 404 fired the
+            # give-up instantly instead of after 6 CONSECUTIVE 404s.
+            if e.status != 404:
+                logger.debug(f"order poll {kid}: HTTP {e.status} (transient; not counted)")
+                continue
             n = _bump_failure(pos["id"])
             logger.debug(
                 f"order poll {kid}: HTTP {e.status} (failure #{n})"
@@ -1150,7 +1247,9 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
                 _clear_failure(pos["id"])
             continue
         except Exception as e:
-            _bump_failure(pos["id"])
+            # Transport/parse failure — not evidence of anything. Don't feed
+            # the shared give-up counter (a 3-minute outage must not 'gone' a
+            # live order).
             logger.warning(f"order poll {kid}: {e}")
             continue
 
@@ -1212,7 +1311,34 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
                     await cancel_order(kid)
                 except KalshiAPIError as e:
                     if e.status == 404:
-                        # Order unknown to Kalshi — genuinely gone.
+                        # Cancel says the order is unknown — but a concurrent
+                        # poll's cancel or a raced FILL produces the same 404.
+                        # Confirm the fill state via get_order before booking a
+                        # terminal status: booking 'gone' blind over a fill left
+                        # a filled order terminal at 0 fills (and once the
+                        # resolution pass flat-resolves it, unrecoverable).
+                        final404 = None
+                        for _ in range(3):
+                            try:
+                                resp2 = await get_order(kid)
+                                final404 = _parse_kalshi_order(
+                                    (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
+                                )
+                                break
+                            except KalshiAPIError as e2:
+                                if e2.status == 404:
+                                    break  # order truly unknown -> 'gone' below
+                                await asyncio.sleep(0.5)
+                            except Exception:
+                                await asyncio.sleep(0.5)
+                        if final404 is not None and int(final404.get("filled") or 0) > 0:
+                            # Fills exist — leave the row; the next poll's
+                            # normal path books them.
+                            logger.warning(
+                                f"cancel {kid}: 404 but order shows "
+                                f"{final404.get('filled')} fills; leaving row for next poll"
+                            )
+                            continue
                         with db.get_db() as conn:
                             db.update_bot_position(
                                 conn, pos["id"], status="gone",
@@ -1335,6 +1461,23 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
     for pos in by_env:
         filled = int(pos["filled_contracts"] or 0)
         if filled <= 0:
+            # 'gone' is a GIVE-UP, not a confirmed terminal state — the order
+            # may be resting live on Kalshi (poll give-ups fire during plain
+            # outages). get_pending_bot_positions keeps such zero-cost rows
+            # re-pollable for 24h; flat-resolving one earlier kills that
+            # recovery window AND (via recent_resolved_position_exists) blocks
+            # the reconcile import of a later fill for another 24h. Leave
+            # 'gone' rows to the poll until the retention has elapsed.
+            if (pos.get("status") or "") == "gone":
+                try:
+                    created = datetime.strptime(
+                        str(pos.get("created_at") or ""), "%Y-%m-%d %H:%M:%S",
+                    ).replace(tzinfo=timezone.utc)
+                    age_sec = (datetime.now(timezone.utc) - created).total_seconds()
+                except (TypeError, ValueError):
+                    age_sec = float("inf")
+                if age_sec < 86400:
+                    continue
             with db.get_db() as conn:
                 db.update_bot_position(
                     conn, pos["id"], resolved=1, outcome_correct=None,
@@ -1750,12 +1893,32 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
 
             cur_filled = int(target.get("filled_contracts") or 0)
             cur_cost_usd = float(target.get("cost_usd") or 0.0)
+
+            # A partially-filled entry whose order is still WORKING (fills so
+            # far < target) must NOT be flipped to 'filled': that frees the
+            # resting remainder's committed notional from the exposure cap
+            # (current_total_exposure_usd values filled rows at cost only),
+            # drops the row from get_pending_bot_positions (so the poll stops
+            # watching the live order — no fee/status updates, no
+            # canceled-partial collapse), and removes it from cancel_all's
+            # selector. Keep it 'partial' until the order reaches a terminal
+            # state; the poll owns the order lifecycle.
+            still_working = (
+                not was_terminal
+                and target["status"] in ("submitted", "partial")
+                and new_filled < int(target.get("target_contracts") or 0)
+            )
+            if still_working:
+                new_status = "partial" if new_filled > 0 else target["status"]
+            else:
+                new_status = "filled"
+
             # Skip a no-op write so the renderer isn't flooded with
             # position:update for unchanged rows — but DO write when the mark
             # moved ≥1c, so live P&L stays current.
             if (
                 not was_terminal
-                and target.get("status") == "filled"
+                and target.get("status") == new_status
                 and cur_filled == new_filled
                 and abs(cur_cost_usd - new_cost_usd) < 0.005
                 and not mark_moved
@@ -1765,7 +1928,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             live_fees_usd = _position_fees_usd(live_p)
             with db.get_db() as conn:
                 db.update_bot_position(
-                    conn, target["id"], status="filled",
+                    conn, target["id"], status=new_status,
                     filled_contracts=new_filled,
                     cost_usd=new_cost_usd,
                     avg_fill_price_cents=new_avg_cents,
@@ -1800,6 +1963,53 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             # engine's open-position slots and contaminate its win/loss/P&L stats.
             # Their cost is added to the account total in _build_account_snapshot.
             if ticker.split("-")[0] in _CRYPTO15M_SERIES:
+                continue
+            # Our OWN position wrongly resolved (flat orphan-close of an
+            # active market, 0-fill give-up resolve over a raced fill) while
+            # the contracts are still held? Re-link that row instead of
+            # importing an 'external' duplicate: externals never count toward
+            # max_open_positions, so every wrongful resolution would otherwise
+            # convert into a PERMANENT cap exemption for our own money (and
+            # the position would ride untracked for the 24h skip-import
+            # window first). Flat-resolved (pnl $0, settlement $0, no
+            # outcome) is the signature of a wrongful close — a real
+            # settlement books a win's cash or a loss's negative pnl.
+            with db.get_db() as conn:
+                stale = db.find_flat_resolved_position(
+                    conn, ticker, side, env, int(round(qty)),
+                )
+            if stale:
+                with db.get_db() as conn:
+                    db.update_bot_position(
+                        conn, stale["id"], status="filled", resolved=0,
+                        outcome_correct=None, pnl_usd=None,
+                        settlement_usd=None, resolved_at=None, error=None,
+                        filled_contracts=int(round(qty)),
+                        cost_usd=(
+                            cost_cents / 100.0 if cost_cents > 0
+                            else float(stale.get("cost_usd") or 0.0)
+                        ),
+                        avg_fill_price_cents=(
+                            (cost_cents / qty) if (qty and cost_cents > 0)
+                            else stale.get("avg_fill_price_cents")
+                        ),
+                    )
+                    db.log_event(
+                        conn, stale["id"], "reconcile",
+                        note=(
+                            "re-linked wrongly-resolved row "
+                            "(still held on Kalshi)"
+                        ),
+                    )
+                    row = db.fetch_position_by_id(conn, stale["id"])
+                if row:
+                    changed.append(row)
+                summary["resurrected"] += 1
+                logger.info(
+                    f"[reconcile] RE-LINKED #{stale['id']} {ticker} {side} "
+                    f"(was resolved flat as {stale['status']}) "
+                    f"qty={qty:.0f} cost=${cost_cents / 100:.2f}"
+                )
                 continue
             with db.get_db() as conn:
                 if db.recent_resolved_position_exists(
@@ -1869,7 +2079,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
     # forever — burning concurrency slots, inflating the open-count, and
     # double-counting its cost in the account total. (This is the 7-shown-vs-
     # 3-held drift, and why a manual Refresh appeared to do nothing.)
-    healthy = nonzero_count > 0
     # Only a real rename (no known qty key on any row) trips the fail-safe. A
     # flat account (keys present, all zero) must NOT skip orphan-closing, or
     # locally-"filled" positions sold/closed outside our tracking linger forever
@@ -1889,19 +2098,17 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     continue
                 streak = _orphan_miss_streak.get(pid, 0) + 1
                 _orphan_miss_streak[pid] = streak
-                with db.get_db() as conn:
-                    age_row = conn.execute(
-                        "SELECT (strftime('%s','now') - strftime('%s', created_at))"
-                        " AS age FROM bot_positions WHERE id=?",
-                        (pid,),
-                    ).fetchone()
-                age_s = age_row["age"] if age_row and age_row["age"] is not None else 1e9
-                recent = age_s < 180
-                # Stale position + trustworthy data → close on first miss (so a
-                # single Refresh fixes it). Recent fill, or a zero-position
-                # response, needs a confirming second miss.
-                need = 1 if (healthy and not recent) else 2
-                if streak < need:
+                # ALWAYS require a confirming second consecutive miss. The old
+                # "stale position + non-empty response → close on first miss"
+                # shortcut closed real held positions on a single incomplete
+                # /portfolio/positions read (a cursor page-shift skipping one
+                # row while the rest looked healthy) — freeing cap slots the
+                # engine refilled while the contracts were still held, with no
+                # resurrection path once resolved. Systematic truncation is
+                # handled at the source: get_positions raises
+                # KalshiTruncatedResult at its page cap, aborting the whole
+                # reconcile instead of feeding it a partial snapshot.
+                if streak < 2:
                     continue
 
                 filled = int(r["filled_contracts"] or 0)
@@ -1981,7 +2188,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
 async def cancel_all_open() -> int:
     with db.get_db() as conn:
         rows = conn.execute(
-            """SELECT id, kalshi_order_id FROM bot_positions
+            """SELECT id, kalshi_order_id, target_contracts FROM bot_positions
                WHERE status IN ('submitted','partial')
                  AND resolved=0 AND kalshi_env=?""",
             (get_env(),),
@@ -1993,7 +2200,62 @@ async def cancel_all_open() -> int:
             continue
         try:
             await cancel_order(kid)
-            with db.get_db() as conn:
+        except Exception as e:
+            logger.warning(f"cancel_all: {kid}: {e}")
+            continue
+        canceled += 1
+        # Cancel accepted — but a fill may have RACED it. Same rule as the
+        # poll's auto-cancel: book 'canceled' ONLY from a CONFIRMED post-cancel
+        # zero-fill read. Writing 'canceled' blind over a partial fill drops
+        # the held contracts out of the open-count cap instantly, and the
+        # resolution pass would flat-resolve the 0-fill row — unrecoverable
+        # (a resolved canceled 0-fill row also blocks the reconcile import
+        # for this ticker for 24h, then feeds the cap-exempt external path).
+        final = None
+        for _ in range(3):
+            try:
+                resp2 = await get_order(kid)
+                final = _parse_kalshi_order(
+                    (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
+                )
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+        if final is None:
+            # Couldn't confirm the fill state — leave the row as-is
+            # (submitted/partial) so the poll loop books the truth.
+            logger.warning(
+                f"cancel_all: {kid}: fill state unconfirmed after cancel; "
+                f"leaving row for the poll loop"
+            )
+            continue
+        with db.get_db() as conn:
+            if int(final.get("filled") or 0) > 0:
+                db_status = _db_status_from_order(
+                    final, int(r["target_contracts"] or 0)
+                )
+                fields: dict = {
+                    "status": db_status,
+                    "filled_contracts": final["filled"],
+                }
+                # The canceled remainder's cash is freed — collapse the target
+                # so exposure stops valuing the dead notional (same as poll).
+                if db_status == "partial" and final["status"] in ("canceled", "cancelled"):
+                    fields["target_contracts"] = final["filled"]
+                if final["avg_cents"] is not None:
+                    fields["avg_fill_price_cents"] = final["avg_cents"]
+                if final["cost_cents"]:
+                    fields["cost_usd"] = final["cost_cents"] / 100.0
+                if final.get("fees_usd"):
+                    fields["fees_usd"] = final["fees_usd"]
+                db.update_bot_position(conn, r["id"], **fields)
+                db.log_event(
+                    conn, r["id"], "cancel",
+                    kalshi_status=final["status"],
+                    filled_contracts=final["filled"],
+                    note="user cancel-all: raced fills kept",
+                )
+            else:
                 db.update_bot_position(
                     conn, r["id"], status="canceled",
                     error="user cancel-all",
@@ -2001,7 +2263,4 @@ async def cancel_all_open() -> int:
                 db.log_event(
                     conn, r["id"], "cancel", note="user cancel-all"
                 )
-            canceled += 1
-        except Exception as e:
-            logger.warning(f"cancel_all: {kid}: {e}")
     return canceled

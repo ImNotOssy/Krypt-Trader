@@ -63,7 +63,7 @@ Requires [Node.js](https://nodejs.org) 18+ and [Python](https://python.org) 3.10
 ## Need a Kalshi account?
 
 Sign up through our referral and Kalshi gives you **$25 free** after your first deposit (and we receive a referral credit too — it costs you nothing extra):
-<https://kalshi.com/sign-up?referral=e258d0db-6ca0-4efc-8435-3592397ada4c>
+<https://kalshi.com/sign-up/?referral=df1514b3-e7e3-48fc-9c86-a7713e452eae&m=true>
 
 ## Links
 

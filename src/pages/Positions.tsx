@@ -21,7 +21,7 @@ const STATUS_COLORS: Record<string, string> = {
 type Tab = 'open' | 'pending' | 'won' | 'lost' | 'errors' | 'all';
 
 export function PositionsPage() {
-  const { positions, refresh } = useApp();
+  const { positions, refresh, config } = useApp();
   const toast = useToast();
   const [tab, setTab] = useState<Tab>('open');
   const [src, setSrc] = useState<'all' | 'whale' | 'momentum'>('all');
@@ -59,6 +59,18 @@ export function PositionsPage() {
     }
     return { open, pending, won, lost, errors, all: positions.length };
   }, [positions]);
+
+  // The tab badges count every row shown (all environments, external imports
+  // included). The engine's max-open cap only counts bot-managed positions in
+  // the active env, so call out how many open/pending rows are outside it.
+  const nonBotOpen = useMemo(
+    () => positions.filter(
+      (p) => !p.resolved
+        && (p.status === 'filled' || p.status === 'partial' || p.status === 'submitted')
+        && (p.signalSource === 'external' || (config != null && p.kalshiEnv !== config.kalshiEnv)),
+    ).length,
+    [positions, config],
+  );
 
   const cancelAll = async (): Promise<void> => {
     if (!window.confirm('Cancel ALL open orders on Kalshi?')) return;
@@ -124,6 +136,13 @@ export function PositionsPage() {
           />
         </div>
       </div>
+
+      {nonBotOpen > 0 && (
+        <p className="-mt-2 mb-3 text-[11px] text-krypt-dim">
+          Open/Pending include {nonBotOpen} external or other-environment position{nonBotOpen === 1 ? '' : 's'} the
+          bot doesn&apos;t count against its max-open cap.
+        </p>
+      )}
 
       {filtered.length === 0 ? (
         <Empty

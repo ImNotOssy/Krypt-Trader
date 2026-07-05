@@ -105,3 +105,40 @@ def test_place_limit_order_rejects_bad_inputs():
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for {bad}")
+
+
+# ───────── /portfolio/positions pagination must signal truncation ─────────
+# A silent break at the page cap made everything past the cut look "no longer
+# held" — reconcile then orphan-closed real positions off the partial list,
+# and the cut is PERSISTENT (same account state → same truncation), so no
+# consecutive-miss debounce could save them.
+
+
+def test_get_positions_raises_on_page_cap(monkeypatch):
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
+        return {
+            "market_positions": [{"ticker": "T", "position": 1}],
+            "cursor": "more",  # never exhausts
+        }
+
+    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
+    try:
+        asyncio.run(kalshi_api.get_positions(limit=1000))
+    except kalshi_api.KalshiTruncatedResult:
+        return
+    raise AssertionError("expected KalshiTruncatedResult at the page cap")
+
+
+def test_get_positions_returns_when_cursor_exhausts(monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
+        calls["n"] += 1
+        return {
+            "market_positions": [{"ticker": f"T{calls['n']}", "position": 1}],
+            "cursor": "more" if calls["n"] < 3 else "",
+        }
+
+    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
+    out = asyncio.run(kalshi_api.get_positions(limit=1000))
+    assert len(out) == 3

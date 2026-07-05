@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import {
-  AlertTriangle, Banknote, Bitcoin, Cloud, Film, Globe2, RotateCcw, Save,
+  AlertTriangle, Banknote, Bitcoin, Cloud, Dices, Film, Globe2, RotateCcw, Save,
   Trophy, Vote,
 } from 'lucide-react';
 import type { TraderConfig } from '@shared/types';
@@ -20,6 +20,7 @@ const KRYPT_CATEGORIES: { id: string; label: string; Icon: typeof Trophy }[] = [
   { id: 'climate', label: 'Climate', Icon: Cloud },
   { id: 'entertainment', label: 'Entertainment', Icon: Film },
   { id: 'world', label: 'World', Icon: Globe2 },
+  { id: 'exotics', label: 'Exotics', Icon: Dices },
 ];
 
 export function SettingsPage() {
@@ -30,13 +31,28 @@ export function SettingsPage() {
 
   if (!config) return <Page title="Settings"><div className="text-krypt-muted">Loading…</div></Page>;
 
-  const update = async <K extends keyof TraderConfig>(key: K, value: TraderConfig[K]): Promise<void> => {
+  const patch = async (p: Partial<TraderConfig>): Promise<void> => {
     try {
-      await window.krypt.config.update({ [key]: value } as Partial<TraderConfig>);
+      await window.krypt.config.update(p);
       await refresh.state();
     } catch (e: any) {
       toast.error(`${e?.message || e}`);
     }
+  };
+
+  const update = <K extends keyof TraderConfig>(key: K, value: TraderConfig[K]): Promise<void> =>
+    patch({ [key]: value } as Partial<TraderConfig>);
+
+  // The backend evaluates the trading-hours window at UTC + tradingTimezoneOffsetMin,
+  // which defaults to 0 (= UTC). Auto-fill the offset from this machine's timezone
+  // the first time the user touches the window while it's still at that default —
+  // otherwise a "19:00" start silently means 19:00 UTC.
+  const systemOffsetMin = -new Date().getTimezoneOffset();
+  const patchTradingWindow = (p: Partial<TraderConfig>): Promise<void> => {
+    if (config.tradingTimezoneOffsetMin === 0 && systemOffsetMin !== 0) {
+      p = { ...p, tradingTimezoneOffsetMin: systemOffsetMin };
+    }
+    return patch(p);
   };
 
   // Switching env is the #1 place users silently lock themselves out (wrong /
@@ -200,7 +216,15 @@ export function SettingsPage() {
         <Card>
           <CategoryPicker
             value={config.allowedCategories}
-            onChange={(v) => void update('allowedCategories', v)}
+            onChange={(v) => void patch({
+              allowedCategories: v,
+              // Strategy presets can install hidden per-source category lists
+              // (e.g. Edge Stack's allowedWhaleCategories) that AND with this
+              // global list and survive shallow config patches forever. The
+              // user's explicit pick here is authoritative — clear them.
+              allowedWhaleCategories: null,
+              allowedMomentumCategories: null,
+            })}
           />
         </Card>
       </Section>
@@ -453,16 +477,18 @@ export function SettingsPage() {
             <div className="text-sm text-white">Restrict trading to a weekly window</div>
             <Switch
               checked={config.tradingHoursEnabled}
-              onChange={(v) => void update('tradingHoursEnabled', v)}
+              onChange={(v) => void (v
+                ? patchTradingWindow({ tradingHoursEnabled: v })
+                : update('tradingHoursEnabled', v))}
             />
           </div>
           <div className={config.tradingHoursEnabled ? '' : 'pointer-events-none opacity-40'}>
             <div className="grid gap-4 md:grid-cols-3">
-              <Field label="Start (HH:MM)" hint="Local time, 24h format">
+              <Field label="Start (HH:MM)" hint="24h format, in the UTC-offset timezone set on the right">
                 <input
                   type="time"
                   value={config.tradingHoursStart}
-                  onChange={(e) => void update('tradingHoursStart', e.target.value)}
+                  onChange={(e) => void patchTradingWindow({ tradingHoursStart: e.target.value })}
                   className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-3 py-1.5 font-mono text-sm text-white"
                 />
               </Field>
@@ -470,11 +496,14 @@ export function SettingsPage() {
                 <input
                   type="time"
                   value={config.tradingHoursEnd}
-                  onChange={(e) => void update('tradingHoursEnd', e.target.value)}
+                  onChange={(e) => void patchTradingWindow({ tradingHoursEnd: e.target.value })}
                   className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-3 py-1.5 font-mono text-sm text-white"
                 />
               </Field>
-              <Field label="UTC offset (minutes)" hint="0 = UTC · -300 = US Eastern (winter) · -240 = US Eastern (summer)">
+              <Field
+                label="UTC offset (minutes)"
+                hint={`The times above run at UTC + this offset. This PC's timezone is ${systemOffsetMin >= 0 ? '+' : ''}${systemOffsetMin} (auto-filled when you edit the window while this is still 0) · 0 = UTC`}
+              >
                 <NumberInput
                   value={config.tradingTimezoneOffsetMin}
                   step={30}
@@ -486,7 +515,7 @@ export function SettingsPage() {
               <div className="mb-2 text-xs uppercase tracking-wider text-krypt-muted">Active days</div>
               <DayPicker
                 value={config.tradingDays}
-                onChange={(v) => void update('tradingDays', v)}
+                onChange={(v) => void patchTradingWindow({ tradingDays: v })}
               />
             </div>
             <div className="mt-3 rounded-md border border-krypt-border bg-krypt-surface2 p-3 text-[11px] text-krypt-muted">

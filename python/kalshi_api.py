@@ -105,6 +105,13 @@ class KalshiAPIError(Exception):
         super().__init__(f"HTTP {status}: {body}")
 
 
+class KalshiTruncatedResult(Exception):
+    """A paginated portfolio read hit its page cap with a cursor still
+    outstanding — the collected rows are an INCOMPLETE snapshot. Callers that
+    treat the list as authoritative (reconcile orphan-closing) must treat this
+    as a failed fetch, not as 'everything past the cut is no longer held'."""
+
+
 
 
 async def _pub_get(url: str, params: dict | None = None) -> Any:
@@ -366,6 +373,9 @@ async def get_balance(pin_env: str | None = None) -> dict:
     return await _signed_request("GET", "/portfolio/balance", pin_env=pin_env)
 
 
+_POSITIONS_MAX_PAGES = 25
+
+
 async def get_positions(
     limit: int = 200, *, settlement_status: str | None = None,
     paginate: bool = True,
@@ -389,8 +399,18 @@ async def get_positions(
             out.extend(data or [])
             cursor = None
         pages += 1
-        if not paginate or not cursor or pages >= 25:
+        if not paginate or not cursor:
             break
+        if pages >= _POSITIONS_MAX_PAGES:
+            # Silently returning the truncated list made everything past the
+            # cut look "no longer held" — reconcile then orphan-closed real
+            # positions, and (same account state → same cut) the truncation
+            # PERSISTS across polls, so no miss-debounce can save them.
+            raise KalshiTruncatedResult(
+                f"/portfolio/positions pagination hit the {pages}-page cap "
+                f"with more rows remaining; refusing to return a truncated "
+                f"snapshot"
+            )
     return out
 
 
@@ -416,16 +436,21 @@ async def get_order(order_id: str) -> dict:
 
 async def find_order_by_client_id(
     client_order_id: str, *, ticker: str = "", limit: int = 200,
+    pin_env: str | None = None,
 ) -> dict | None:
     """Look an order up by our client_order_id. Used after a POST whose
     response was lost (timeout / dropped connection): the order may be live on
     Kalshi even though place_limit_order raised, and booking it as 'error'
     would leave an untracked real-money position. Returns the order dict or
-    None when no order with that client id exists."""
+    None when no order with that client id exists.
+
+    Pass pin_env=<env the order was placed under> so an env switch mid-lookup
+    aborts (env_changed) instead of silently querying the OTHER account —
+    a miss there says nothing about whether this order is live."""
     params: dict = {"limit": int(limit)}
     if ticker:
         params["ticker"] = ticker
-    data = await _signed_request("GET", "/portfolio/orders", params=params)
+    data = await _signed_request("GET", "/portfolio/orders", params=params, pin_env=pin_env)
     orders = (data.get("orders") if isinstance(data, dict) else data) or []
     for o in orders:
         if isinstance(o, dict) and str(o.get("client_order_id") or "") == str(client_order_id):

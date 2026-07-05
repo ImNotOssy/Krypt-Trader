@@ -38,6 +38,15 @@ export function DashboardPage({ onNav }: DashboardProps) {
       && p.status !== 'dry_run'
       && (p.status === 'filled' || p.status === 'partial' || p.status === 'submitted'),
   );
+  // The engine's max-open-positions cap only counts bot-managed positions in the
+  // ACTIVE environment — imported/external rows and other-env leftovers don't eat
+  // cap slots (db.count_open_bot_positions). Mirror that filter so "X / cap"
+  // compares the same quantity the engine does.
+  const botOpenPos = openPos.filter(
+    (p) => p.signalSource !== 'external' && (!config || p.kalshiEnv === config.kalshiEnv),
+  );
+  const botPendingCount = botOpenPos.filter((p) => p.status === 'submitted').length;
+  const externalOpenCount = openPos.length - botOpenPos.length;
   const recentResolved = positions
     .filter((p) => p.resolved)
     .slice(0, 5);
@@ -134,8 +143,9 @@ export function DashboardPage({ onNav }: DashboardProps) {
         />
         <StatCard
           label="Open Positions"
-          value={`${openPos.length} / ${config?.maxOpenPositions ?? 25}`}
-          hint={`${account?.pendingCount ?? 0} pending · ${account?.openCount ?? 0} filled`}
+          value={`${botOpenPos.length} / ${config?.maxOpenPositions ?? 25}`}
+          hint={`${botPendingCount} pending · ${botOpenPos.length - botPendingCount} filled`
+            + (externalOpenCount > 0 ? ` · +${externalOpenCount} external/other-env (not in cap)` : '')}
         />
       </div>
 

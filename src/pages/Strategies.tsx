@@ -115,7 +115,7 @@ export function StrategiesPage() {
   return (
     <Page
       title="Strategies"
-      subtitle="Ranked by risk-adjusted, in-sample backtest of your own resolved signals. These are experimental heuristics — none has a proven forward edge, so test the top pick on the Demo environment first. Apply one, tweak in Settings, then save it below as your own strategy."
+      subtitle="Ranked by a risk-adjusted backtest on the author's historical signal sample — fixed reference numbers shipped with the app, not computed from your own data. These are experimental heuristics — none has a proven forward edge, so test the top pick on the Demo environment first. Apply one, tweak in Settings, then save it below as your own strategy."
       actions={
         <>
           {secret && (
@@ -264,9 +264,11 @@ export function StrategiesPage() {
 
       <p className="mt-5 max-w-3xl text-[11px] leading-relaxed text-krypt-dim">
         <span className="font-semibold text-krypt-muted">How the ranking works:</span>{' '}
-        each preset's gates (source, confidence, category, entry-price) are
-        replayed against your own resolved signals and scored net of an
-        estimated Kalshi fee. The chip shows mean net{' '}
+        each preset's gates (source, confidence, category, entry-price) were
+        replayed against a historical sample of the author's resolved signals
+        and scored net of an estimated Kalshi fee. The chips are illustrative
+        reference numbers shipped with the app — they are <strong>not</strong>{' '}
+        recomputed from your own trading history. The chip shows mean net{' '}
         <span className="font-mono">¢/contract</span>, the t-stat{' '}
         <span className="font-mono">t</span> (≥&nbsp;2 ≈ a real edge, not
         noise), and sample size <span className="font-mono">n</span>. Cards are
@@ -277,7 +279,7 @@ export function StrategiesPage() {
         has a higher ¢, because its smaller n / lower t make it less reliable).{' '}
         <span className="font-mono">≈</span> marks presets whose edge-point gate
         can't be replayed, so their number ignores it. All figures are{' '}
-        <em>in-sample</em> on a small history — run the top pick on the{' '}
+        <em>in-sample</em> on a small, fixed history — run the top pick on the{' '}
         <span className="font-semibold">Demo</span> environment (Settings) before
         risking real money.
       </p>

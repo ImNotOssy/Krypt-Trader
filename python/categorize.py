@@ -4,17 +4,32 @@ KALSHI_CATEGORY_MAP = {
     "Sports": "sports",
     "Economics": "economics",
     "Financials": "economics",
+    "Companies": "economics",
+    "Commodities": "economics",
     "Climate and Weather": "climate",
     "Entertainment": "entertainment",
+    "Mentions": "entertainment",
+    "Social": "entertainment",
+    "Culture": "entertainment",
     "Elections": "politics",
     "Politics": "politics",
     "Tech": "world",
     "Health": "world",
     "Science": "world",
-    "Culture": "entertainment",
+    "Science and Technology": "world",
+    "Transportation": "world",
     "World": "world",
     "Crypto": "crypto",
+    # Kalshi's literal series category for novelty markets. Kept as its own
+    # canonical id (not folded into a keyword bucket) because the Edge Stack
+    # preset explicitly allow-lists 'exotics' in allowed_whale_categories.
+    "Exotics": "exotics",
 }
+
+# Case-insensitive view: Kalshi's raw category strings have drifted in casing
+# before, and a pure case miss must not dump a known category into the
+# keyword fallback.
+KALSHI_CATEGORY_MAP_CI = {k.lower(): v for k, v in KALSHI_CATEGORY_MAP.items()}
 
 SPORTS_KEYWORDS = [
     "nba", "nfl", "mlb", "nhl", "mls", "epl", "premier league",
@@ -95,6 +110,7 @@ CATEGORY_EDGE = {
     "economics":      0.0,
     "entertainment":  0.0,
     "climate":        0.0,
+    "exotics":        0.0,
 }
 
 

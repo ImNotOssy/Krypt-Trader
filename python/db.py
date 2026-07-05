@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     open_positions INTEGER DEFAULT 0
 );
 
+-- risk_state: tiny per-(env, kind) persistence for the daily-risk gate.
+-- The 180s breach-persistence window used to live only in a module-global
+-- dict, so a backend restart mid-breach re-enabled both engines until the
+-- timer re-elapsed — restarting the app is exactly what a user does after a
+-- losing streak. breach_started_at is unix seconds (wall clock); NULL/absent
+-- means no active breach.
+CREATE TABLE IF NOT EXISTS risk_state (
+    kalshi_env TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    breach_started_at REAL,
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (kalshi_env, kind)
+);
+
 CREATE TABLE IF NOT EXISTS crypto15m_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,
@@ -1089,6 +1103,32 @@ def recent_resolved_position_exists(
     return row is not None
 
 
+def find_flat_resolved_position(
+    conn, ticker: str, direction: str, env: str, qty: int
+) -> dict | None:
+    """A resolved row for (ticker, direction, env) that was closed FLAT —
+    pnl $0, settlement $0, no outcome — i.e. the signature of a wrongful
+    orphan-close / give-up resolve, not of a real settlement (a genuine loss
+    books pnl<0; a genuine win books settlement>0). Used by reconcile: when
+    Kalshi still holds this (ticker, side), such a row is our OWN position
+    that got mis-resolved and must be re-linked instead of re-imported as a
+    cap-exempt 'external' duplicate. Prefers a row whose recorded fill count
+    matches the held quantity."""
+    row = conn.execute(
+        """SELECT * FROM bot_positions
+           WHERE ticker=? AND direction=? AND kalshi_env=?
+             AND resolved=1
+             AND status != 'dry_run'
+             AND COALESCE(pnl_usd, 0)=0
+             AND COALESCE(settlement_usd, 0)=0
+             AND outcome_correct IS NULL
+           ORDER BY (filled_contracts = ?) DESC, resolved_at DESC, id DESC
+           LIMIT 1""",
+        (ticker, direction, env, int(qty)),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def exists_position_in_event(conn, event_ticker: str, env: str) -> bool:
     if not event_ticker:
         return False
@@ -1185,10 +1225,22 @@ def _c15_matched_adjusted_cost(conn, env: str) -> float:
     contracts are redeemed for $1×matched CASH on the spot — the position is
     flat and its basis is no longer held value. Counting it anyway double-
     counts against the cash credit, inflating the account total while a pair
-    is open and then 'crashing' it at settlement when the rows resolve."""
+    is open and then 'crashing' it at settlement when the rows resolve.
+
+    Sold-but-unsettled contracts are excluded too: a partially-filled exit
+    (stop-loss/TP) leaves the row status='exiting', resolved=0 until
+    settlement, but the sold contracts' cash proceeds have ALREADY landed in
+    the Kalshi balance — still counting their entry cost as held value
+    overstates the account total by sold × avg entry cost, which reads as
+    phantom profit to the balance-delta daily stop-loss at exactly the moment
+    a stop just half-failed. Each row is valued at its RESIDUAL cost:
+    cost × (filled − exit_filled) / filled."""
     rows = conn.execute(
         """SELECT ticker, direction,
-                  SUM(filled_contracts) f, SUM(COALESCE(cost_usd, 0)) c
+                  SUM(MAX(0, filled_contracts - COALESCE(exit_filled_contracts, 0))) f,
+                  SUM(COALESCE(cost_usd, 0)
+                      * MAX(0, filled_contracts - COALESCE(exit_filled_contracts, 0))
+                      / filled_contracts) c
            FROM crypto15m_positions
            WHERE resolved=0 AND filled_contracts > 0 AND kalshi_env=?
            GROUP BY ticker, direction""",
@@ -1218,9 +1270,13 @@ def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
     return _c15_matched_adjusted_cost(conn, env)
 
 
-def get_pending_bot_positions(conn) -> list[dict]:
-    rows = conn.execute(
-        """SELECT * FROM bot_positions
+def get_pending_bot_positions(conn, env: str | None = None) -> list[dict]:
+    # env filter: the poll loop signs for the CURRENT env only — feeding it the
+    # other env's rows made every one of their live orders 404 six polls in a
+    # row and get killed as 'gone' the moment the user switched environments.
+    # Every other consumer (count/exposure/reconcile/resolve) is env-filtered;
+    # rows from the inactive env must simply freeze until that env is active.
+    sql = """SELECT * FROM bot_positions
            WHERE resolved=0
              AND signal_source != 'external'
              AND (
@@ -1229,9 +1285,13 @@ def get_pending_bot_positions(conn) -> list[dict]:
                OR (status IN ('canceled','expired','gone','error')
                    AND (cost_usd IS NULL OR cost_usd=0)
                    AND (julianday('now')-julianday(created_at))*86400 < 86400)
-             )
-           ORDER BY created_at DESC"""
-    ).fetchall()
+             )"""
+    args: tuple = ()
+    if env:
+        sql += " AND kalshi_env = ?"
+        args = (env,)
+    sql += " ORDER BY created_at DESC"
+    rows = conn.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1601,6 +1661,35 @@ def insert_pnl_snapshot(
     )
 
 
+def get_risk_breach_start(conn, env: str, kind: str) -> float | None:
+    """Persisted first-breach timestamp (unix seconds) for the daily-risk
+    gate, or None when no breach is latched. Survives restarts so a reboot
+    mid-breach can't reopen the trading gate for another persistence window."""
+    row = conn.execute(
+        "SELECT breach_started_at FROM risk_state WHERE kalshi_env=? AND kind=?",
+        (env, kind),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def set_risk_breach_start(
+    conn, env: str, kind: str, started_at: float | None
+) -> None:
+    conn.execute(
+        """INSERT INTO risk_state (kalshi_env, kind, breach_started_at, updated_at)
+           VALUES (?,?,?,datetime('now'))
+           ON CONFLICT(kalshi_env, kind) DO UPDATE SET
+             breach_started_at=excluded.breach_started_at,
+             updated_at=excluded.updated_at""",
+        (env, kind, started_at),
+    )
+
+
 def earliest_pnl_total(conn, env: str) -> float | None:
     # Ignore any $0/unknown-balance rows so they can never become a baseline.
     row = conn.execute(
@@ -1905,8 +1994,15 @@ def cleanup_old_data(
         deleted += c.execute(
             "DELETE FROM whale_trades WHERE resolved = 0 AND created_at < ?", (alert_cutoff,)
         ).rowcount or 0
+        # Keep one ANCHOR row per env — the first-ever positive-total
+        # snapshot. earliest_pnl_total() is the all-time P&L/ROI baseline;
+        # pruning it silently re-baselined "all-time" to a trailing
+        # 45-day window every maintenance pass.
         deleted += c.execute(
-            "DELETE FROM pnl_snapshots WHERE at < ?", (pnl_cutoff,)
+            """DELETE FROM pnl_snapshots WHERE at < ?
+               AND id NOT IN (SELECT MIN(id) FROM pnl_snapshots
+                              WHERE total_usd > 0 GROUP BY kalshi_env)""",
+            (pnl_cutoff,),
         ).rowcount or 0
         # events had NO pruning rule at all (sync_events upserts every 10 min
         # forever); anything not touched in `event_days` is long closed.

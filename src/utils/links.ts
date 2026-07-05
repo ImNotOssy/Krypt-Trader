@@ -1,6 +1,6 @@
 
 export const KALSHI_REFERRAL_URL =
-  'https://kalshi.com/sign-up?referral=e258d0db-6ca0-4efc-8435-3592397ada4c';
+  'https://kalshi.com/sign-up/?referral=df1514b3-e7e3-48fc-9c86-a7713e452eae&m=true';
 
 export const KALSHI_DEMO_URL = 'https://demo.kalshi.co';
 export const KALSHI_DEMO_SIGNUP = 'https://demo.kalshi.co/sign-up';
