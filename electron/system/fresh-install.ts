@@ -1,16 +1,18 @@
 import { app } from 'electron';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { appendLog } from '../ipc';
 
-// "Fresh install" maintenance. Because productName is constant ("Krypt Trader"),
-// every version shares ONE userData folder — so stale DB rows / settings from an
-// old version bleed into a new one and cause issues. On a version change we move
-// the old DB + settings into a single backup and wipe the rest, keeping ONLY the
-// Kalshi credentials so the user stays logged in. Separately, a freshly-opened
-// version terminates any OTHER-install instance still running so it can take the
-// single-instance lock instead of silently quitting back to the old copy.
+// Version-change maintenance. Because productName is constant ("Krypt Trader"),
+// every version shares ONE userData folder — settings, credentials, and the
+// trade/signal DB all carry across updates, and that is intentional: the DB
+// migrates its own schema (python/db.py) and the settings loader merges old
+// files over new defaults, so nothing needs a wipe. On a version change we only
+// snapshot settings + DB into backups/v<prev> as rollback insurance and clear
+// the logs dir. Separately, a freshly-opened version terminates any
+// OTHER-install instance still running so it can take the single-instance lock
+// instead of silently quitting back to the old copy.
 
 const APP_EXE = 'Krypt Trader.exe';
 const BACKEND_EXE = 'krypt-trader-backend.exe';
@@ -124,7 +126,7 @@ export function takeOverOtherInstances(): number {
 }
 
 // ---------------------------------------------------------------------------
-// Version-change data wipe (keep credentials)
+// Version-change maintenance (preserve data, snapshot for rollback)
 // ---------------------------------------------------------------------------
 
 function readPrevVersion(statePath: string): string | null {
@@ -152,45 +154,45 @@ function writeVersion(statePath: string, version: string): void {
   }
 }
 
-/** Move a stashed item back to its live location if the live slot is empty —
- *  undoes a partial wipe so the app never boots on defaults. */
-function restore(backupDir: string, name: string, dest: string): void {
-  const src = join(backupDir, name);
-  if (!existsSync(src) || existsSync(dest)) return;
-  try { renameSync(src, dest); } catch {   }
-}
-
-/** Delete every backup except `keep` — called ONLY after a complete stash, so a
- *  failed wipe can never destroy the sole copy of real data. */
+/** Delete every backup except `keep` — called ONLY after a complete snapshot,
+ *  so a failed copy (e.g. disk full) never destroys the previous rollback
+ *  point. Legacy wipe-era stashes are NEVER pruned: versions before the
+ *  preserve-data fix MOVED the user's whole data dir here on update
+ *  (recognizable by their `data` subdir — new snapshots are flat files), so
+ *  for anyone updating from a wipe-era version that stash holds the only
+ *  copy of their real collected data. */
 function pruneBackupsExcept(backupsRoot: string, keep: string): void {
   let entries: string[] = [];
   try { entries = readdirSync(backupsRoot); } catch { return; }
   for (const e of entries) {
     if (e === keep) continue;
+    if (existsSync(join(backupsRoot, e, 'data'))) continue; // legacy wipe stash
     try { rmSync(join(backupsRoot, e), { recursive: true, force: true }); } catch {   }
   }
 }
 
-/** Move `src` into the backup dir; if the move fails, force-delete it so the
- *  wipe still happens (backup is best-effort, the wipe is the contract).
- *  Returns true if it was backed up. */
-function stash(src: string, backupDir: string, name: string): boolean {
-  if (!existsSync(src)) return false;
+/** Copy one file into the backup dir. Missing source is fine (nothing to
+ *  snapshot); a failed copy is logged and reported so the caller can keep the
+ *  previous rollback point instead of pruning it. Never touches `src`. */
+function snapshotFile(src: string, backupDir: string, name: string): boolean {
+  if (!existsSync(src)) return true;
   try {
     mkdirSync(backupDir, { recursive: true });
-    renameSync(src, join(backupDir, name));
+    copyFileSync(src, join(backupDir, name));
     return true;
-  } catch {
-    try { rmSync(src, { recursive: true, force: true }); } catch {   }
+  } catch (e: any) {
+    log('WARNING', `rollback snapshot of ${name} failed: ${e?.message || e}`);
     return false;
   }
 }
 
 /**
- * On a version change, back up the old DB + settings into a single
- * (auto-pruned) backup folder and wipe history/settings/logs. Credentials are
- * always preserved. Runs before settings load + backend start so the app comes
- * up clean. No-op on the same version, on a brand-new install, or in dev.
+ * On a version change, COPY settings.json + the DB into a single (auto-pruned)
+ * rollback snapshot and clear the logs dir. The live settings, DB, and
+ * credentials are all left in place — users keep their configuration and
+ * collected backtest/signal data across updates; the backend migrates the DB
+ * schema itself on boot. No-op on the same version, on a brand-new install, or
+ * in dev.
  */
 export function runVersionMaintenance(): void {
   if (!enabled()) return;
@@ -209,18 +211,9 @@ export function runVersionMaintenance(): void {
 
   if (prev === current) return; // already on this version
 
-  // A missing/corrupt marker must NOT be read as a version change — that would
-  // wipe real data on the SAME version (e.g. after the marker was truncated by a
-  // kill/power-loss). Only a successfully-parsed PRIOR version that differs
-  // authorizes a wipe; otherwise adopt the existing data and seed the marker.
+  // A missing/corrupt marker is a brand-new install (or a marker truncated by
+  // a kill/power-loss) — adopt whatever data exists and just seed the marker.
   if (prev === null) {
-    writeVersion(statePath, current);
-    return;
-  }
-
-  const hadData = existsSync(settingsPath) || existsSync(dbPath);
-  if (!hadData) {
-    // Brand-new install: nothing to wipe, just record the version.
     writeVersion(statePath, current);
     return;
   }
@@ -228,32 +221,29 @@ export function runVersionMaintenance(): void {
   const tag = prev.replace(/[^\w.\-]/g, '_');
   const backupsRoot = join(userData, 'backups');
   const backupDir = join(backupsRoot, `v${tag}`);
-  // Clear only THIS tag's stale dir; older backups stay until the new stash
-  // fully succeeds, so a failed wipe can't orphan the only copy of real data.
+  // Clear only THIS tag's stale dir; older snapshots stay until the new one
+  // fully succeeds, so a failed copy can't orphan the only rollback point.
   try { rmSync(backupDir, { recursive: true, force: true }); } catch {   }
 
-  const dataBacked = stash(dataDir, backupDir, 'data');
-  const settingsBacked = stash(settingsPath, backupDir, 'settings.json');
-  // Logs are noise — wipe without backing up.
-  try { rmSync(logsDir, { recursive: true, force: true }); } catch {   }
-
-  // If the DB/settings are still present, the wipe failed (most likely a file
-  // still locked by an old backend mid-exit). Restore anything we already moved
-  // so the app doesn't boot on defaults, and DON'T advance the marker — retry
-  // on the next launch instead of leaving stale data (or losing settings).
-  if (existsSync(dataDir) || existsSync(settingsPath)) {
-    restore(backupDir, 'settings.json', settingsPath);
-    restore(backupDir, 'data', dataDir);
-    log('ERROR', 'version wipe incomplete (files locked?) — restored, will retry next launch');
-    return;
+  // Snapshot settings + DB. The WAL/SHM sidecars matter: right after an old
+  // backend was killed they can hold commits not yet checkpointed into the
+  // main DB file, and SQLite recovers them from a db+wal copy.
+  let snapshotOk = snapshotFile(settingsPath, backupDir, 'settings.json');
+  for (const suffix of ['', '-wal', '-shm']) {
+    snapshotOk = snapshotFile(`${dbPath}${suffix}`, backupDir, `krypt-trader.db${suffix}`) && snapshotOk;
   }
 
-  // Wipe succeeded: only NOW is it safe to prune older backups, keeping this one.
-  pruneBackupsExcept(backupsRoot, `v${tag}`);
+  // Logs are noise — clear them each version.
+  try { rmSync(logsDir, { recursive: true, force: true }); } catch {   }
+
+  // Snapshot complete: only NOW is it safe to prune older ones, keeping this
+  // one. The marker always advances — preserving live data can't fail, and a
+  // best-effort snapshot shouldn't re-run every launch on a full disk.
+  if (snapshotOk) pruneBackupsExcept(backupsRoot, `v${tag}`);
   writeVersion(statePath, current);
   log(
     'INFO',
-    `version change ${prev} -> ${current}: wiped history/settings, kept API keys` +
-    `${dataBacked || settingsBacked ? ` (backup at backups/v${tag})` : ''}`,
+    `version change ${prev} -> ${current}: settings + data preserved` +
+    (snapshotOk ? ` (rollback snapshot at backups/v${tag})` : ' (snapshot incomplete — older backups kept)'),
   );
 }

@@ -212,9 +212,10 @@ async function bootstrap(): Promise<void> {
     Menu.setApplicationMenu(null);
   }
 
-  // Wipe stale history/settings from an older version (keeping API keys) BEFORE
-  // anything reads settings or the Python backend opens the DB, so the app and
-  // backend both come up on a clean slate.
+  // On a version change, snapshot settings + DB for rollback and clear old
+  // logs — user data is preserved across updates (the backend migrates the DB
+  // schema itself). Runs BEFORE settings load / backend start so the snapshot
+  // is taken from quiescent files.
   runVersionMaintenance();
 
   registerIpc();
