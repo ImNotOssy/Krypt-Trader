@@ -95,6 +95,14 @@ const api: KryptApi = {
     backtestMain: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('main:backtest', args),
     history: (args?: { limit?: number }) => ipcRenderer.invoke('crypto15m:history', args),
   },
+  perps: {
+    status: () => ipcRenderer.invoke('perps:status'),
+    backfill: () => ipcRenderer.invoke('perps:backfill'),
+    farmFlatten: () => ipcRenderer.invoke('perps:farmFlatten'),
+    backtest: (args) => ipcRenderer.invoke('perps:backtest', args),
+    history: (args) => ipcRenderer.invoke('perps:history', args),
+    stratFlatten: () => ipcRenderer.invoke('perps:stratFlatten'),
+  },
   kalshi: {
     marketUrl: (args) => ipcRenderer.invoke('kalshi:marketUrl', args),
   },

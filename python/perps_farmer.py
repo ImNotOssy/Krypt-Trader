@@ -1,0 +1,549 @@
+"""Perps volume farmer — maker-only, two-sided, loss-capped.
+
+Kalshi's in-app perps rewards pay volume bonuses (observed 2026-07:
+trade $50 → $25, $100K notional → $40, $1M → $200 ≈ 2-4 bps of volume).
+This engine generates qualifying volume at the lowest achievable cost:
+join the best bid AND best ask with small post_only clips, let the market
+fill both sides, and let captured spread offset the maker fees. It is a
+volume engine with a loss budget — NOT a profit strategy:
+
+    net cost / $ volume ≈ maker fee (5 bps today, 4 at the $100K 30-day
+    tier from ~Jul 8) − captured half-spread (~1-3 bps on KXBTCPERP)
+    ± adverse selection (unknowable up front — measured live below).
+
+The whole design hangs on MEASURED economics: every fill lands in
+perp_farm_fills (volume, fees, avg-cost realized P&L) and the engine
+auto-halts for the UTC day when the realized cost per $ of volume exceeds
+`perps_farm_max_cost_bps` (default = the ~4 bps bonus rate: if farming
+costs more than the bonus pays, stop burning) or the hard daily loss cap.
+
+Compliance: single-account genuine two-sided resting liquidity — exactly
+what venue programs pay for. No self-matches: quotes never cross each
+other (cross-guard + venue self-trade prevention), no wash trades, no
+prearranged volume (Rulebook 5.17).
+
+Mechanics per ~2.5s tick (gated from the service main loop, never raises):
+  * gates: enabled, WS quote fresh, spread ≥ min ticks, not in the Thu
+    maintenance window, margin enabled + funded (cached), daily halts
+  * desired quotes: join best bid / best ask, post_only, clip contracts;
+    an inventory beyond ±cap quotes only the reducing side
+  * requote: cancel/replace a resting order when the touch moved more than
+    `requote_ticks` away from its price
+  * fills: polled via GET /margin/fills since the last seen fill, deduped
+    into perp_farm_fills; inventory + avg-cost realized P&L updated here
+  * reconcile: positions endpoint every ~60s is the inventory tiebreaker
+
+Live orders are recovered by client_order_id after lost responses, the
+same discipline as the event-side engines."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+
+import db
+import kalshi_auth
+import kalshi_perps_api as papi
+import perps_ws as pws
+from kalshi_api import KalshiAPIError
+
+logger = logging.getLogger("perps_farmer")
+
+TICK_MICRO = 100                    # $0.0001 tick in micro-dollars
+# Stand down only if we haven't RECEIVED a top-of-book for the symbol in this
+# long (local receipt time, not Kalshi's wire ts_ms). Kalshi's perps ticker is
+# coalesced and thin/new markets update their book slowly — 30-120s between
+# changes is normal on a healthy stream — so a tight window here (the old 10s,
+# borrowed from the high-frequency 15m/spot feeds) made the farmer read "quote
+# stale" on nearly every tick and never quote. A slow book is safe to join:
+# post_only quotes can never cross, a dead stream is already caught by
+# is_connected(), and adverse selection is measured + auto-halted downstream.
+_QUOTE_FRESH_MS = 180_000
+_RECONCILE_SEC = 60.0
+_BALANCE_CACHE_SEC = 60.0
+_MIN_COST_SAMPLE_USD = 500.0        # measured-cost halt needs ≥ this much volume
+# Thursday maintenance 3-5 AM ET. July = EDT (UTC-4) → 07:00-09:00 UTC,
+# padded. Winter shifts an hour; the pad + Kalshi's own order rejects cover it.
+_MAINT_START_UTC = (6, 50)
+_MAINT_END_UTC = (9, 10)
+
+
+def _utc_day(ts: float | None = None) -> str:
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def in_maintenance_window(dt: datetime | None = None) -> bool:
+    dt = dt or datetime.now(timezone.utc)
+    if dt.weekday() != 3:  # Thursday
+        return False
+    hm = (dt.hour, dt.minute)
+    return _MAINT_START_UTC <= hm < _MAINT_END_UTC
+
+
+# ───────── pure decision helpers (unit-tested directly) ─────────────────────
+
+def desired_quotes(
+    quote: dict, inventory_cc: int, cfg: dict,
+) -> dict[str, int]:
+    """{'bid': price_micro, 'ask': price_micro} we WANT resting, given the
+    live top-of-book and our inventory. Empty dict = stand down this tick."""
+    bid = quote.get("bid_usd_micro")
+    ask = quote.get("ask_usd_micro")
+    if not bid or not ask or ask <= bid:
+        return {}
+    min_spread = int(cfg.get("perps_farm_min_spread_ticks", 2)) * TICK_MICRO
+    if ask - bid < min_spread:
+        return {}  # too tight: joining both sides guarantees negative capture
+    max_inv = int(cfg.get("perps_farm_max_inventory_contracts", 3)) * 100
+    out: dict[str, int] = {}
+    if inventory_cc < max_inv:
+        out["bid"] = bid   # join best bid
+    if inventory_cc > -max_inv:
+        out["ask"] = ask   # join best ask
+    return out
+
+
+def should_replace(live_price_micro: int, target_micro: int, cfg: dict) -> bool:
+    tol = int(cfg.get("perps_farm_requote_ticks", 1)) * TICK_MICRO
+    return abs(live_price_micro - target_micro) > tol
+
+
+def apply_fill(inv_cc: int, avg_micro: float, side: str, count_cc: int,
+               price_micro: int) -> tuple[int, float, int]:
+    """Avg-cost inventory accounting. Returns (new_inv_cc, new_avg_micro,
+    realized_pnl_usd_micro). side is OUR order side: bid = buy (+), ask = sell (−)."""
+    signed = count_cc if side == "bid" else -count_cc
+    realized = 0.0
+    if inv_cc == 0 or (inv_cc > 0) == (signed > 0):
+        # extending (or opening) — new weighted average
+        total = abs(inv_cc) + abs(signed)
+        avg_micro = (avg_micro * abs(inv_cc) + price_micro * abs(signed)) / total
+        inv_cc += signed
+    else:
+        # reducing / flipping
+        reduce_cc = min(abs(inv_cc), abs(signed))
+        direction = 1 if inv_cc > 0 else -1   # +1: we were long, selling out
+        realized = direction * (price_micro - avg_micro) * reduce_cc / 100.0
+        inv_cc += signed
+        if (inv_cc > 0) != (direction > 0) and inv_cc != 0:
+            avg_micro = float(price_micro)   # flipped: remainder opened here
+        elif inv_cc == 0:
+            avg_micro = 0.0
+    return inv_cc, avg_micro, int(round(realized))
+
+
+# ───────── engine ────────────────────────────────────────────────────────────
+
+class _Farmer:
+    def __init__(self) -> None:
+        self.env: str = "production"
+        self.running: bool = False
+        self.halted_day: str = ""      # UTC day the halt applies to
+        self.halt_reason: str = ""
+        self.inventory_cc: int = 0
+        self.avg_entry_micro: float = 0.0
+        self.live: dict[str, dict] = {}       # side -> {order_id, price_micro, count_cc, client_order_id}
+        self.last_fill_ts: int = 0            # unix seconds, fills poll cursor
+        self._last_reconcile: float = 0.0
+        self._last_balance_t: float = 0.0
+        self._balance_ok: bool = False
+        self._margin_enabled: bool | None = None
+        self.last_error: str = ""
+        self.day_stats: dict = {}
+        self._stats_dirty: bool = True
+        self._stats_day: str = ""
+
+    # ── lifecycle ────────────────────────────────────────────────────
+
+    def _wire_ticker(self, cfg: dict) -> str:
+        sym = str(cfg.get("perps_farm_symbol") or "KXBTCPERP").upper().rstrip("1")
+        return papi.env_ticker(sym, self.env)
+
+    def _halted(self) -> bool:
+        return self.halted_day == _utc_day()
+
+    def _halt(self, reason: str) -> None:
+        if not self._halted():
+            logger.warning(f"perps_farmer: HALTED for {_utc_day()} — {reason}")
+        self.halted_day = _utc_day()
+        self.halt_reason = reason
+
+    async def stop(self, *, cancel_orders: bool = True) -> None:
+        self.running = False
+        if cancel_orders:
+            await self._cancel_all()
+
+    # ── order plumbing ───────────────────────────────────────────────
+
+    async def _cancel_all(self) -> None:
+        for side in list(self.live):
+            o = self.live.pop(side, None)
+            if not o or not o.get("order_id"):
+                continue
+            try:
+                await papi.cancel_perps_order(o["order_id"])
+            except Exception as e:
+                logger.debug(f"perps_farmer: cancel {side} failed: {e}")
+
+    async def _place(self, ticker: str, side: str, price_micro: int, count_cc: int) -> None:
+        coid = str(uuid.uuid4())
+        try:
+            resp = await papi.place_perps_limit_order(
+                ticker=ticker, side=side, count_cc=count_cc,
+                price_usd_micro=price_micro, post_only=True,
+                client_order_id=coid,
+            )
+            oid = str(resp.get("order_id") or "")
+            if oid:
+                self.live[side] = {
+                    "order_id": oid, "price_micro": price_micro,
+                    "count_cc": count_cc, "client_order_id": coid,
+                }
+        except KalshiAPIError as e:
+            # Clean rejection (post_only would cross, banding, margin…) —
+            # the order is definitively NOT live; requote next tick.
+            logger.debug(f"perps_farmer: place {side} rejected: {e}")
+        except Exception as e:
+            # Lost response — the order may be live. Recover by client id
+            # before assuming it isn't (the codebase's order-lifecycle rule).
+            try:
+                o = await papi.find_perps_order_by_client_id(coid, ticker=ticker)
+            except Exception:
+                o = None
+            if o and str(o.get("order_id") or ""):
+                self.live[side] = {
+                    "order_id": str(o["order_id"]), "price_micro": price_micro,
+                    "count_cc": count_cc, "client_order_id": coid,
+                }
+            else:
+                logger.debug(f"perps_farmer: place {side} failed: {e}")
+
+    # ── fills & accounting ───────────────────────────────────────────
+
+    async def _poll_fills(self, ticker: str, cfg: dict) -> None:
+        min_ts = self.last_fill_ts - 5 if self.last_fill_ts else int(time.time()) - 3600
+        try:
+            fills = await papi.get_perps_fills(min_ts=min_ts)
+        except Exception as e:
+            logger.debug(f"perps_farmer: fills poll failed: {e}")
+            return
+        new_rows = []
+        for f in fills:
+            tkr = f.get("market_ticker") or f.get("ticker") or ""
+            if tkr != ticker:
+                continue
+            # /margin/fills identifies a fill as `fill_id` (the public trade
+            # tape uses `trade_id`; the fills endpoint does NOT). Reading the
+            # wrong key left trade_id empty and skipped EVERY fill — inventory
+            # reconciled off the positions endpoint while volume/fees/P&L (and
+            # therefore the cost + daily-loss halts) stayed at zero. Keep
+            # trade_id as a fallback in case the schema ever converges.
+            trade_id = str(f.get("fill_id") or f.get("trade_id") or "")
+            if not trade_id:
+                continue
+            price = papi.usd_micro(f.get("price"))
+            count = papi.cc(f.get("count"))
+            if price is None or count is None:
+                continue
+            ts_ms = f.get("ts_ms")
+            if ts_ms is None and f.get("created_time"):
+                try:
+                    dt = datetime.fromisoformat(
+                        str(f["created_time"]).replace("Z", "+00:00"))
+                    ts_ms = int(dt.timestamp() * 1000)
+                except ValueError:
+                    ts_ms = None
+            new_rows.append({
+                "trade_id": trade_id,
+                "order_id": str(f.get("order_id") or ""),
+                "ticker": tkr,
+                "ts_ms": ts_ms,
+                "side": str(f.get("side") or ""),
+                "count_cc": count,
+                "price_usd_micro": price,
+                # /margin/fills reports fees as `fees` (dollars). `fee_cost` is
+                # the event-order field name and is absent here — reading it
+                # booked every fill at zero fee, understating farming cost.
+                "fee_usd_micro": papi.usd_micro(
+                    f.get("fees") if f.get("fees") is not None
+                    else f.get("fee_cost")) or 0,
+                "is_taker": bool(f.get("is_taker")),
+            })
+        if not new_rows:
+            return
+        new_rows.sort(key=lambda r: r["ts_ms"] or 0)
+        with db.get_db() as conn:
+            for r in new_rows:
+                if db.perp_farm_fill_seen(conn, r["trade_id"], self.env):
+                    continue
+                inv, avg, realized = apply_fill(
+                    self.inventory_cc, self.avg_entry_micro,
+                    r["side"], r["count_cc"], r["price_usd_micro"],
+                )
+                self.inventory_cc, self.avg_entry_micro = inv, avg
+                r["realized_pnl_usd_micro"] = realized
+                r["inventory_after_cc"] = inv
+                r["kalshi_env"] = self.env
+                db.insert_perp_farm_fill(conn, r)
+                self._stats_dirty = True
+                if r["ts_ms"]:
+                    self.last_fill_ts = max(self.last_fill_ts, int(r["ts_ms"] // 1000))
+                # A filled resting order is gone (partial fills re-quote next
+                # tick at the fresh touch — simpler than tracking remainders).
+                for side, o in list(self.live.items()):
+                    if o.get("order_id") == r["order_id"]:
+                        self.live.pop(side, None)
+
+    def _refresh_day_stats(self) -> dict:
+        day = _utc_day()
+        if not self._stats_dirty and self._stats_day == day and self.day_stats:
+            return self.day_stats
+        try:
+            with db.get_db() as conn:
+                self.day_stats = db.perp_farm_stats(conn, self.env, day_utc=day)
+            self._stats_day = day
+            self._stats_dirty = False
+        except Exception as e:
+            logger.debug(f"perps_farmer: stats failed: {e}")
+        return self.day_stats
+
+    def _check_economics(self, cfg: dict) -> None:
+        s = self._refresh_day_stats()
+        if not s:
+            return
+        vol_usd = s["volume_usd_micro"] / 1e6
+        net_micro = s["realized_usd_micro"] - s["fees_usd_micro"]
+        max_loss = float(cfg.get("perps_farm_daily_loss_usd", 2.0))
+        if net_micro / 1e6 <= -max_loss:
+            self._halt(f"daily loss cap hit (net ${net_micro / 1e6:.2f})")
+            return
+        max_cost_bps = float(cfg.get("perps_farm_max_cost_bps", 4.0))
+        if vol_usd >= _MIN_COST_SAMPLE_USD and net_micro < 0:
+            cost_bps = (-net_micro / 1e6) / vol_usd * 10_000
+            if cost_bps > max_cost_bps:
+                self._halt(
+                    f"measured cost {cost_bps:.1f} bps/volume$ exceeds "
+                    f"{max_cost_bps:.1f} bps cap"
+                )
+                return
+        target = float(cfg.get("perps_farm_daily_volume_usd", 0) or 0)
+        if target > 0 and vol_usd >= target:
+            self._halt(f"daily volume target ${target:,.0f} reached")
+
+    # ── reconcile ────────────────────────────────────────────────────
+
+    async def _reconcile(self, ticker: str) -> None:
+        try:
+            positions = await papi.get_perps_positions(ticker)
+        except Exception as e:
+            logger.debug(f"perps_farmer: reconcile failed: {e}")
+            return
+        remote_cc = 0
+        remote_avg = 0.0
+        for p in positions:
+            if (p.get("market_ticker") or "") != ticker:
+                continue
+            remote_cc = papi.cc(p.get("position")) or 0
+            remote_avg = float(papi.usd_micro(p.get("entry_price")) or 0)
+        if remote_cc != self.inventory_cc:
+            logger.info(
+                f"perps_farmer: inventory reconcile {self.inventory_cc}→{remote_cc}cc "
+                f"(exchange is source of truth)"
+            )
+            self.inventory_cc = remote_cc
+            if remote_avg:
+                self.avg_entry_micro = remote_avg
+
+    async def _account_gates_ok(self, cfg: dict) -> bool:
+        now = time.monotonic()
+        if now - self._last_balance_t > _BALANCE_CACHE_SEC:
+            self._last_balance_t = now
+            try:
+                if self._margin_enabled is None:
+                    self._margin_enabled = await papi.get_perps_enabled()
+                bal = await papi.get_perps_balance()
+                avail = 0.0
+                for sub in (bal.get("subaccount_balances") or []):
+                    if int(sub.get("subaccount") or 0) == 0:
+                        avail = float(papi.micro_to_usd(
+                            papi.usd_micro(sub.get("available_balance"))) or 0)
+                self._balance_ok = bool(self._margin_enabled) and avail > 1.0
+                if not self._balance_ok:
+                    self.last_error = (
+                        "margin not enabled for account" if not self._margin_enabled
+                        else "perps wallet unfunded (available < $1) — transfer funds first"
+                    )
+            except Exception as e:
+                logger.debug(f"perps_farmer: balance gate failed: {e}")
+                self._balance_ok = False
+                self.last_error = f"balance check failed: {e}"
+        return self._balance_ok
+
+    # ── main tick ────────────────────────────────────────────────────
+
+    async def farm_tick(self, cfg: dict) -> None:
+        """Awaited from the service loop every ≥2.5s while enabled. Never raises."""
+        try:
+            await self._tick(cfg)
+        except Exception as e:
+            self.last_error = str(e)
+            logger.debug(f"perps_farmer: tick error: {e}")
+
+    async def _tick(self, cfg: dict) -> None:
+        self.env = kalshi_auth.get_env()
+        ticker = self._wire_ticker(cfg)
+        self.running = True
+
+        # Fills first — accounting stays true even while standing down.
+        await self._poll_fills(ticker, cfg)
+        self._check_economics(cfg)
+
+        if self._halted() or in_maintenance_window():
+            await self._cancel_all()
+            return
+        if not pws.is_connected():
+            self.last_error = "perps stream offline"
+            await self._cancel_all()
+            return
+        q = pws.quote(ticker)
+        now_ms = int(time.time() * 1000)
+        # Freshness is judged by when we last RECEIVED a frame for this symbol
+        # (recv_ms, local clock — skew-immune), NOT Kalshi's wire ts_ms, which
+        # tracks market-event time and lags real time on slow perps books. Fall
+        # back to ts_ms only for legacy quotes without recv_ms.
+        age_ref = q.get("recv_ms") or q.get("ts_ms") if q else None
+        if not q or (age_ref and now_ms - int(age_ref) > _QUOTE_FRESH_MS):
+            self.last_error = "quote stale"
+            await self._cancel_all()
+            return
+        if not await self._account_gates_ok(cfg):
+            await self._cancel_all()
+            return
+        self.last_error = ""
+
+        if time.monotonic() - self._last_reconcile > _RECONCILE_SEC:
+            self._last_reconcile = time.monotonic()
+            await self._reconcile(ticker)
+
+        want = desired_quotes(
+            {"bid_usd_micro": q.get("bid_usd_micro"),
+             "ask_usd_micro": q.get("ask_usd_micro")},
+            self.inventory_cc, cfg,
+        )
+        clip_cc = max(1, int(cfg.get("perps_farm_clip_contracts", 1))) * 100
+
+        # Drop sides we no longer want.
+        for side in list(self.live):
+            if side not in want:
+                o = self.live.pop(side)
+                try:
+                    await papi.cancel_perps_order(o["order_id"])
+                except Exception:
+                    pass
+
+        for side, target in want.items():
+            # Cross-guard: our two resting orders must never be able to match
+            # each other (venue STP is the backstop, this is the primary).
+            other = self.live.get("ask" if side == "bid" else "bid")
+            if other:
+                if side == "bid" and target >= other["price_micro"]:
+                    continue
+                if side == "ask" and target <= other["price_micro"]:
+                    continue
+            o = self.live.get(side)
+            if o and not should_replace(o["price_micro"], target, cfg) \
+                    and o["count_cc"] == clip_cc:
+                continue
+            if o:
+                self.live.pop(side, None)
+                try:
+                    await papi.cancel_perps_order(o["order_id"])
+                except Exception:
+                    pass
+            await self._place(ticker, side, target, clip_cc)
+
+    async def flatten(self, cfg: dict) -> dict:
+        """Cancel quotes and close inventory with reduce_only IOC at the touch."""
+        ticker = self._wire_ticker(cfg)
+        await self._cancel_all()
+        closed = 0
+        for _ in range(3):
+            await self._reconcile(ticker)
+            if self.inventory_cc == 0:
+                break
+            q = pws.quote(ticker)
+            if not q:
+                break
+            side = "ask" if self.inventory_cc > 0 else "bid"
+            px = q.get("bid_usd_micro") if side == "ask" else q.get("ask_usd_micro")
+            if not px:
+                break
+            try:
+                await papi.place_perps_limit_order(
+                    ticker=ticker, side=side, count_cc=abs(self.inventory_cc),
+                    price_usd_micro=px, time_in_force="immediate_or_cancel",
+                    reduce_only=True,
+                )
+                closed += 1
+            except Exception as e:
+                logger.warning(f"perps_farmer: flatten leg failed: {e}")
+                break
+            await asyncio.sleep(1.0)
+        await self._poll_fills(ticker, cfg)
+        return {"inventoryCc": self.inventory_cc, "attempts": closed}
+
+    def status(self, cfg: dict) -> dict:
+        day = self._refresh_day_stats()
+        vol = day.get("volume_usd_micro", 0) / 1e6 if day else 0.0
+        fees = day.get("fees_usd_micro", 0) / 1e6 if day else 0.0
+        realized = day.get("realized_usd_micro", 0) / 1e6 if day else 0.0
+        net = realized - fees
+        cost_bps = (-net / vol * 10_000) if vol > 0 and net < 0 else 0.0
+        return {
+            "enabled": bool(cfg.get("perps_farm_enabled", False)),
+            "running": self.running,
+            "halted": self._halted(),
+            "haltReason": self.halt_reason if self._halted() else "",
+            "lastError": self.last_error,
+            "symbol": str(cfg.get("perps_farm_symbol") or "KXBTCPERP"),
+            "inventoryContracts": self.inventory_cc / 100,
+            "avgEntry": (self.avg_entry_micro / 1e6) if self.inventory_cc else None,
+            "liveOrders": [
+                {"side": s, "price": o["price_micro"] / 1e6,
+                 "contracts": o["count_cc"] / 100}
+                for s, o in self.live.items()
+            ],
+            "today": {
+                "fills": day.get("fills", 0) if day else 0,
+                "volumeUsd": round(vol, 2),
+                "feesUsd": round(fees, 4),
+                "realizedUsd": round(realized, 4),
+                "netUsd": round(net, 4),
+                "costBps": round(cost_bps, 2),
+            },
+            "maintenanceWindow": in_maintenance_window(),
+        }
+
+
+_farmer = _Farmer()
+
+
+async def farm_tick(cfg: dict) -> None:
+    await _farmer.farm_tick(cfg)
+
+
+async def ensure_stopped() -> None:
+    """Called when the toggle goes off — cancel resting quotes exactly once."""
+    if _farmer.running or _farmer.live:
+        await _farmer.stop(cancel_orders=True)
+
+
+async def flatten(cfg: dict) -> dict:
+    return await _farmer.flatten(cfg)
+
+
+def status(cfg: dict) -> dict:
+    return _farmer.status(cfg)

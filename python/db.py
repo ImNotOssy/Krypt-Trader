@@ -340,6 +340,137 @@ CREATE TABLE IF NOT EXISTS crypto15m_ticks (
 CREATE INDEX IF NOT EXISTS idx_c15tick_ticker ON crypto15m_ticks(ticker, observed_at);
 CREATE INDEX IF NOT EXISTS idx_c15tick_time ON crypto15m_ticks(observed_at);
 
+-- Kalshi perpetual futures (margin API) market data. Prices are INTEGER
+-- micro-dollars (1 = $0.000001; perp tick is $0.0001, wire allows 6dp) and
+-- counts INTEGER centi-contracts (1 = 0.01 contracts) — exact fixed-point,
+-- parsed via Decimal at the wire boundary, never float (this codebase's
+-- cents-vs-dollars history earned that rule). Funding rates stay REAL.
+-- kalshi_env defaults 'production': the public REST recorder path always
+-- reads prod (unauthenticated) regardless of the trading env.
+
+-- perp_ticks: WS ticker-channel stream (1/sec/market coalesced) + REST
+-- /margin/markets snapshot rows (src='rest', the baseline when WS is down).
+CREATE TABLE IF NOT EXISTS perp_ticks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,                       -- wire ticker (KXBTCPERP / demo KXBTCPERP1)
+    observed_at TEXT DEFAULT (datetime('now')),
+    ts_ms INTEGER,                              -- wire event time, epoch ms (NULL for REST rows)
+    last_usd_micro INTEGER,
+    bid_usd_micro INTEGER,
+    ask_usd_micro INTEGER,
+    bid_size_cc INTEGER,
+    ask_size_cc INTEGER,
+    volume_24h_cc INTEGER,
+    oi_cc INTEGER,
+    ref_usd_micro INTEGER,                      -- CF Benchmarks index × contract_size
+    ref_ts_ms INTEGER,
+    settle_mark_usd_micro INTEGER,
+    liq_mark_usd_micro INTEGER,
+    funding_rate REAL,                          -- running estimate (decimal per 8h window)
+    next_funding_ms INTEGER,
+    src TEXT DEFAULT 'ws',                      -- 'ws' | 'rest'
+    kalshi_env TEXT DEFAULT 'production'
+);
+CREATE INDEX IF NOT EXISTS idx_perptick_ticker ON perp_ticks(ticker, observed_at);
+CREATE INDEX IF NOT EXISTS idx_perptick_tsms   ON perp_ticks(ticker, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_perptick_time   ON perp_ticks(observed_at);
+
+-- perp_trades: public tape (WS trade channel + REST backfill), deduped on trade_id.
+CREATE TABLE IF NOT EXISTS perp_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    observed_at TEXT DEFAULT (datetime('now')),
+    ts_ms INTEGER,
+    price_usd_micro INTEGER NOT NULL,
+    count_cc INTEGER NOT NULL,
+    taker_side TEXT,                            -- 'bid' | 'ask' (perps have no yes/no)
+    kalshi_env TEXT DEFAULT 'production',
+    UNIQUE(trade_id, kalshi_env)
+);
+CREATE INDEX IF NOT EXISTS idx_perptrade_ticker ON perp_trades(ticker, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_perptrade_time   ON perp_trades(observed_at);
+
+-- perp_candles: REST candlesticks (period_min ∈ 1|60|1440 — Kalshi has NO 15m).
+-- Quote (bid/ask) OHLC is always present; trade OHLC/mean is NULL when no
+-- trades printed in the period. Upserted, so top-up/backfill are idempotent.
+CREATE TABLE IF NOT EXISTS perp_candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    period_min INTEGER NOT NULL,
+    end_ts INTEGER NOT NULL,                    -- wire end_period_ts, unix SECONDS, inclusive
+    bid_open_usd_micro INTEGER, bid_high_usd_micro INTEGER,
+    bid_low_usd_micro INTEGER,  bid_close_usd_micro INTEGER,
+    ask_open_usd_micro INTEGER, ask_high_usd_micro INTEGER,
+    ask_low_usd_micro INTEGER,  ask_close_usd_micro INTEGER,
+    trade_open_usd_micro INTEGER, trade_high_usd_micro INTEGER,
+    trade_low_usd_micro INTEGER,  trade_close_usd_micro INTEGER,
+    trade_mean_usd_micro INTEGER,
+    volume_cc INTEGER,
+    volume_notional_usd_micro INTEGER,
+    oi_cc INTEGER,
+    kalshi_env TEXT DEFAULT 'production',
+    UNIQUE(ticker, period_min, end_ts, kalshi_env)
+);
+CREATE INDEX IF NOT EXISTS idx_perpcandle_lookup ON perp_candles(ticker, period_min, end_ts);
+
+-- perp_farm_fills: the volume farmer's own fills (accounting source of truth
+-- for volume/fees/realized P&L; deduped on trade_id like perp_trades).
+CREATE TABLE IF NOT EXISTS perp_farm_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL,
+    order_id TEXT DEFAULT '',
+    ticker TEXT NOT NULL,
+    observed_at TEXT DEFAULT (datetime('now')),
+    ts_ms INTEGER,
+    side TEXT,                                  -- our order side: 'bid' | 'ask'
+    count_cc INTEGER NOT NULL,
+    price_usd_micro INTEGER NOT NULL,
+    fee_usd_micro INTEGER DEFAULT 0,
+    is_taker INTEGER DEFAULT 0,
+    realized_pnl_usd_micro INTEGER DEFAULT 0,   -- avg-cost realized on this fill
+    inventory_after_cc INTEGER,
+    kalshi_env TEXT DEFAULT 'production',
+    UNIQUE(trade_id, kalshi_env)
+);
+CREATE INDEX IF NOT EXISTS idx_perpfarm_time ON perp_farm_fills(observed_at);
+CREATE INDEX IF NOT EXISTS idx_perpfarm_ticker ON perp_farm_fills(ticker, observed_at);
+
+-- perp_positions: user-strategy positions (paper AND live — dry_run flag).
+-- Prices in INTEGER micro-dollars, counts centi-contracts, like all perp tables.
+CREATE TABLE IF NOT EXISTS perp_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,                         -- 'long' | 'short'
+    dry_run INTEGER DEFAULT 1,                  -- 1 = paper fill, 0 = real order
+    opened_at TEXT DEFAULT (datetime('now')),
+    closed_at TEXT,
+    count_cc INTEGER NOT NULL,
+    entry_usd_micro INTEGER NOT NULL,
+    exit_usd_micro INTEGER,
+    leverage REAL DEFAULT 1,
+    fees_usd_micro INTEGER DEFAULT 0,           -- entry+exit fees
+    funding_usd_micro INTEGER DEFAULT 0,        -- funding paid(-)/received(+) while held
+    pnl_usd_micro INTEGER,                      -- realized net (px + funding - fees)
+    exit_reason TEXT DEFAULT '',                -- tp|sl|max_hold|rules_exit|flatten|liquidated
+    entry_reason TEXT DEFAULT '',
+    kalshi_env TEXT DEFAULT 'production'
+);
+CREATE INDEX IF NOT EXISTS idx_perppos_open ON perp_positions(closed_at, ticker);
+CREATE INDEX IF NOT EXISTS idx_perppos_time ON perp_positions(opened_at DESC);
+
+-- perp_funding: finalized funding rates (8h windows: 04/12/20 UTC). Tiny; kept forever.
+CREATE TABLE IF NOT EXISTS perp_funding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    funding_time TEXT NOT NULL,                 -- RFC3339 normalized to 'YYYY-MM-DD HH:MM:SS' UTC
+    funding_rate REAL NOT NULL,
+    mark_usd_micro INTEGER,
+    kalshi_env TEXT DEFAULT 'production',
+    UNIQUE(ticker, funding_time, kalshi_env)
+);
+CREATE INDEX IF NOT EXISTS idx_perpfund_lookup ON perp_funding(ticker, funding_time);
+
 -- bot_runs: each row is a single launch of the bot (start → stop).
 -- This is what powers the user-facing "session P&L" model — every
 -- restart starts a fresh run, and `start_balance` is what we benchmark
@@ -471,6 +602,12 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
         "crypto15m_positions",
         "crypto15m_signals",
         "crypto15m_ticks",
+        "perp_ticks",
+        "perp_trades",
+        "perp_candles",
+        "perp_funding",
+        "perp_farm_fills",
+        "perp_positions",
     ]
     if wipe_markets:
         targets.extend(["markets", "events", "trades", "market_snapshots"])
@@ -496,6 +633,8 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
                 "('bot_positions','bot_runs','pnl_snapshots',"
                 "'daily_stats','order_events','alerts','whale_trades',"
                 "'crypto15m_positions','crypto15m_signals','crypto15m_ticks',"
+                "'perp_ticks','perp_trades','perp_candles','perp_funding',"
+                "'perp_farm_fills','perp_positions',"
                 "'markets','events','trades','market_snapshots')",
             )
     except sqlite3.OperationalError:
@@ -1571,6 +1710,8 @@ def crypto15m_signal_counts(conn) -> dict:
 # came from (sniper validated, pairs killed) — deleting them at 14 days
 # starves user backtests of sample.
 _C15_TICKS_KEEP_DAYS = 60
+_PERP_TICKS_KEEP_DAYS = 30
+_PERP_CANDLES_KEEP_DAYS = 365
 
 
 def insert_crypto15m_tick(conn, row: dict) -> None:
@@ -1628,6 +1769,264 @@ def recent_crypto15m_resolved(conn, env: str, limit: int = 200) -> list[dict]:
 
 def crypto15m_tick_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0])
+
+
+# ───────── perps (margin) market-data recording ─────────────────────────────
+# Rows arrive pre-converted to integer micro-dollars / centi-contracts
+# (kalshi_perps_api.usd_micro / cc at the wire boundary). Helpers take `conn`;
+# callers own the transaction — the recorder batches one txn per flush.
+
+_PERP_TICK_COLS = (
+    "ticker", "ts_ms", "last_usd_micro", "bid_usd_micro", "ask_usd_micro",
+    "bid_size_cc", "ask_size_cc", "volume_24h_cc", "oi_cc",
+    "ref_usd_micro", "ref_ts_ms", "settle_mark_usd_micro", "liq_mark_usd_micro",
+    "funding_rate", "next_funding_ms", "src", "kalshi_env",
+)
+
+
+def insert_perp_ticks(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    sql = (
+        f"INSERT INTO perp_ticks ({','.join(_PERP_TICK_COLS)}) "
+        f"VALUES ({','.join('?' * len(_PERP_TICK_COLS))})"
+    )
+    # kalshi_env is written explicitly on every row — never rely on the DDL
+    # default (c15 tables default 'demo', perps 'production'; a missed field
+    # would silently mislabel the env).
+    conn.executemany(sql, [
+        tuple(r.get(c) for c in _PERP_TICK_COLS) for r in rows
+    ])
+    return len(rows)
+
+
+def insert_perp_trades(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    cur = conn.executemany(
+        """INSERT OR IGNORE INTO perp_trades
+              (trade_id, ticker, ts_ms, price_usd_micro, count_cc,
+               taker_side, kalshi_env)
+           VALUES (?,?,?,?,?,?,?)""",
+        [
+            (r.get("trade_id"), r.get("ticker"), r.get("ts_ms"),
+             r.get("price_usd_micro"), r.get("count_cc"),
+             r.get("taker_side"), r.get("kalshi_env"))
+            for r in rows
+        ],
+    )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+_PERP_CANDLE_COLS = (
+    "ticker", "period_min", "end_ts",
+    "bid_open_usd_micro", "bid_high_usd_micro", "bid_low_usd_micro", "bid_close_usd_micro",
+    "ask_open_usd_micro", "ask_high_usd_micro", "ask_low_usd_micro", "ask_close_usd_micro",
+    "trade_open_usd_micro", "trade_high_usd_micro", "trade_low_usd_micro",
+    "trade_close_usd_micro", "trade_mean_usd_micro",
+    "volume_cc", "volume_notional_usd_micro", "oi_cc", "kalshi_env",
+)
+
+
+def upsert_perp_candles(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    update_cols = [c for c in _PERP_CANDLE_COLS
+                   if c not in ("ticker", "period_min", "end_ts", "kalshi_env")]
+    sql = (
+        f"INSERT INTO perp_candles ({','.join(_PERP_CANDLE_COLS)}) "
+        f"VALUES ({','.join('?' * len(_PERP_CANDLE_COLS))}) "
+        f"ON CONFLICT(ticker, period_min, end_ts, kalshi_env) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in update_cols)
+    )
+    conn.executemany(sql, [
+        tuple(r.get(c) for c in _PERP_CANDLE_COLS) for r in rows
+    ])
+    return len(rows)
+
+
+def upsert_perp_funding(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    # Finalized rates never change → OR IGNORE keeps re-fetch idempotent.
+    cur = conn.executemany(
+        """INSERT OR IGNORE INTO perp_funding
+              (ticker, funding_time, funding_rate, mark_usd_micro, kalshi_env)
+           VALUES (?,?,?,?,?)""",
+        [
+            (r.get("ticker"), r.get("funding_time"), r.get("funding_rate"),
+             r.get("mark_usd_micro"), r.get("kalshi_env"))
+            for r in rows
+        ],
+    )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def perp_last_candle_end_ts(
+    conn, ticker: str, period_min: int, env: str = "production",
+) -> int | None:
+    row = conn.execute(
+        """SELECT MAX(end_ts) FROM perp_candles
+           WHERE ticker=? AND period_min=? AND kalshi_env=?""",
+        (ticker, int(period_min), env),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def perp_last_funding_time(conn, ticker: str = "", env: str = "production") -> str | None:
+    if ticker:
+        row = conn.execute(
+            "SELECT MAX(funding_time) FROM perp_funding WHERE ticker=? AND kalshi_env=?",
+            (ticker, env),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MAX(funding_time) FROM perp_funding WHERE kalshi_env=?", (env,),
+        ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def open_perp_position(conn, row: dict) -> int:
+    cur = conn.execute(
+        """INSERT INTO perp_positions
+              (ticker, side, dry_run, count_cc, entry_usd_micro, leverage,
+               fees_usd_micro, entry_reason, kalshi_env)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            row["ticker"], row["side"], 1 if row.get("dry_run", True) else 0,
+            row["count_cc"], row["entry_usd_micro"], row.get("leverage", 1),
+            row.get("fees_usd_micro", 0), row.get("entry_reason", ""),
+            row.get("kalshi_env", "production"),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def close_perp_position(
+    conn, pos_id: int, *, exit_usd_micro: int, fees_usd_micro: int,
+    funding_usd_micro: int, pnl_usd_micro: int, exit_reason: str,
+) -> None:
+    conn.execute(
+        """UPDATE perp_positions
+           SET closed_at=datetime('now'), exit_usd_micro=?,
+               fees_usd_micro=fees_usd_micro+?, funding_usd_micro=?,
+               pnl_usd_micro=?, exit_reason=?
+           WHERE id=?""",
+        (exit_usd_micro, fees_usd_micro, funding_usd_micro,
+         pnl_usd_micro, exit_reason, int(pos_id)),
+    )
+
+
+def get_open_perp_position(conn, env: str, *, dry_run: bool | None = None) -> dict | None:
+    sql = "SELECT * FROM perp_positions WHERE closed_at IS NULL AND kalshi_env=?"
+    params: list = [env]
+    if dry_run is not None:
+        sql += " AND dry_run=?"
+        params.append(1 if dry_run else 0)
+    row = conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
+    return dict(row) if row else None
+
+
+def recent_perp_positions(conn, env: str, limit: int = 100) -> list[dict]:
+    rows = conn.execute(
+        """SELECT * FROM perp_positions WHERE kalshi_env=?
+           ORDER BY id DESC LIMIT ?""",
+        (env, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def perp_strategy_day_pnl(conn, env: str, day_utc: str) -> int:
+    """Realized strategy P&L (micro-dollars) closed on the given UTC day."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(pnl_usd_micro), 0) FROM perp_positions
+           WHERE kalshi_env=? AND closed_at >= ? AND closed_at < datetime(?, '+1 day')""",
+        (env, f"{day_utc} 00:00:00", f"{day_utc} 00:00:00"),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def insert_perp_farm_fill(conn, row: dict) -> bool:
+    """True when the fill is NEW (dedup on trade_id per env) — callers only
+    apply inventory/P&L updates for new rows."""
+    cur = conn.execute(
+        """INSERT OR IGNORE INTO perp_farm_fills
+              (trade_id, order_id, ticker, ts_ms, side, count_cc,
+               price_usd_micro, fee_usd_micro, is_taker,
+               realized_pnl_usd_micro, inventory_after_cc, kalshi_env)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row.get("trade_id"), row.get("order_id", ""), row.get("ticker"),
+            row.get("ts_ms"), row.get("side"), row.get("count_cc"),
+            row.get("price_usd_micro"), row.get("fee_usd_micro", 0),
+            1 if row.get("is_taker") else 0,
+            row.get("realized_pnl_usd_micro", 0),
+            row.get("inventory_after_cc"), row.get("kalshi_env"),
+        ),
+    )
+    return bool(cur.rowcount and cur.rowcount > 0)
+
+
+def perp_farm_fill_seen(conn, trade_id: str, env: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM perp_farm_fills WHERE trade_id=? AND kalshi_env=? LIMIT 1",
+        (trade_id, env),
+    ).fetchone()
+    return row is not None
+
+
+def perp_farm_stats(conn, env: str, *, day_utc: str | None = None) -> dict:
+    """Volume/fees/realized aggregates in micro-dollars. day_utc 'YYYY-MM-DD'
+    filters to that UTC day; None = lifetime."""
+    where = "kalshi_env=?"
+    params: list = [env]
+    if day_utc:
+        where += " AND observed_at >= ? AND observed_at < datetime(?, '+1 day')"
+        params += [f"{day_utc} 00:00:00", f"{day_utc} 00:00:00"]
+    row = conn.execute(
+        f"""SELECT COUNT(*),
+                   COALESCE(SUM(CAST(price_usd_micro AS REAL) * count_cc / 100.0), 0),
+                   COALESCE(SUM(fee_usd_micro), 0),
+                   COALESCE(SUM(realized_pnl_usd_micro), 0),
+                   MAX(observed_at)
+            FROM perp_farm_fills WHERE {where}""",
+        params,
+    ).fetchone()
+    return {
+        "fills": int(row[0] or 0),
+        "volume_usd_micro": int(row[1] or 0),
+        "fees_usd_micro": int(row[2] or 0),
+        "realized_usd_micro": int(row[3] or 0),
+        "lastAt": row[4],
+    }
+
+
+def perp_collection_counts(conn, env: str = "production") -> dict:
+    out: dict = {"ticks": 0, "trades": 0, "candles": 0, "funding": 0,
+                 "firstAt": None, "lastAt": None, "byTicker": []}
+    try:
+        for key, table in (("ticks", "perp_ticks"), ("trades", "perp_trades"),
+                           ("candles", "perp_candles"), ("funding", "perp_funding")):
+            out[key] = int(conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE kalshi_env=?", (env,),
+            ).fetchone()[0])
+        row = conn.execute(
+            "SELECT MIN(observed_at), MAX(observed_at) FROM perp_ticks WHERE kalshi_env=?",
+            (env,),
+        ).fetchone()
+        if row:
+            out["firstAt"], out["lastAt"] = row[0], row[1]
+        rows = conn.execute(
+            """SELECT ticker, COUNT(*) n, MAX(observed_at) last_at
+               FROM perp_ticks WHERE kalshi_env=? GROUP BY ticker ORDER BY ticker""",
+            (env,),
+        ).fetchall()
+        out["byTicker"] = [
+            {"ticker": r[0], "ticks": int(r[1]), "lastAt": r[2]} for r in rows
+        ]
+    except sqlite3.OperationalError:
+        pass
+    return out
 
 
 
@@ -1963,11 +2362,19 @@ def cleanup_old_data(
     c15sig_cutoff = (now - timedelta(days=c15_signal_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     ticks_cutoff = (now - timedelta(days=_C15_TICKS_KEEP_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    perp_tick_cutoff = (now - timedelta(days=_PERP_TICKS_KEEP_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    perp_candle_cutoff_epoch = int((now - timedelta(days=_PERP_CANDLES_KEEP_DAYS)).timestamp())
 
     deleted = 0
     deleted += _delete_batched("created_time < ?", (trade_cutoff,), "trades")
     deleted += _delete_batched("snapshot_at < ?", (snap_cutoff,), "market_snapshots")
     deleted += _delete_batched("observed_at < ?", (ticks_cutoff,), "crypto15m_ticks")
+    # Perps recording: ticks/trades are the bulky raw series (5 symbols @1Hz ≈
+    # 430k rows/day); candles+funding are the compact long-horizon record —
+    # candles kept a year, funding never pruned (13 tickers × 3 rows/day).
+    deleted += _delete_batched("observed_at < ?", (perp_tick_cutoff,), "perp_ticks")
+    deleted += _delete_batched("observed_at < ?", (perp_tick_cutoff,), "perp_trades")
+    deleted += _delete_batched("end_ts < ?", (perp_candle_cutoff_epoch,), "perp_candles")
     # order_events + resolved 15m signals were never swept → unbounded growth.
     deleted += _delete_batched("created_at < ?", (event_cutoff,), "order_events")
     deleted += _delete_batched(

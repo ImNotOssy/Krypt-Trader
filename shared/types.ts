@@ -128,6 +128,40 @@ export interface TraderConfig {
   crypto15mHoursEndUtc?: number;
   crypto15mRecordSignals?: boolean;
   mainRecordSignals?: boolean;             // record whale/momentum signals while the app runs (forced on when trading is enabled)
+  // Perpetual futures (Kalshi margin API) — passive market-data recorder.
+  // Public REST always reads production (unauthenticated) so research data
+  // flows in any env; the WS accelerator follows the active env's creds.
+  perpsRecordSignals?: boolean;
+  perpsWsEnabled?: boolean;
+  perpsSymbols?: string[];                 // prod tickers (KXBTCPERP…); demo '1' suffix handled internally
+  // Perps volume farmer — maker-only two-sided quoting for the in-app volume
+  // rewards. Loss-budgeted volume engine, auto-halts when measured cost per
+  // $ of volume exceeds perpsFarmMaxCostBps or the daily loss cap.
+  perpsFarmEnabled?: boolean;
+  perpsFarmSymbol?: string;
+  perpsFarmClipContracts?: number;
+  perpsFarmMaxInventoryContracts?: number;
+  perpsFarmDailyLossUsd?: number;
+  perpsFarmDailyVolumeUsd?: number;        // 0 = no daily volume target
+  perpsFarmMaxCostBps?: number;
+  // Perps user strategy (rule-composed like the 15m builder; same gates run
+  // in backtest, paper and live). perpsStratEnabled = paper trading;
+  // perpsStratLive = REAL leveraged orders (explicit risk-ack modal in UI).
+  perpsStratEnabled?: boolean;
+  perpsStratLive?: boolean;
+  perpsStratSymbol?: string;
+  perpsStratDirection?: 'long' | 'short';
+  perpsStratRules?: RuleCondition[];
+  perpsStratEntryStyle?: 'taker' | 'maker';
+  perpsStratContracts?: number;
+  perpsStratLeverage?: number;             // hard-capped 5x
+  perpsStratTpBps?: number;
+  perpsStratSlBps?: number;
+  perpsStratMaxHoldMin?: number;
+  perpsStratExitOnRulesFail?: boolean;
+  perpsStratDailyLossUsd?: number;
+  perpsStratMaxNotionalUsd?: number;
+  perpsStratFeeEra?: 'today' | 'jul8';     // backtest fee scenario
   crypto15mIndicatorDetect?: boolean;            // compute underlying MACD/RSI (rule fields, detection-only)
   crypto15mSpotWs?: boolean;                     // Coinbase WS spot feed (BRTI proxy) + final-minute settlement tracker
   crypto15mArbDetect?: boolean;                  // detect Up+Down ≠ $1 arbitrage
@@ -545,7 +579,86 @@ export interface CollectionStats {
     topCategories: { category: string; n: number }[];
     recent: { ticker: string; category: string; taker_side: string; price: number; dollar_value: number; outcome_correct: number | null; resolved: number; created_at: string }[];
   };
-  collecting: { c15: boolean; main: boolean };
+  perps: PerpsCounts;
+  collecting: { c15: boolean; main: boolean; perps: boolean };
+}
+
+export interface PerpsCounts {
+  ticks: number; trades: number; candles: number; funding: number;
+  firstAt: string | null; lastAt: string | null;
+  byTicker: { ticker: string; ticks: number; lastAt: string | null }[];
+}
+
+export interface PerpsStatus {
+  recording: boolean;
+  wsConnected: boolean;
+  ws: {
+    enabled: boolean; connected: boolean; env: string; symbols: string[];
+    bufferedTicks: number; bufferedTrades: number;
+    droppedTicks: number; droppedTrades: number;
+    lastMsgAgeSec: number | null;
+  };
+  symbols: string[];
+  quotes: {
+    symbol: string; last: number | null; bid: number | null; ask: number | null;
+    ref: number | null; fundingRate: number | null;
+    nextFundingTime: string | null; tsMs: number | null;
+  }[];
+  counts: PerpsCounts;
+  backfill: { running: boolean; done: boolean; progress: string; error: string | null };
+  farmer: PerpsFarmerStatus;
+  strategy: PerpsStrategyStatus;
+}
+
+export interface PerpsStrategyStatus {
+  enabled: boolean;
+  live: boolean;
+  halted: boolean;
+  haltReason: string;
+  lastReason: string;                      // why-not-entering, surfaced live
+  lastError: string;
+  openPosition: {
+    ticker: string; side: string; dryRun: boolean; contracts: number;
+    entry: number; mark: number | null; unrealizedUsd: number | null;
+    openedAt: string;
+  } | null;
+  dayPnlUsd: number;
+  bars: number;
+}
+
+export interface PerpPositionRow {
+  id: number;
+  ticker: string;
+  side: string;
+  dry_run: number;
+  opened_at: string;
+  closed_at: string | null;
+  contracts: number;
+  entryUsd: number | null;
+  exitUsd: number | null;
+  leverage: number;
+  feesUsd: number | null;
+  fundingUsd: number | null;
+  pnlUsd: number | null;
+  exit_reason: string;
+  entry_reason: string;
+}
+
+export interface PerpsFarmerStatus {
+  enabled: boolean;
+  running: boolean;
+  halted: boolean;
+  haltReason: string;
+  lastError: string;
+  symbol: string;
+  inventoryContracts: number;
+  avgEntry: number | null;
+  liveOrders: { side: string; price: number; contracts: number }[];
+  today: {
+    fills: number; volumeUsd: number; feesUsd: number;
+    realizedUsd: number; netUsd: number; costBps: number;
+  };
+  maintenanceWindow: boolean;
 }
 
 export interface TradingGate {
@@ -678,6 +791,14 @@ export interface KryptApi {
     backtest: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
     backtestMain: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
     history: (args?: { limit?: number }) => Promise<{ rows: Crypto15mPosition[] } | null>;
+  };
+  perps: {
+    status: () => Promise<PerpsStatus | null>;
+    backfill: () => Promise<{ ok: boolean } | null>;
+    farmFlatten: () => Promise<{ inventoryCc: number } | null>;
+    backtest: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
+    history: (args?: { limit?: number }) => Promise<{ rows: PerpPositionRow[] } | null>;
+    stratFlatten: () => Promise<{ closed: number } | null>;
   };
   kalshi: {
     marketUrl: (args: { eventTicker?: string; ticker?: string; env?: string }) =>

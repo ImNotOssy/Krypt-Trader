@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { FlaskConical,
   Activity, BarChart3, Bitcoin, BookOpen, Briefcase, Folder, Info, KeyRound,
-  LayoutDashboard, ListChecks, Orbit, Settings, Share2, Sparkles, Wallet,
+  LayoutDashboard, ListChecks, Orbit, Settings, Share2, Sparkles, TrendingUp, Wallet,
 } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
@@ -15,6 +15,7 @@ const NAV: { id: PageId; label: string; icon: React.ComponentType<{ className?: 
   { id: 'positions', label: 'Positions', icon: Briefcase },
   { id: 'signals', label: 'Signals', icon: Activity },
   { id: 'crypto15m', label: '15m Crypto', icon: Bitcoin },
+  { id: 'perps', label: 'Perpetuals', icon: TrendingUp },
   { id: 'backtest', label: 'Backtest', icon: FlaskConical },
   { id: 'history', label: 'History', icon: BarChart3 },
   { id: 'profiles', label: 'Profiles', icon: Folder },

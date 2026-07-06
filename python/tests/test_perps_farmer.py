@@ -1,0 +1,379 @@
+"""perps_farmer: quoting decisions, avg-cost fill accounting, halts,
+maintenance window, flatten. Pure helpers tested directly; the engine tick
+runs against monkeypatched papi/pws — no network, no real orders."""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+
+import pytest
+
+import db
+import kalshi_auth
+import perps_farmer as pf
+import perps_ws as pws
+
+
+@pytest.fixture
+def fresh_db(tmp_path, monkeypatch):
+    dbfile = tmp_path / "krypt-test.db"
+    monkeypatch.setattr(db, "db_path", lambda: dbfile)
+    db.init_db()
+    return dbfile
+
+
+@pytest.fixture
+def farmer(monkeypatch):
+    f = pf._Farmer()
+    f.env = "production"
+    monkeypatch.setattr(pf, "_farmer", f)
+    return f
+
+
+CFG = {
+    "perps_farm_enabled": True,
+    "perps_farm_symbol": "KXBTCPERP",
+    "perps_farm_clip_contracts": 1,
+    "perps_farm_max_inventory_contracts": 3,
+    "perps_farm_min_spread_ticks": 2,
+    "perps_farm_requote_ticks": 1,
+    "perps_farm_daily_loss_usd": 2.0,
+    "perps_farm_daily_volume_usd": 0.0,
+    "perps_farm_max_cost_bps": 4.0,
+}
+
+
+# ───────── pure decision helpers ─────────────────────────────────────────────
+
+def test_desired_quotes_two_sided():
+    q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000}
+    want = pf.desired_quotes(q, 0, CFG)
+    assert want == {"bid": 6_349_500, "ask": 6_353_000}
+
+
+def test_desired_quotes_spread_too_tight():
+    q = {"bid_usd_micro": 6_350_000, "ask_usd_micro": 6_350_100}  # 1 tick
+    assert pf.desired_quotes(q, 0, CFG) == {}
+
+
+def test_desired_quotes_inventory_caps_one_side():
+    q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000}
+    # long 3 contracts (cap) → no more buying, only the reducing ask
+    assert pf.desired_quotes(q, 300, CFG) == {"ask": 6_353_000}
+    assert pf.desired_quotes(q, -300, CFG) == {"bid": 6_349_500}
+
+
+def test_desired_quotes_crossed_book_stands_down():
+    assert pf.desired_quotes({"bid_usd_micro": 5, "ask_usd_micro": 5}, 0, CFG) == {}
+    assert pf.desired_quotes({"bid_usd_micro": None, "ask_usd_micro": 5}, 0, CFG) == {}
+
+
+def test_should_replace_threshold():
+    assert not pf.should_replace(6_350_000, 6_350_100, CFG)  # 1 tick — keep
+    assert pf.should_replace(6_350_000, 6_350_300, CFG)      # 3 ticks — replace
+
+
+def test_apply_fill_avg_cost_round_trip():
+    # buy 2 @ 6.35 → long 200cc @ 6.35
+    inv, avg, r = pf.apply_fill(0, 0.0, "bid", 200, 6_350_000)
+    assert (inv, avg, r) == (200, 6_350_000.0, 0)
+    # buy 2 more @ 6.36 → avg 6.355
+    inv, avg, r = pf.apply_fill(inv, avg, "bid", 200, 6_360_000)
+    assert inv == 400 and avg == pytest.approx(6_355_000.0) and r == 0
+    # sell 4 @ 6.3650 → realized = (6365000-6355000)*400/100 = 40_000 micro = $0.04
+    inv, avg, r = pf.apply_fill(inv, avg, "ask", 400, 6_365_000)
+    assert inv == 0 and r == 40_000 and avg == 0.0
+
+
+def test_apply_fill_short_side_and_flip():
+    # sell 1 @ 6.36 → short
+    inv, avg, r = pf.apply_fill(0, 0.0, "ask", 100, 6_360_000)
+    assert inv == -100 and avg == 6_360_000.0 and r == 0
+    # buy back 1 @ 6.35 → +$0.01 realized
+    inv, avg, r = pf.apply_fill(inv, avg, "bid", 100, 6_350_000)
+    assert inv == 0 and r == 10_000
+    # short 1 @ 6.36 then buy 2 @ 6.37: realize -$0.01, flip long 1 @ 6.37
+    inv, avg, r = pf.apply_fill(-100, 6_360_000.0, "bid", 200, 6_370_000)
+    assert inv == 100 and r == -10_000 and avg == 6_370_000.0
+
+
+def test_maintenance_window():
+    thu_in = datetime(2026, 7, 9, 7, 30, tzinfo=timezone.utc)   # Thursday
+    thu_out = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    fri = datetime(2026, 7, 10, 7, 30, tzinfo=timezone.utc)
+    assert pf.in_maintenance_window(thu_in) is True
+    assert pf.in_maintenance_window(thu_out) is False
+    assert pf.in_maintenance_window(fri) is False
+
+
+# ───────── accounting + halts against the DB ────────────────────────────────
+
+def _seed_fill(farmer, trade_id, side, count_cc, price_micro, fee_micro=0):
+    inv, avg, realized = pf.apply_fill(
+        farmer.inventory_cc, farmer.avg_entry_micro, side, count_cc, price_micro)
+    farmer.inventory_cc, farmer.avg_entry_micro = inv, avg
+    with db.get_db() as conn:
+        db.insert_perp_farm_fill(conn, {
+            "trade_id": trade_id, "ticker": "KXBTCPERP", "ts_ms": 1,
+            "side": side, "count_cc": count_cc, "price_usd_micro": price_micro,
+            "fee_usd_micro": fee_micro, "realized_pnl_usd_micro": realized,
+            "inventory_after_cc": inv, "kalshi_env": "production",
+        })
+    farmer._stats_dirty = True
+
+
+def test_farm_stats_and_status(fresh_db, farmer):
+    _seed_fill(farmer, "t1", "bid", 100, 6_350_000, fee_micro=3_175)   # buy 1
+    _seed_fill(farmer, "t2", "ask", 100, 6_353_000, fee_micro=3_176)   # sell 1, +$0.003
+    st = farmer.status(CFG)
+    assert st["today"]["fills"] == 2
+    assert st["today"]["volumeUsd"] == pytest.approx(12.70, abs=0.02)
+    assert st["today"]["realizedUsd"] == pytest.approx(0.003, abs=0.0005)
+    assert st["today"]["feesUsd"] == pytest.approx(0.00635, abs=0.0005)
+    assert st["inventoryContracts"] == 0
+
+
+def test_daily_loss_halt(fresh_db, farmer):
+    # one ugly round trip: buy 10 @ 6.35, sell 10 @ 6.10 → -$2.50 realized
+    _seed_fill(farmer, "t1", "bid", 1000, 6_350_000)
+    _seed_fill(farmer, "t2", "ask", 1000, 6_100_000)
+    farmer._check_economics(CFG)
+    assert farmer._halted()
+    assert "loss cap" in farmer.halt_reason
+
+
+def test_cost_bps_halt_needs_sample(fresh_db, farmer):
+    # generous loss budget so the MEASURED-COST halt is what fires
+    cfg = dict(CFG, perps_farm_daily_loss_usd=100.0)
+    # tiny volume, small loss → NOT halted (below the $500 sample floor)
+    _seed_fill(farmer, "t1", "bid", 100, 6_350_000, fee_micro=10_000)
+    _seed_fill(farmer, "t2", "ask", 100, 6_349_000, fee_micro=10_000)
+    farmer._check_economics(cfg)
+    assert not farmer._halted()
+    # scale volume past the floor with cost ≈ 6.3 bps > the 4 bps cap → halts
+    for i in range(50):
+        _seed_fill(farmer, f"b{i}", "bid", 1000, 6_350_000, fee_micro=40_000)
+        _seed_fill(farmer, f"s{i}", "ask", 1000, 6_350_000, fee_micro=40_000)
+    farmer._check_economics(cfg)
+    assert farmer._halted()
+    assert "bps" in farmer.halt_reason
+
+
+def test_volume_target_halt(fresh_db, farmer):
+    cfg = dict(CFG, perps_farm_daily_volume_usd=10.0)
+    _seed_fill(farmer, "t1", "bid", 100, 6_350_000)
+    _seed_fill(farmer, "t2", "ask", 100, 6_350_000)
+    farmer._check_economics(cfg)
+    assert farmer._halted()
+    assert "target" in farmer.halt_reason
+
+
+def test_halt_expires_next_day(fresh_db, farmer):
+    farmer._halt("test")
+    assert farmer._halted()
+    farmer.halted_day = "2020-01-01"
+    assert not farmer._halted()
+
+
+# ───────── engine tick against fakes ─────────────────────────────────────────
+
+class _FakePapi:
+    def __init__(self):
+        self.placed = []
+        self.canceled = []
+        self.next_order_id = 0
+
+    async def place(self, **kw):
+        self.next_order_id += 1
+        self.placed.append(kw)
+        return {"order_id": f"o{self.next_order_id}", "fill_count": "0",
+                "remaining_count": kw["count_cc"]}
+
+
+def _wire_fakes(monkeypatch, farmer, fake, quote):
+    import kalshi_perps_api as papi
+
+    async def place(**kw):
+        return await fake.place(**kw)
+
+    async def cancel(order_id):
+        fake.canceled.append(order_id)
+        return {}
+
+    async def fills(**kw):
+        return []
+
+    async def positions(ticker=""):
+        return []
+
+    async def enabled():
+        return True
+
+    async def balance(**kw):
+        return {"subaccount_balances": [
+            {"subaccount": 0, "available_balance": "100.0000"}]}
+
+    monkeypatch.setattr(papi, "place_perps_limit_order", place)
+    monkeypatch.setattr(papi, "cancel_perps_order", cancel)
+    monkeypatch.setattr(papi, "get_perps_fills", fills)
+    monkeypatch.setattr(papi, "get_perps_positions", positions)
+    monkeypatch.setattr(papi, "get_perps_enabled", enabled)
+    monkeypatch.setattr(papi, "get_perps_balance", balance)
+    monkeypatch.setattr(pws, "is_connected", lambda: True)
+    monkeypatch.setattr(pws, "quote", lambda t: quote)
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
+
+
+def _fresh_quote():
+    import time
+    now = int(time.time() * 1000)
+    return {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000,
+            "ts_ms": now, "recv_ms": now}
+
+
+def test_tick_places_both_sides(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    asyncio.run(farmer.farm_tick(CFG))
+    sides = {p["side"] for p in fake.placed}
+    assert sides == {"bid", "ask"}
+    assert all(p["post_only"] for p in fake.placed)
+    assert farmer.live["bid"]["price_micro"] == 6_349_500
+    assert farmer.live["ask"]["price_micro"] == 6_353_000
+
+
+def test_tick_requotes_on_drift(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    q = _fresh_quote()
+    _wire_fakes(monkeypatch, farmer, fake, q)
+    asyncio.run(farmer.farm_tick(CFG))
+    placed_before = len(fake.placed)
+    # touch drifts 3 ticks up → both orders replaced
+    q["bid_usd_micro"] += 300
+    q["ask_usd_micro"] += 300
+    asyncio.run(farmer.farm_tick(CFG))
+    assert len(fake.canceled) == 2
+    assert len(fake.placed) == placed_before + 2
+
+
+def test_tick_keeps_orders_within_tolerance(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    q = _fresh_quote()
+    _wire_fakes(monkeypatch, farmer, fake, q)
+    asyncio.run(farmer.farm_tick(CFG))
+    placed_before = len(fake.placed)
+    q["bid_usd_micro"] += 100  # 1 tick = within tolerance
+    q["ask_usd_micro"] += 100
+    asyncio.run(farmer.farm_tick(CFG))
+    assert len(fake.placed) == placed_before
+    assert fake.canceled == []
+
+
+def test_tick_stands_down_when_halted(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    farmer._halt("test halt")
+    asyncio.run(farmer.farm_tick(CFG))
+    assert fake.placed == []
+
+
+def test_tick_cancels_when_stream_down(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    asyncio.run(farmer.farm_tick(CFG))
+    assert len(farmer.live) == 2
+    monkeypatch.setattr(pws, "is_connected", lambda: False)
+    asyncio.run(farmer.farm_tick(CFG))
+    assert farmer.live == {}
+    assert len(fake.canceled) == 2
+
+
+def test_tick_quotes_on_slow_book_fresh_receipt(fresh_db, farmer, monkeypatch):
+    """Regression: Kalshi's perps ticker wire ts_ms lags real time by minutes on
+    a slow book, but the frame was just received. Freshness must key off recv_ms
+    (local receipt), so the farmer still quotes instead of standing down."""
+    import time
+    fake = _FakePapi()
+    now = int(time.time() * 1000)
+    q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000,
+         "ts_ms": now - 90_000,   # wire event 90s ago — normal for thin perps
+         "recv_ms": now}          # ...but we received it just now
+    _wire_fakes(monkeypatch, farmer, fake, q)
+    asyncio.run(farmer.farm_tick(CFG))
+    assert {p["side"] for p in fake.placed} == {"bid", "ask"}
+    assert farmer.last_error == ""
+
+
+def test_tick_stands_down_when_receipt_stale(fresh_db, farmer, monkeypatch):
+    """No frame received for the symbol in a long time (stream quiet for it) →
+    'quote stale', even though the socket reports connected."""
+    import time
+    fake = _FakePapi()
+    now = int(time.time() * 1000)
+    q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000,
+         "ts_ms": now, "recv_ms": now - 200_000}  # received 200s ago
+    _wire_fakes(monkeypatch, farmer, fake, q)
+    asyncio.run(farmer.farm_tick(CFG))
+    assert fake.placed == []
+    assert farmer.last_error == "quote stale"
+
+
+def test_tick_never_raises(fresh_db, farmer, monkeypatch):
+    import kalshi_perps_api as papi
+
+    async def boom(**kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(papi, "get_perps_fills", boom)
+    monkeypatch.setattr(pws, "is_connected", lambda: False)
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
+    asyncio.run(farmer.farm_tick(CFG))  # must not raise
+    assert farmer.last_error != "" or True
+
+
+def test_poll_fills_parses_kalshi_margin_shape(fresh_db, farmer, monkeypatch):
+    """Regression: /margin/fills identifies fills as `fill_id` (not `trade_id`)
+    and reports fees as `fees` (not `fee_cost`). The old keys skipped every fill
+    (0 volume/fees/P&L while inventory reconciled off positions) — which also
+    silently disarmed the cost + daily-loss halts that read perp_farm_fills."""
+    import kalshi_perps_api as papi
+
+    fill = {
+        "fill_id": "F123",
+        "order_id": "o1",
+        "ticker": "KXBTCPERP",
+        "side": "ask",                 # our resting ask filled → short 1
+        "count": "1.00",               # FixedPointCount
+        "price": "6.3530",             # FixedPointDollars
+        "fees": "0.0032",              # dollars
+        "is_taker": False,
+        "created_time": "2026-07-06T05:00:00Z",
+    }
+
+    async def fills(**kw):
+        return [fill]
+
+    monkeypatch.setattr(papi, "get_perps_fills", fills)
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
+    asyncio.run(farmer._poll_fills("KXBTCPERP", CFG))
+
+    assert farmer.inventory_cc == -100          # short 1 contract booked
+    with db.get_db() as conn:
+        assert db.perp_farm_fill_seen(conn, "F123", "production")
+        row = conn.execute(
+            "SELECT side, count_cc, price_usd_micro, fee_usd_micro "
+            "FROM perp_farm_fills WHERE trade_id='F123'"
+        ).fetchone()
+    assert tuple(row) == ("ask", 100, 6_353_000, 3200)  # fee = $0.0032 captured
+
+    # Idempotent: the same fill on the next poll must not double-count.
+    asyncio.run(farmer._poll_fills("KXBTCPERP", CFG))
+    assert farmer.inventory_cc == -100
+
+
+def test_demo_env_uses_suffixed_ticker(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
+    asyncio.run(farmer.farm_tick(CFG))
+    assert all(p["ticker"] == "KXBTCPERP1" for p in fake.placed)

@@ -8,7 +8,7 @@ import { Card, Page, Switch } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
 
-type Engine = 'crypto15m' | 'main';
+type Engine = 'crypto15m' | 'main' | 'perps';
 
 /** 15m strategy presets replayable WITHOUT touching the live config — the
  * backtest RPC merges these over current settings for the run only. */
@@ -70,6 +70,11 @@ export function BacktestPage() {
     void loadCollection();
   };
 
+  const togglePerpsCollection = async (on: boolean) => {
+    await window.krypt.config.update({ perpsRecordSignals: on });
+    void loadCollection();
+  };
+
   const [exporting, setExporting] = useState(false);
   const exportData = async () => {
     setExporting(true);
@@ -93,6 +98,7 @@ export function BacktestPage() {
   };
 
   const resolvePatch = (): Partial<TraderConfig> => {
+    if (engine === 'perps') return {}; // always the current Perpetuals-page strategy
     const sel = engine === 'crypto15m' ? stratSel : mainSel;
     if (sel.startsWith('profile:')) {
       const prof = profiles.find((pr) => pr.id === sel.slice(8));
@@ -111,7 +117,9 @@ export function BacktestPage() {
       const patch = resolvePatch();
       const r = engine === 'crypto15m'
         ? await window.krypt.crypto15m.backtest({ sinceDays: days, config: patch })
-        : await window.krypt.crypto15m.backtestMain({ sinceDays: days, config: patch });
+        : engine === 'perps'
+          ? await window.krypt.perps.backtest({ sinceDays: days, config: patch })
+          : await window.krypt.crypto15m.backtestMain({ sinceDays: days, config: patch });
       setRes(r);
       if (!r) setErr('Engine not running — start the app backend first.');
     } catch (e: any) {
@@ -130,7 +138,7 @@ export function BacktestPage() {
         <div className="flex flex-wrap items-end gap-4">
           <Field label="Engine">
             <Chips
-              options={[['crypto15m', '15m Crypto'], ['main', 'Main engine (whales + momentum)']]}
+              options={[['crypto15m', '15m Crypto'], ['main', 'Main engine (whales + momentum)'], ['perps', 'Perpetuals']]}
               value={engine}
               onPick={(v) => setEngine(v as Engine)}
             />
@@ -156,6 +164,13 @@ export function BacktestPage() {
                   </optgroup>
                 )}
               </select>
+            </Field>
+          )}
+          {engine === 'perps' && (
+            <Field label="Strategy">
+              <div className="rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-krypt-dim">
+                Your Perpetuals-page strategy (rules, TP/SL, leverage, fee era) — edit it there, test it here.
+              </div>
             </Field>
           )}
           {engine === 'main' && (
@@ -220,6 +235,18 @@ export function BacktestPage() {
               <p className="mt-1.5 text-[11px] text-krypt-dim">
                 {coll ? `${coll.main.whales.toLocaleString()} whale signals · ${coll.main.alerts.toLocaleString()} momentum` : '…'}
                 {coll?.main.lastAt ? ` · last ${coll.main.lastAt.slice(5, 16)} UTC` : ''}
+              </p>
+            </div>
+            <div className="rounded-lg bg-krypt-surface2/50 p-3">
+              <Switch
+                checked={config?.perpsRecordSignals ?? true}
+                onChange={(v) => void togglePerpsCollection(v)}
+                label="Collect perpetuals data"
+                description="Records 1-second perp quotes, the trade tape, 1m candles and funding rates while the app is open — no orders, no margin. This is the dataset the upcoming perps strategies will be backtested on (see the Perpetuals page)."
+              />
+              <p className="mt-1.5 text-[11px] text-krypt-dim">
+                {coll?.perps ? `${coll.perps.ticks.toLocaleString()} quote ticks · ${coll.perps.trades.toLocaleString()} trades · ${coll.perps.candles.toLocaleString()} candles · ${coll.perps.funding.toLocaleString()} funding` : '…'}
+                {coll?.perps?.lastAt ? ` · last ${coll.perps.lastAt.slice(5, 16)} UTC` : ''}
               </p>
             </div>
           </div>

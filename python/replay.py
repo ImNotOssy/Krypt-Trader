@@ -356,3 +356,54 @@ def replay_main(cfg: dict, *, since_days: int = 60,
         "contrarianOnly and maxResolutionDays are NOT re-simulated: alerts inherit whatever filter was live when they were RECORDED (contrarianOnly gates at record time), and signal rows carry no close_time for the resolution-days gate to read.",
     ]
     return _summarize(trades, contracts, scanned, caveats)
+
+
+def perp_series(cfg: dict, ticker: str, *, since_days: int = 30,
+                env: str = "production") -> dict:
+    """Joined perps dataset for one market — the consumable a future
+    replay_perps() (and today's research notebooks) reads. Same honesty
+    contract as replay(): the caveats state the sampling reality instead of
+    letting a 1Hz-coalesced stream masquerade as tick data.
+
+    P&L note: do NOT push perps trades through backtest.summarize — perps fees
+    are bps-of-notional (tier 0: 12 taker / 5 maker) plus 8h funding cash
+    flows, not the binary settle-to-$1 + 0.07·p·(1−p) model. A perps sim owns
+    its own fee/funding math and can then emit {pnlUsd, at, won} dicts into
+    _summarize/_bucketize unchanged.
+    """
+    conn = sqlite3.connect(f"file:{dbmod.db_path()}?mode=ro", uri=True)
+    try:
+        ticks = bt.load_perp_ticks(conn, ticker, since_days=since_days, env=env)
+        trades = bt.load_perp_trades(conn, ticker, since_days=since_days, env=env)
+        candles = bt.load_perp_candles(conn, ticker, since_days=since_days, env=env)
+        funding = bt.load_perp_funding(conn, ticker, env=env)
+        summary = bt.perp_dataset_summary(conn, env)
+    finally:
+        conn.close()
+
+    med_gap = None
+    for t in summary.get("tickers", []):
+        if t.get("ticker") == ticker:
+            med_gap = t.get("medianTickGapMs")
+            break
+    caveats = [
+        "Ticker stream is WS 1Hz-coalesced per market (latest-wins within the "
+        "second) — intra-second quote changes are invisible.",
+        "REST snapshot rows (src='rest') land every ~30s and carry no sizes; "
+        "they are the baseline when the WS was down.",
+        "Recorded during app uptime only — gaps are app-closed periods; "
+        "candles (REST top-up) are the only gap-free series.",
+        "Demo rows (env='demo', tickers suffixed '1') are order-mechanics "
+        "data, not edge data — this loader defaults to production.",
+    ]
+    if med_gap is not None:
+        caveats.append(f"Median WS tick spacing for {ticker}: {med_gap}ms.")
+    return {
+        "ticker": ticker,
+        "env": env,
+        "ticks": ticks,
+        "trades": trades,
+        "candles": candles,
+        "funding": funding,
+        "caveats": caveats,
+    }

@@ -664,6 +664,34 @@ export function registerIpc(): void {
     if (!pythonBackend.isRunning()) return null;
     return await pythonBackend.request('collectionStats', {});
   });
+  ipcMain.handle('perps:status', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    try {
+      return await pythonBackend.request('perpsStatus', {});
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('perps:backfill', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('perpsBackfill', {});
+  });
+  ipcMain.handle('perps:farmFlatten', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('perpsFarmFlatten', {});
+  });
+  ipcMain.handle('perps:backtest', async (_e, args?: { sinceDays?: number }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('perpsBacktest', args || {});
+  });
+  ipcMain.handle('perps:history', async (_e, args?: { limit?: number }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('perpsHistory', args || {});
+  });
+  ipcMain.handle('perps:stratFlatten', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('perpsStratFlatten', {});
+  });
   ipcMain.handle('trading:status', async () => {
     if (!pythonBackend.isRunning()) return null;
     try {

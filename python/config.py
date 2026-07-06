@@ -194,6 +194,59 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Record whale/momentum signals while the app runs. Forced ON while
     # enable_trading is set — the engine cannot follow signals it never sees.
     "main_record_signals": True,
+
+    # ── Kalshi perpetual futures: passive data recorder (no trading) ──
+    # Streams the margin WS ticker/trade channels + polls the public REST API
+    # (always PRODUCTION — market data is unauthenticated) into the perp_*
+    # tables. Feeds the perps research program (sniper filter, consistency
+    # arb, lead-lag); collection must run for ~2 weeks before those are
+    # testable, which is why this exists ahead of any perps strategy. ON by
+    # default like the other recorders — disk is capped by the 30-day tick
+    # retention (~1GB worst case at 24/7 uptime), and the bot cannot research
+    # what it never recorded.
+    "perps_record_signals": True,
+    "perps_symbols": ["KXBTCPERP", "KXETHPERP", "KXSOLPERP", "KXXRPPERP", "KXDOGEPERP"],
+    "perps_ws_enabled": True,       # WS accelerator; REST poll is the baseline either way
+    "perps_rest_poll_sec": 30,      # public markets snapshot cadence
+    "perps_funding_est_sec": 60,    # live funding-estimate poll (series exists nowhere else)
+    "perps_funding_poll_min": 60,   # finalized-rate top-up cadence
+    "perps_candle_topup_min": 10,   # 1m candle top-up / gap repair cadence
+    "perps_backfill_days": 14,      # deep candle backfill window on first enable
+    # ── Perps volume farmer: maker-only two-sided quoting for the in-app
+    # volume rewards ($25/$50 trade; ~2-4 bps of notional at the volume
+    # tiers). A volume engine with a loss budget, not a profit strategy —
+    # auto-halts for the day when measured cost/volume exceeds max_cost_bps
+    # (i.e. farming costs more than the bonus pays) or the loss cap. ──
+    "perps_farm_enabled": False,
+    "perps_farm_symbol": "KXBTCPERP",
+    "perps_farm_clip_contracts": 1,          # contracts per resting quote
+    "perps_farm_max_inventory_contracts": 3,  # beyond ±this, quote reduce-side only
+    "perps_farm_min_spread_ticks": 2,        # stand down when book tighter than this
+    "perps_farm_requote_ticks": 1,           # re-join when touch drifts > this
+    "perps_farm_daily_loss_usd": 2.0,        # hard net-loss halt per UTC day
+    "perps_farm_daily_volume_usd": 0.0,      # stop after this much volume (0 = off)
+    "perps_farm_max_cost_bps": 4.0,          # halt when measured cost/volume$ exceeds
+
+    # ── Perps user strategy (rule-composed, like the 15m rule builder).
+    # perps_strat_enabled = paper trading on live quotes (simulated fills,
+    # dry_run rows). perps_strat_live additionally places REAL leveraged
+    # orders — gated in the UI behind an explicit risk acknowledgement.
+    # Same gates run in backtest/paper/live (replay parity). ──
+    "perps_strat_enabled": False,
+    "perps_strat_live": False,
+    "perps_strat_symbol": "KXBTCPERP",
+    "perps_strat_direction": "long",         # long | short
+    "perps_strat_rules": [],                 # {field, op, value} ANDed (perps vocabulary)
+    "perps_strat_entry_style": "taker",      # taker | maker (backtest models both; live is taker IOC)
+    "perps_strat_contracts": 1,
+    "perps_strat_leverage": 1.0,             # informs margin/liquidation sim + notional cap
+    "perps_strat_tp_bps": 30.0,              # take-profit, bps of entry (0 = off)
+    "perps_strat_sl_bps": 20.0,              # stop-loss, bps of entry (0 = off)
+    "perps_strat_max_hold_min": 60.0,        # time exit (0 = off)
+    "perps_strat_exit_on_rules_fail": False,
+    "perps_strat_daily_loss_usd": 5.0,       # halt for the UTC day
+    "perps_strat_max_notional_usd": 100.0,   # per-position notional cap
+    "perps_strat_fee_era": "jul8",           # backtest fee scenario: today | jul8
     # Underlying MACD/RSI on 1-min closes (detection-only rule fields).
     "crypto15m_indicator_detect": True,
     # Coinbase WebSocket spot feed (BRTI-constituent proxy — the number Kalshi
@@ -757,6 +810,61 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg["crypto15m_pairs_first_leg_min_cents"], cfg["crypto15m_pairs_first_leg_max_cents"] = (
             cfg["crypto15m_pairs_first_leg_max_cents"], cfg["crypto15m_pairs_first_leg_min_cents"],
         )
+    # Perps recorder — same rate-limit-floor rationale as the intervals below.
+    cfg["perps_record_signals"] = bool(cfg.get("perps_record_signals", d["perps_record_signals"]))
+    cfg["perps_ws_enabled"] = bool(cfg.get("perps_ws_enabled", d["perps_ws_enabled"]))
+    ps = cfg.get("perps_symbols")
+    if isinstance(ps, list):
+        cleaned = []
+        for s in ps:
+            if not isinstance(s, str):
+                continue
+            s = s.strip().upper().rstrip("1")  # config always stores prod symbols
+            if s.startswith("KX") and s.endswith("PERP"):
+                cleaned.append(s)
+        cfg["perps_symbols"] = list(dict.fromkeys(cleaned))[:16] or list(d["perps_symbols"])
+    else:
+        cfg["perps_symbols"] = list(d["perps_symbols"])
+    cfg["perps_farm_enabled"] = bool(cfg.get("perps_farm_enabled", d["perps_farm_enabled"]))
+    sym = str(cfg.get("perps_farm_symbol") or d["perps_farm_symbol"]).strip().upper().rstrip("1")
+    cfg["perps_farm_symbol"] = sym if (sym.startswith("KX") and sym.endswith("PERP")) else d["perps_farm_symbol"]
+    cfg["perps_farm_clip_contracts"] = _clampi(cfg.get("perps_farm_clip_contracts"), 1, 100, d["perps_farm_clip_contracts"])
+    cfg["perps_farm_max_inventory_contracts"] = _clampi(cfg.get("perps_farm_max_inventory_contracts"), 1, 1000, d["perps_farm_max_inventory_contracts"])
+    cfg["perps_farm_min_spread_ticks"] = _clampi(cfg.get("perps_farm_min_spread_ticks"), 1, 100, d["perps_farm_min_spread_ticks"])
+    cfg["perps_farm_requote_ticks"] = _clampi(cfg.get("perps_farm_requote_ticks"), 1, 100, d["perps_farm_requote_ticks"])
+    cfg["perps_farm_daily_loss_usd"] = _clampf(cfg.get("perps_farm_daily_loss_usd"), 0.1, 10000.0, d["perps_farm_daily_loss_usd"])
+    cfg["perps_farm_daily_volume_usd"] = _clampf(cfg.get("perps_farm_daily_volume_usd"), 0.0, 1e9, d["perps_farm_daily_volume_usd"])
+    cfg["perps_farm_max_cost_bps"] = _clampf(cfg.get("perps_farm_max_cost_bps"), 0.1, 100.0, d["perps_farm_max_cost_bps"])
+    cfg["perps_strat_enabled"] = bool(cfg.get("perps_strat_enabled", d["perps_strat_enabled"]))
+    cfg["perps_strat_live"] = bool(cfg.get("perps_strat_live", d["perps_strat_live"]))
+    ssym = str(cfg.get("perps_strat_symbol") or d["perps_strat_symbol"]).strip().upper().rstrip("1")
+    cfg["perps_strat_symbol"] = ssym if (ssym.startswith("KX") and ssym.endswith("PERP")) else d["perps_strat_symbol"]
+    if cfg.get("perps_strat_direction") not in ("long", "short"):
+        cfg["perps_strat_direction"] = d["perps_strat_direction"]
+    if cfg.get("perps_strat_entry_style") not in ("taker", "maker"):
+        cfg["perps_strat_entry_style"] = d["perps_strat_entry_style"]
+    if cfg.get("perps_strat_fee_era") not in ("today", "jul8"):
+        cfg["perps_strat_fee_era"] = d["perps_strat_fee_era"]
+    try:
+        from perps_strategy import PERPS_RULE_FIELDS as _PERPS_FIELDS
+    except Exception:
+        _PERPS_FIELDS = []
+    cfg["perps_strat_rules"] = rules.sanitize_rules(cfg.get("perps_strat_rules"), _PERPS_FIELDS)
+    cfg["perps_strat_contracts"] = _clampi(cfg.get("perps_strat_contracts"), 1, 500, d["perps_strat_contracts"])
+    # Leverage hard-capped at 5x regardless of what the venue allows — this is
+    # a retail research bot, not a liquidation speedrun.
+    cfg["perps_strat_leverage"] = _clampf(cfg.get("perps_strat_leverage"), 1.0, 5.0, d["perps_strat_leverage"])
+    cfg["perps_strat_tp_bps"] = _clampf(cfg.get("perps_strat_tp_bps"), 0.0, 5000.0, d["perps_strat_tp_bps"])
+    cfg["perps_strat_sl_bps"] = _clampf(cfg.get("perps_strat_sl_bps"), 0.0, 5000.0, d["perps_strat_sl_bps"])
+    cfg["perps_strat_max_hold_min"] = _clampf(cfg.get("perps_strat_max_hold_min"), 0.0, 10080.0, d["perps_strat_max_hold_min"])
+    cfg["perps_strat_exit_on_rules_fail"] = bool(cfg.get("perps_strat_exit_on_rules_fail", d["perps_strat_exit_on_rules_fail"]))
+    cfg["perps_strat_daily_loss_usd"] = _clampf(cfg.get("perps_strat_daily_loss_usd"), 0.5, 10000.0, d["perps_strat_daily_loss_usd"])
+    cfg["perps_strat_max_notional_usd"] = _clampf(cfg.get("perps_strat_max_notional_usd"), 5.0, 100000.0, d["perps_strat_max_notional_usd"])
+    cfg["perps_rest_poll_sec"] = _clampi(cfg.get("perps_rest_poll_sec"), 10, 600, d["perps_rest_poll_sec"])
+    cfg["perps_funding_est_sec"] = _clampi(cfg.get("perps_funding_est_sec"), 30, 3600, d["perps_funding_est_sec"])
+    cfg["perps_funding_poll_min"] = _clampi(cfg.get("perps_funding_poll_min"), 15, 1440, d["perps_funding_poll_min"])
+    cfg["perps_candle_topup_min"] = _clampi(cfg.get("perps_candle_topup_min"), 5, 120, d["perps_candle_topup_min"])
+    cfg["perps_backfill_days"] = _clampi(cfg.get("perps_backfill_days"), 1, 90, d["perps_backfill_days"])
     # Floor the scan/poll intervals so a user can't drive them toward ~1s and get
     # rate-limited / banned by Kalshi (the UI had no minimum).
     cfg["trade_scan_interval"] = _clampi(cfg.get("trade_scan_interval"), 5, 3600, d["trade_scan_interval"])

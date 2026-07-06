@@ -87,3 +87,26 @@ even if advised of the possibility of such damages. Your sole remedy is to stop
 using the software.
 
 If you do not agree with any of the above, do not use this software.
+
+## Perpetual Futures (Kalshi "margin")
+
+The Perpetuals features (data recorder, volume farmer, strategy builder,
+backtester, paper mode, and live mode) interact with LEVERAGED derivatives.
+In addition to everything above:
+
+- **You can lose more than your posted margin.** Leveraged positions are
+  liquidated automatically by the exchange when the market moves against you.
+  At 5x leverage, roughly a 2% adverse move can wipe a position.
+- **Fees are charged on notional, not margin.** A "small" position pays fees
+  on its full size every fill. Funding payments accrue every 8 hours while a
+  position is held.
+- **Backtests and paper trading are simulations.** They use honest fill rules
+  but cannot capture live slippage, partial fills, outages, liquidation
+  engine behavior, or your own latency. A profitable backtest is more often
+  an overfit artifact than a discovery — our own published audit of this
+  venue (bundled under `python/data/research/`) backtested eleven strategy
+  families and found zero profitable configurations.
+- **The strategy builder executes YOUR rules.** The authors provide the tool,
+  not the strategy; nothing in this software is investment advice, and no
+  outcome is warranted. Use the daily loss caps, start in paper mode, and
+  never fund the perps wallet with money you cannot afford to lose.

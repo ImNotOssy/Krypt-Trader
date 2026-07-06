@@ -333,6 +333,195 @@ def load_crypto15m_signals(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
+# ───────── perps (margin) dataset loaders ────────────────────────────────────
+# Read-only over the perp_* tables (raw sqlite3 conn like every loader here —
+# the CLI stays usable on any DB copy). DB stores exact integer micro-dollars /
+# centi-contracts; loaders hand research code floats (USD / contracts).
+#
+# Do NOT route perps P&L through summarize(): it hard-codes binary
+# settle-to-$1 economics and the 0.07·p·(1−p) fee curve. Perps fees are
+# bps-of-notional (tier 0: 12 taker / 5 maker) plus funding cash flows — any
+# perps sim must model those itself.
+
+def _perp_f(v) -> Optional[float]:
+    return None if v is None else v / 1_000_000
+
+
+def _perp_c(v) -> Optional[float]:
+    return None if v is None else v / 100
+
+
+def _since_clause(since_days: int) -> str:
+    return f"datetime('now', '-{max(1, int(since_days))} days')"
+
+
+def load_perp_ticks(
+    conn: sqlite3.Connection, ticker: str, *, since_days: int = 30,
+    env: str = "production", src: Optional[str] = None,
+) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    sql = (
+        "SELECT * FROM perp_ticks WHERE ticker=? AND kalshi_env=? "
+        f"AND observed_at >= {_since_clause(since_days)}"
+    )
+    params: list = [ticker, env]
+    if src:
+        sql += " AND src=?"
+        params.append(src)
+    sql += " ORDER BY COALESCE(ts_ms, 0), observed_at, id"
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{
+        "ts_ms": r["ts_ms"],
+        "observed_at": r["observed_at"],
+        "last": _perp_f(r["last_usd_micro"]),
+        "bid": _perp_f(r["bid_usd_micro"]),
+        "ask": _perp_f(r["ask_usd_micro"]),
+        "bid_size": _perp_c(r["bid_size_cc"]),
+        "ask_size": _perp_c(r["ask_size_cc"]),
+        "ref": _perp_f(r["ref_usd_micro"]),
+        "ref_ts_ms": r["ref_ts_ms"],
+        "settle_mark": _perp_f(r["settle_mark_usd_micro"]),
+        "liq_mark": _perp_f(r["liq_mark_usd_micro"]),
+        "funding_rate": r["funding_rate"],
+        "oi": _perp_c(r["oi_cc"]),
+        "src": r["src"],
+    } for r in rows]
+
+
+def load_perp_trades(
+    conn: sqlite3.Connection, ticker: str, *, since_days: int = 30,
+    env: str = "production",
+) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM perp_trades WHERE ticker=? AND kalshi_env=? "
+            f"AND observed_at >= {_since_clause(since_days)} "
+            "ORDER BY ts_ms, id",
+            (ticker, env),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{
+        "trade_id": r["trade_id"],
+        "ts_ms": r["ts_ms"],
+        "observed_at": r["observed_at"],
+        "price": _perp_f(r["price_usd_micro"]),
+        "count": _perp_c(r["count_cc"]),
+        "taker_side": r["taker_side"],
+    } for r in rows]
+
+
+def load_perp_candles(
+    conn: sqlite3.Connection, ticker: str, *, since_days: int = 90,
+    period_min: int = 1, env: str = "production",
+) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    cutoff = f"strftime('%s', 'now', '-{max(1, int(since_days))} days')"
+    try:
+        rows = conn.execute(
+            "SELECT * FROM perp_candles WHERE ticker=? AND period_min=? "
+            f"AND kalshi_env=? AND end_ts >= {cutoff} ORDER BY end_ts",
+            (ticker, int(period_min), env),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for r in rows:
+        out.append({
+            "end_ts": r["end_ts"],
+            "bid_open": _perp_f(r["bid_open_usd_micro"]),
+            "bid_high": _perp_f(r["bid_high_usd_micro"]),
+            "bid_low": _perp_f(r["bid_low_usd_micro"]),
+            "bid_close": _perp_f(r["bid_close_usd_micro"]),
+            "ask_open": _perp_f(r["ask_open_usd_micro"]),
+            "ask_high": _perp_f(r["ask_high_usd_micro"]),
+            "ask_low": _perp_f(r["ask_low_usd_micro"]),
+            "ask_close": _perp_f(r["ask_close_usd_micro"]),
+            # trade OHLC/mean are None for no-trade periods — quote OHLC is
+            # the always-present series.
+            "open": _perp_f(r["trade_open_usd_micro"]),
+            "high": _perp_f(r["trade_high_usd_micro"]),
+            "low": _perp_f(r["trade_low_usd_micro"]),
+            "close": _perp_f(r["trade_close_usd_micro"]),
+            "mean": _perp_f(r["trade_mean_usd_micro"]),
+            "volume": _perp_c(r["volume_cc"]),
+            "volume_usd": _perp_f(r["volume_notional_usd_micro"]),
+            "oi": _perp_c(r["oi_cc"]),
+        })
+    return out
+
+
+def load_perp_funding(
+    conn: sqlite3.Connection, ticker: Optional[str] = None, *,
+    env: str = "production",
+) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    sql = "SELECT * FROM perp_funding WHERE kalshi_env=?"
+    params: list = [env]
+    if ticker:
+        sql += " AND ticker=?"
+        params.append(ticker)
+    sql += " ORDER BY funding_time"
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{
+        "ticker": r["ticker"],
+        "funding_time": r["funding_time"],
+        "funding_rate": r["funding_rate"],
+        "mark": _perp_f(r["mark_usd_micro"]),
+    } for r in rows]
+
+
+def perp_dataset_summary(conn: sqlite3.Connection, env: str = "production") -> dict:
+    """Per-ticker coverage + tick spacing — the honesty-caveat input for any
+    perps replay (states the sampling reality instead of implying tick data)."""
+    conn.row_factory = sqlite3.Row
+    out: dict = {"env": env, "tickers": []}
+    try:
+        tickers = [r[0] for r in conn.execute(
+            "SELECT DISTINCT ticker FROM perp_ticks WHERE kalshi_env=? ORDER BY ticker",
+            (env,),
+        ).fetchall()]
+    except sqlite3.OperationalError:
+        return out
+    for t in tickers:
+        row = conn.execute(
+            """SELECT COUNT(*), MIN(observed_at), MAX(observed_at)
+               FROM perp_ticks WHERE ticker=? AND kalshi_env=?""",
+            (t, env),
+        ).fetchone()
+        n, first, last = int(row[0]), row[1], row[2]
+        # Median gap between consecutive WS ticks (sampled, cheap).
+        gaps = [r[0] for r in conn.execute(
+            """SELECT ts_ms - LAG(ts_ms) OVER (ORDER BY ts_ms) AS gap
+               FROM (SELECT ts_ms FROM perp_ticks
+                     WHERE ticker=? AND kalshi_env=? AND ts_ms IS NOT NULL
+                     ORDER BY id DESC LIMIT 5000)""",
+            (t, env),
+        ).fetchall() if r[0] is not None and r[0] > 0]
+        gaps.sort()
+        median_gap_ms = gaps[len(gaps) // 2] if gaps else None
+        candles = int(conn.execute(
+            "SELECT COUNT(*) FROM perp_candles WHERE ticker=? AND kalshi_env=?",
+            (t, env),
+        ).fetchone()[0])
+        trades = int(conn.execute(
+            "SELECT COUNT(*) FROM perp_trades WHERE ticker=? AND kalshi_env=?",
+            (t, env),
+        ).fetchone()[0])
+        out["tickers"].append({
+            "ticker": t, "ticks": n, "trades": trades, "candles": candles,
+            "firstAt": first, "lastAt": last, "medianTickGapMs": median_gap_ms,
+        })
+    return out
+
+
 def crypto15m_eval(
     signals: list[dict], *, mode: str = "favorite", min_fav: float = 0.0,
     max_fav: float = 1.0, min_delta_pct: float = 0.0,

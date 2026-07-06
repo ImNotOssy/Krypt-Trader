@@ -86,6 +86,11 @@ import crypto15m  # noqa: E402
 import trader  # noqa: E402
 import crypto15m_trader  # noqa: E402
 import crypto15m_record  # noqa: E402
+import perps_record  # noqa: E402
+import perps_ws  # noqa: E402
+import perps_farmer  # noqa: E402
+import perps_strategy  # noqa: E402
+import kalshi_perps_api  # noqa: E402
 import webhook  # noqa: E402
 import leaderboard  # noqa: E402
 import kalshi_ws  # noqa: E402
@@ -606,6 +611,9 @@ async def _scanner_and_trader_loop() -> None:
     last_reconcile = 0.0
     _consec_reconcile_fails = 0
     last_crypto15m_record = 0.0
+    last_perps_record = 0.0
+    last_perps_farm = 0.0
+    last_perps_strat = 0.0
     last_ws_subs = 0.0
     last_cleanup = 0.0
     last_stats_push = asyncio.get_event_loop().time()
@@ -636,6 +644,7 @@ async def _scanner_and_trader_loop() -> None:
 
         # Keep the WS pointed at the live env (no-op unless it changed).
         kalshi_ws.set_env(kalshi_auth.get_env())
+        perps_ws.set_env(kalshi_auth.get_env())
 
         if STATE.paused:
             await asyncio.sleep(1)
@@ -844,6 +853,52 @@ async def _scanner_and_trader_loop() -> None:
                 last_crypto15m_record = now
         except Exception as e:
             logger.debug(f"crypto15m record error: {e}")
+
+        # Perps market-data recorder (passive, no orders). ensure_ws also
+        # STOPS the perps WS when the toggle goes off, so it runs either way.
+        try:
+            perps_record.ensure_ws(cfg, kalshi_auth.get_env())
+            if (
+                cfg.get("perps_record_signals", False)
+                and now - last_perps_record >= 15
+            ):
+                await perps_record.record_tick(cfg)
+                last_perps_record = now
+                if perps_record.backfill_needed():
+                    _fire_and_forget(perps_record.backfill(cfg))
+        except Exception as e:
+            logger.debug(f"perps record error: {e}")
+
+        # Perps user strategy (paper by default; live only with the explicit
+        # perps_strat_live arm). Own gates + halts inside tick; never raises.
+        try:
+            if (
+                cfg.get("perps_strat_enabled", False)
+                and cfg.get("perps_record_signals", False)
+                and now - last_perps_strat >= 5
+            ):
+                if not cfg.get("perps_strat_live") or STATE.auth_ok:
+                    await perps_strategy.tick(cfg)
+                last_perps_strat = now
+        except Exception as e:
+            logger.debug(f"perps strategy error: {e}")
+
+        # Perps volume farmer (maker-only order engine; its own gates + halts
+        # live inside farm_tick and never raise). Needs the perps WS quotes,
+        # so it also requires the recorder toggle to be on.
+        try:
+            if (
+                cfg.get("perps_farm_enabled", False)
+                and cfg.get("perps_record_signals", False)
+                and STATE.auth_ok
+                and now - last_perps_farm >= 2.5
+            ):
+                await perps_farmer.farm_tick(cfg)
+                last_perps_farm = now
+            elif not cfg.get("perps_farm_enabled", False):
+                await perps_farmer.ensure_stopped()
+        except Exception as e:
+            logger.debug(f"perps farm error: {e}")
 
         try:
             if now - last_cleanup >= float(cfg.get("db_cleanup_interval", 3600)):
@@ -1660,6 +1715,7 @@ async def _h_collection_stats(p: dict) -> dict:
                           outcome_correct, resolved, created_at
                    FROM whale_trades ORDER BY id DESC LIMIT 12"""
             ).fetchall()
+            perps = db.perp_collection_counts(conn)
         return {
             "c15": {
                 "windows": int(c15["n"] or 0),
@@ -1675,9 +1731,11 @@ async def _h_collection_stats(p: dict) -> dict:
                 "topCategories": [dict(r) for r in cats],
                 "recent": [dict(r) for r in recent_main],
             },
+            "perps": perps,
             "collecting": {
                 "c15": bool((STATE.cfg or {}).get("crypto15m_record_signals", True)),
                 "main": True,
+                "perps": bool((STATE.cfg or {}).get("perps_record_signals", False)),
             },
         }
     return await asyncio.to_thread(_q)
@@ -1723,6 +1781,58 @@ async def _h_export_research(p: dict) -> dict:
     return await asyncio.to_thread(_dump)
 
 
+async def _h_perps_status(p: dict) -> dict:
+    cfg = STATE.cfg or {}
+    out = await asyncio.to_thread(perps_record.status, cfg)
+    out["farmer"] = await asyncio.to_thread(perps_farmer.status, cfg)
+    out["strategy"] = await asyncio.to_thread(perps_strategy.status, cfg)
+    return out
+
+
+async def _h_perps_farm_flatten(p: dict) -> dict:
+    return await perps_farmer.flatten(STATE.cfg or {})
+
+
+async def _h_perps_backtest(p: dict) -> dict:
+    """Backtest the user's perps strategy over their recorded candles. Accepts
+    a config patch (merged over current settings for the run only) so the
+    Backtest page can replay presets/profiles without touching live config."""
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = merge_with_defaults(cfg)
+    since = int((p or {}).get("sinceDays") or 14)
+    return await asyncio.to_thread(perps_strategy.run_backtest, cfg, since)
+
+
+async def _h_perps_strat_flatten(p: dict) -> dict:
+    return await perps_strategy.flatten(STATE.cfg or {})
+
+
+async def _h_perps_history(p: dict) -> dict:
+    limit = min(500, int((p or {}).get("limit") or 100))
+    env = kalshi_auth.get_env()
+    def _q():
+        with db.get_db() as conn:
+            rows = db.recent_perp_positions(conn, env, limit=limit)
+        for r in rows:
+            for k in ("entry_usd_micro", "exit_usd_micro", "fees_usd_micro",
+                      "funding_usd_micro", "pnl_usd_micro"):
+                r[k.replace("_usd_micro", "Usd")] = (
+                    r[k] / 1e6 if r.get(k) is not None else None)
+                r.pop(k, None)
+            r["contracts"] = (r.pop("count_cc") or 0) / 100
+        return {"rows": rows}
+    return await asyncio.to_thread(_q)
+
+
+async def _h_perps_backfill(p: dict) -> dict:
+    """Manual backfill re-run (idempotent upserts; concurrent-run guarded)."""
+    _fire_and_forget(perps_record.backfill(STATE.cfg or {}))
+    return {"ok": True, "state": dict(perps_record._backfill_state)}
+
+
 _HANDLERS = {
     "ping": _h_ping,
     "crypto15m": _h_crypto15m,
@@ -1731,6 +1841,12 @@ _HANDLERS = {
     "c15Backtest": _h_c15_backtest,
     "mainBacktest": _h_main_backtest,
     "collectionStats": _h_collection_stats,
+    "perpsStatus": _h_perps_status,
+    "perpsBackfill": _h_perps_backfill,
+    "perpsFarmFlatten": _h_perps_farm_flatten,
+    "perpsBacktest": _h_perps_backtest,
+    "perpsStratFlatten": _h_perps_strat_flatten,
+    "perpsHistory": _h_perps_history,
     "c15History": _h_c15_history,
     "exportResearch": _h_export_research,
     "kalshiMarketUrl": _h_kalshiMarketUrl,
@@ -1836,6 +1952,18 @@ async def _shutdown() -> None:
         pass
     try:
         await kalshi_ws.stop()
+    except Exception:
+        pass
+    try:
+        await perps_farmer.ensure_stopped()  # cancel resting farm quotes
+    except Exception:
+        pass
+    try:
+        await perps_ws.stop()
+    except Exception:
+        pass
+    try:
+        await kalshi_perps_api.close_clients()
     except Exception:
         pass
     try:
