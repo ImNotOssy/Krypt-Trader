@@ -63,6 +63,12 @@ TICK_MICRO = 100                    # $0.0001 tick in micro-dollars
 _QUOTE_FRESH_MS = 180_000
 _RECONCILE_SEC = 60.0
 _BALANCE_CACHE_SEC = 60.0
+# Fee gate: farming's net cost ≈ the maker fee, so we let the user cap the fee
+# they'll farm at. The fee we're charged is measured from real fills; before any
+# fills exist we assume Kalshi's Tier-0 maker fee (the highest), so an unknown
+# fee keeps the gate CLOSED rather than trading blind.
+_DEFAULT_MAKER_FEE_BPS = 5.0
+_FEE_REFRESH_SEC = 300.0
 _MIN_COST_SAMPLE_USD = 500.0        # measured-cost halt needs ≥ this much volume
 # Thursday maintenance 3-5 AM ET. July = EDT (UTC-4) → 07:00-09:00 UTC,
 # padded. Winter shifts an hour; the pad + Kalshi's own order rejects cover it.
@@ -149,6 +155,8 @@ class _Farmer:
         self.last_fill_ts: int = 0            # unix seconds, fills poll cursor
         self._last_reconcile: float = 0.0
         self._last_balance_t: float = 0.0
+        self._maker_fee_bps: float | None = None   # measured from fills; None = unknown
+        self._last_fee_calc: float = 0.0
         self._balance_ok: bool = False
         self._margin_enabled: bool | None = None
         self.last_error: str = ""
@@ -310,6 +318,35 @@ class _Farmer:
             logger.debug(f"perps_farmer: stats failed: {e}")
         return self.day_stats
 
+    def _refresh_maker_fee(self) -> None:
+        """Refresh the measured maker fee (bps) at most every _FEE_REFRESH_SEC.
+        None until enough real fills exist; the gate then assumes Tier-0."""
+        now = time.monotonic()
+        if self._last_fee_calc and now - self._last_fee_calc < _FEE_REFRESH_SEC:
+            return
+        self._last_fee_calc = now
+        try:
+            with db.get_db() as conn:
+                self._maker_fee_bps = db.perp_farm_effective_fee_bps(conn, self.env)
+        except Exception as e:
+            logger.debug(f"perps_farmer: fee calc failed: {e}")
+
+    def _fee_gate_blocks(self, cfg: dict) -> str:
+        """Non-empty reason when the maker fee we're charged exceeds the user's
+        cap (0 = off). Cost of farming ≈ the maker fee, so this keeps the farmer
+        idle until fees are actually worth it."""
+        max_fee = float(cfg.get("perps_farm_max_fee_bps", 0) or 0)
+        if max_fee <= 0:
+            return ""
+        fee = self._maker_fee_bps if self._maker_fee_bps is not None else _DEFAULT_MAKER_FEE_BPS
+        if fee > max_fee + 1e-9:
+            assumed = " (assumed Tier-0)" if self._maker_fee_bps is None else ""
+            return (
+                f"maker fee ~{fee:.1f} bps{assumed} exceeds your {max_fee:.1f} bps cap — "
+                f"standing by; farm resumes automatically once the fee drops to your cap"
+            )
+        return ""
+
     def _check_economics(self, cfg: dict) -> None:
         s = self._refresh_day_stats()
         if not s:
@@ -400,6 +437,7 @@ class _Farmer:
         # Fills first — accounting stays true even while standing down.
         await self._poll_fills(ticker, cfg)
         self._check_economics(cfg)
+        self._refresh_maker_fee()
 
         if self._halted() or in_maintenance_window():
             await self._cancel_all()
@@ -420,6 +458,11 @@ class _Farmer:
             await self._cancel_all()
             return
         if not await self._account_gates_ok(cfg):
+            await self._cancel_all()
+            return
+        fee_block = self._fee_gate_blocks(cfg)
+        if fee_block:
+            self.last_error = fee_block
             await self._cancel_all()
             return
         self.last_error = ""
@@ -497,6 +540,7 @@ class _Farmer:
 
     def status(self, cfg: dict) -> dict:
         day = self._refresh_day_stats()
+        self._refresh_maker_fee()   # keep the displayed fee current even while off
         vol = day.get("volume_usd_micro", 0) / 1e6 if day else 0.0
         fees = day.get("fees_usd_micro", 0) / 1e6 if day else 0.0
         realized = day.get("realized_usd_micro", 0) / 1e6 if day else 0.0
@@ -509,6 +553,9 @@ class _Farmer:
             "haltReason": self.halt_reason if self._halted() else "",
             "lastError": self.last_error,
             "symbol": str(cfg.get("perps_farm_symbol") or "KXBTCPERP"),
+            "makerFeeBps": (round(self._maker_fee_bps, 2)
+                            if self._maker_fee_bps is not None else None),
+            "maxFeeBps": float(cfg.get("perps_farm_max_fee_bps", 0) or 0),
             "inventoryContracts": self.inventory_cc / 100,
             "avgEntry": (self.avg_entry_micro / 1e6) if self.inventory_cc else None,
             "liveOrders": [

@@ -348,6 +348,53 @@ async def backfill(cfg: dict) -> dict:
     return {"candles": candles_n, "funding": funding_n, "errors": errors}
 
 
+_wallet_cache: dict = {"t": 0.0, "data": None}
+_WALLET_TTL_SEC = 20.0
+
+
+async def wallet(env: str) -> dict | None:
+    """Perps (margin) wallet balance — the SEPARATE perps wallet, distinct from
+    the main Kalshi cash balance. Powers the Perps page's wallet card.
+
+    Cached ~20s: the available-balance computation costs 50 rate tokens/call and
+    the page polls status every 3s. Never flashes a spurious zero — a failed or
+    malformed poll serves the last-known snapshot (balance-flash-zero guard);
+    returns None only before the first good read or when creds/env are absent."""
+    if not kalshi_auth.credentials_present(env):
+        return None
+    now = time.monotonic()
+    cached = _wallet_cache["data"]
+    fresh = cached is not None and cached.get("env") == env \
+        and now - _wallet_cache["t"] < _WALLET_TTL_SEC
+    if fresh:
+        return cached
+    same_env_cache = cached if (cached and cached.get("env") == env) else None
+    try:
+        bal = await papi.get_perps_balance()
+    except Exception as e:
+        logger.debug(f"perps wallet fetch failed: {e}")
+        return same_env_cache          # last-known, never a spurious zero
+    subs = bal.get("subaccount_balances") if isinstance(bal, dict) else None
+    sub0 = next((s for s in (subs or []) if int(s.get("subaccount") or 0) == 0), None)
+    if sub0 is None:
+        return same_env_cache          # malformed — don't overwrite good data with nulls
+
+    def d(x):
+        return papi.micro_to_usd(papi.usd_micro(x))
+
+    data = {
+        "env": env,
+        "settledUsd": d(bal.get("settled_funds")),
+        "availableUsd": d(sub0.get("available_balance")),
+        "positionValueUsd": d(sub0.get("position_value")),
+        "restingMarginUsd": d(sub0.get("resting_orders_margin")),
+        "maintenanceMarginUsd": d(sub0.get("maintenance_margin")),
+    }
+    _wallet_cache["t"] = now
+    _wallet_cache["data"] = data
+    return data
+
+
 def status(cfg: dict) -> dict:
     """Sync + cheap: powers the perpsStatus RPC / Perps page."""
     counts: dict = {}

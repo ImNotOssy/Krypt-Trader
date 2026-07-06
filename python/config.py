@@ -226,6 +226,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "perps_farm_daily_loss_usd": 2.0,        # hard net-loss halt per UTC day
     "perps_farm_daily_volume_usd": 0.0,      # stop after this much volume (0 = off)
     "perps_farm_max_cost_bps": 4.0,          # halt when measured cost/volume$ exceeds
+    "perps_farm_max_fee_bps": 0.0,           # pre-trade gate: only farm while the maker
+                                             # fee we're actually charged is <= this many
+                                             # bps (0 = off). Farming cost ≈ the maker fee,
+                                             # so set this to the reward rate (~2 bps) and
+                                             # the farmer sits idle until fees are worth it.
 
     # ── Perps user strategy (rule-composed, like the 15m rule builder).
     # perps_strat_enabled = paper trading on live quotes (simulated fills,
@@ -835,6 +840,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["perps_farm_daily_loss_usd"] = _clampf(cfg.get("perps_farm_daily_loss_usd"), 0.1, 10000.0, d["perps_farm_daily_loss_usd"])
     cfg["perps_farm_daily_volume_usd"] = _clampf(cfg.get("perps_farm_daily_volume_usd"), 0.0, 1e9, d["perps_farm_daily_volume_usd"])
     cfg["perps_farm_max_cost_bps"] = _clampf(cfg.get("perps_farm_max_cost_bps"), 0.1, 100.0, d["perps_farm_max_cost_bps"])
+    cfg["perps_farm_max_fee_bps"] = _clampf(cfg.get("perps_farm_max_fee_bps"), 0.0, 100.0, d["perps_farm_max_fee_bps"])
     cfg["perps_strat_enabled"] = bool(cfg.get("perps_strat_enabled", d["perps_strat_enabled"]))
     cfg["perps_strat_live"] = bool(cfg.get("perps_strat_live", d["perps_strat_live"]))
     ssym = str(cfg.get("perps_strat_symbol") or d["perps_strat_symbol"]).strip().upper().rstrip("1")

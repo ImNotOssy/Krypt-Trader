@@ -144,6 +144,7 @@ export interface TraderConfig {
   perpsFarmDailyLossUsd?: number;
   perpsFarmDailyVolumeUsd?: number;        // 0 = no daily volume target
   perpsFarmMaxCostBps?: number;
+  perpsFarmMaxFeeBps?: number;             // pre-trade gate: only farm while the charged maker fee ≤ this (0 = off)
   // Perps user strategy (rule-composed like the 15m builder; same gates run
   // in backtest, paper and live). perpsStratEnabled = paper trading;
   // perpsStratLive = REAL leveraged orders (explicit risk-ack modal in UI).
@@ -589,9 +590,20 @@ export interface PerpsCounts {
   byTicker: { ticker: string; ticks: number; lastAt: string | null }[];
 }
 
+export interface PerpsWallet {
+  env: string;
+  settledUsd: number | null;        // total settled cash in the perps wallet
+  availableUsd: number | null;      // free to trade (settled − margin locked)
+  positionValueUsd: number | null;  // mark-to-market value of open positions
+  restingMarginUsd: number | null;  // margin locked by resting orders
+  maintenanceMarginUsd: number | null;
+}
+
 export interface PerpsStatus {
   recording: boolean;
   wsConnected: boolean;
+  wallet?: PerpsWallet | null;       // separate perps wallet; null until a good read
+
   ws: {
     enabled: boolean; connected: boolean; env: string; symbols: string[];
     bufferedTicks: number; bufferedTrades: number;
@@ -651,6 +663,8 @@ export interface PerpsFarmerStatus {
   haltReason: string;
   lastError: string;
   symbol: string;
+  makerFeeBps: number | null;      // measured from real fills; null = not yet measured (assumes Tier-0)
+  maxFeeBps: number;               // user's fee cap; 0 = gate off
   inventoryContracts: number;
   avgEntry: number | null;
   liveOrders: { side: string; price: number; contracts: number }[];

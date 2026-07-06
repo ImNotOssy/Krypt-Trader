@@ -365,3 +365,86 @@ def test_perp_series_ships_caveats(fresh_db):
     assert out["ticker"] == "KXBTCPERP"
     assert len(out["ticks"]) == 1
     assert out["caveats"], "honesty caveats must ship with the series"
+
+
+# ───────── perps wallet (separate margin wallet) ─────────────────────────────
+
+def _wallet_resp():
+    # Kalshi /margin/balance shape (FixedPointDollars strings).
+    return {
+        "settled_funds": "10.5000",
+        "subaccount_balances": [
+            {"subaccount": 0, "available_balance": "8.2500",
+             "position_value": "2.2500", "resting_orders_margin": "1.0000",
+             "maintenance_margin": "0.5000"},
+            {"subaccount": 1, "available_balance": "99.0000"},
+        ],
+    }
+
+
+def test_wallet_parses_margin_balance(monkeypatch):
+    import kalshi_auth
+    monkeypatch.setattr(perps_record, "_wallet_cache", {"t": 0.0, "data": None})
+    monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env: True)
+
+    async def bal(**kw):
+        return _wallet_resp()
+
+    monkeypatch.setattr(papi, "get_perps_balance", bal)
+    w = asyncio.run(perps_record.wallet("production"))
+    assert w == {
+        "env": "production",
+        "settledUsd": 10.5,
+        "availableUsd": 8.25,          # subaccount 0 only, not the sub-1 $99
+        "positionValueUsd": 2.25,
+        "restingMarginUsd": 1.0,
+        "maintenanceMarginUsd": 0.5,
+    }
+
+
+def test_wallet_no_creds_returns_none(monkeypatch):
+    import kalshi_auth
+    monkeypatch.setattr(perps_record, "_wallet_cache", {"t": 0.0, "data": None})
+    monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env: False)
+    called = {"n": 0}
+
+    async def bal(**kw):
+        called["n"] += 1
+        return _wallet_resp()
+
+    monkeypatch.setattr(papi, "get_perps_balance", bal)
+    assert asyncio.run(perps_record.wallet("production")) is None
+    assert called["n"] == 0             # never hit the API without creds
+
+
+def test_wallet_never_flashes_zero_on_failure(monkeypatch):
+    """A good snapshot then a failed/malformed poll must serve last-known, not
+    None/zero (balance-flash-zero guard)."""
+    import kalshi_auth
+    monkeypatch.setattr(perps_record, "_wallet_cache", {"t": 0.0, "data": None})
+    monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env: True)
+
+    async def good(**kw):
+        return _wallet_resp()
+
+    monkeypatch.setattr(papi, "get_perps_balance", good)
+    first = asyncio.run(perps_record.wallet("production"))
+    assert first["settledUsd"] == 10.5
+
+    # Expire the cache so the next call refetches, but make the fetch fail.
+    perps_record._wallet_cache["t"] = time.monotonic() - 999
+
+    async def boom(**kw):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(papi, "get_perps_balance", boom)
+    assert asyncio.run(perps_record.wallet("production")) == first  # last-known
+
+    # Malformed (no primary subaccount) must also not clobber good data.
+    perps_record._wallet_cache["t"] = time.monotonic() - 999
+
+    async def malformed(**kw):
+        return {"subaccount_balances": [{"subaccount": 1, "available_balance": "1.0"}]}
+
+    monkeypatch.setattr(papi, "get_perps_balance", malformed)
+    assert asyncio.run(perps_record.wallet("production")) == first

@@ -377,3 +377,55 @@ def test_demo_env_uses_suffixed_ticker(fresh_db, farmer, monkeypatch):
     monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
     asyncio.run(farmer.farm_tick(CFG))
     assert all(p["ticker"] == "KXBTCPERP1" for p in fake.placed)
+
+
+# ───────── fee gate (only farm when the maker fee is worth it) ───────────────
+
+def test_effective_fee_bps_helper_excludes_taker(fresh_db):
+    with db.get_db() as conn:
+        assert db.perp_farm_effective_fee_bps(conn, "production") is None  # empty → unknown
+        db.insert_perp_farm_fill(conn, {
+            "trade_id": "m", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "bid",
+            "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 3000,
+            "is_taker": 0, "realized_pnl_usd_micro": 0, "inventory_after_cc": 100,
+            "kalshi_env": "production"})
+        # taker (flatten) leg with a huge fee must NOT inflate the maker estimate
+        db.insert_perp_farm_fill(conn, {
+            "trade_id": "t", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "ask",
+            "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 48000,
+            "is_taker": 1, "realized_pnl_usd_micro": 0, "inventory_after_cc": 0,
+            "kalshi_env": "production"})
+        bps = db.perp_farm_effective_fee_bps(conn, "production")
+    assert bps == pytest.approx(5.0)   # 3000 / 6_000_000 * 1e4, maker only
+
+
+def test_fee_gate_off_by_default(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    asyncio.run(farmer.farm_tick(CFG))          # CFG has no max_fee → 0 → gate off
+    assert {p["side"] for p in fake.placed} == {"bid", "ask"}
+
+
+def test_fee_gate_stands_down_when_fee_above_cap(fresh_db, farmer, monkeypatch):
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    # No fills → fee unknown → assume Tier-0 5 bps, which exceeds the 2 bps cap.
+    cfg = dict(CFG, perps_farm_max_fee_bps=2.0)
+    asyncio.run(farmer.farm_tick(cfg))
+    assert fake.placed == []
+    assert "cap" in farmer.last_error and "bps" in farmer.last_error
+
+
+def test_fee_gate_allows_when_measured_fee_below_cap(fresh_db, farmer, monkeypatch):
+    with db.get_db() as conn:      # a real maker fill at ~1.5 bps of notional
+        db.insert_perp_farm_fill(conn, {
+            "trade_id": "cheap", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "bid",
+            "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 900,
+            "is_taker": 0, "realized_pnl_usd_micro": 0, "inventory_after_cc": 100,
+            "kalshi_env": "production"})
+    fake = _FakePapi()
+    _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
+    cfg = dict(CFG, perps_farm_max_fee_bps=2.0)   # 1.5 bps measured ≤ 2 → farm
+    asyncio.run(farmer.farm_tick(cfg))
+    assert farmer._maker_fee_bps is not None and farmer._maker_fee_bps < 2.0
+    assert {p["side"] for p in fake.placed} == {"bid", "ask"}

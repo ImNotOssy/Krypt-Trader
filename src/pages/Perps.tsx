@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, DatabaseZap, Download, RadioTower, Sparkles, Tractor } from 'lucide-react';
-import type { PerpPositionRow, PerpsStatus, RuleCondition, TraderConfig } from '@shared/types';
+import type { PerpPositionRow, PerpsStatus, PerpsWallet, RuleCondition, TraderConfig } from '@shared/types';
 import { Card, Page, Switch, useOptimisticValue } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
@@ -90,6 +90,10 @@ export function PerpsPage() {
             Nothing here is financial advice.
           </div>
         </div>
+      </div>
+
+      <div className="mb-4">
+        <WalletCard w={st?.wallet ?? null} />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -578,7 +582,7 @@ function FarmerCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: () =
     }
   };
 
-  const setNum = (key: 'perpsFarmClipContracts' | 'perpsFarmMaxInventoryContracts' | 'perpsFarmDailyLossUsd' | 'perpsFarmDailyVolumeUsd') =>
+  const setNum = (key: 'perpsFarmClipContracts' | 'perpsFarmMaxInventoryContracts' | 'perpsFarmDailyLossUsd' | 'perpsFarmDailyVolumeUsd' | 'perpsFarmMaxFeeBps') =>
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const v = Number(e.target.value);
       if (Number.isFinite(v)) void window.krypt.config.update({ [key]: v });
@@ -629,6 +633,17 @@ function FarmerCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: () =
                 onBlur={setNum('perpsFarmDailyVolumeUsd')}
                 className="mt-1 w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-1 text-xs text-white outline-none focus:border-krypt-purple/60" />
             </label>
+            <label className="col-span-2 text-[11px] text-krypt-dim">
+              Only farm when maker fee ≤ (bps, 0 = off)
+              <input type="number" min={0} max={100} step={0.1} defaultValue={config?.perpsFarmMaxFeeBps ?? 0}
+                onBlur={setNum('perpsFarmMaxFeeBps')}
+                className="mt-1 w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-1 text-xs text-white outline-none focus:border-krypt-purple/60" />
+              <span className="mt-1 block text-[10px] leading-snug text-krypt-dim">
+                Farming costs ≈ the maker fee, and volume rewards pay only ~2 bps — so at today’s 5 bps
+                fee it loses. Set this to your reward rate (e.g. 2) and the farmer stays idle until Kalshi’s
+                fee is actually low enough to make volume free. 0 = farm regardless of fee.
+              </span>
+            </label>
           </div>
         </div>
         <div>
@@ -639,6 +654,11 @@ function FarmerCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: () =
             <Stat label="Cost / volume" value={f ? `${f.today.costBps.toFixed(1)} bp` : '…'} />
             <Stat label="Fills" value={f ? String(f.today.fills) : '…'} />
             <Stat label="Inventory" value={f ? `${f.inventoryContracts} ct` : '…'} />
+            <Stat
+              label="Maker fee"
+              value={f ? (f.makerFeeBps != null ? `${f.makerFeeBps.toFixed(1)} bp` : '~5 bp*') : '…'}
+            />
+            <Stat label="Fee cap" value={f && f.maxFeeBps > 0 ? `${f.maxFeeBps} bp` : 'off'} />
           </div>
           <div className="mt-2 space-y-1 text-[11px] text-krypt-dim">
             {f?.liveOrders.map((o) => (
@@ -649,6 +669,9 @@ function FarmerCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: () =
             {f?.halted && <div className="text-krypt-warn">⚠ {f.haltReason}</div>}
             {!f?.halted && f?.lastError && <div className="text-krypt-warn">⚠ {f.lastError}</div>}
             {f?.maintenanceWindow && <div className="text-krypt-warn">⚠ Kalshi maintenance window — standing down</div>}
+            {f && f.makerFeeBps == null && f.maxFeeBps > 0 && (
+              <div>* maker fee assumed at Tier-0 (5 bp) until real fills measure it</div>
+            )}
           </div>
           <button
             onClick={() => void flatten()}
@@ -673,6 +696,41 @@ function FarmerCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: () =
 function fmtPx(v: number | null | undefined): string {
   if (v == null) return '—';
   return `$${v.toFixed(4)}`;
+}
+
+function WalletCard({ w }: { w: PerpsWallet | null }) {
+  return (
+    <Card
+      header={
+        <div className="flex flex-wrap items-center justify-between gap-1">
+          <div className="text-xs uppercase tracking-wider text-krypt-muted">Perpetuals wallet</div>
+          <div className="text-[10px] text-krypt-dim">
+            {w?.env ? `${w.env} · ` : ''}separate wallet from your main Kalshi cash
+          </div>
+        </div>
+      }
+    >
+      {w ? (
+        <>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Stat label="Balance" value={fmtUsd(w.settledUsd)} />
+            <Stat label="Available to trade" value={fmtUsd(w.availableUsd)} />
+            <Stat label="Open positions" value={fmtUsd(w.positionValueUsd)} />
+            <Stat label="In resting orders" value={fmtUsd(w.restingMarginUsd)} />
+          </div>
+          <div className="mt-2 text-[11px] text-krypt-dim">
+            Fund this wallet by transferring cash to Perpetuals on Kalshi — money in your main event-market
+            balance can’t be traded here, and vice versa.
+          </div>
+        </>
+      ) : (
+        <div className="text-xs leading-relaxed text-krypt-dim">
+          Perps wallet unavailable — this needs API keys on an account with margin (perpetuals) enabled.
+          Once enabled, transfer funds into your Perpetuals wallet on Kalshi and the balance shows here.
+        </div>
+      )}
+    </Card>
+  );
 }
 
 function Stat({ label, value }: { label: string; value: string }) {

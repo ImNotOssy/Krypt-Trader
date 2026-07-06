@@ -1786,6 +1786,7 @@ async def _h_perps_status(p: dict) -> dict:
     out = await asyncio.to_thread(perps_record.status, cfg)
     out["farmer"] = await asyncio.to_thread(perps_farmer.status, cfg)
     out["strategy"] = await asyncio.to_thread(perps_strategy.status, cfg)
+    out["wallet"] = await perps_record.wallet(kalshi_auth.get_env())
     return out
 
 

@@ -2001,6 +2001,28 @@ def perp_farm_stats(conn, env: str, *, day_utc: str | None = None) -> dict:
     }
 
 
+def perp_farm_effective_fee_bps(conn, env: str, *, since_days: int = 30) -> float | None:
+    """Trailing realized MAKER fee as bps of notional, from actual fills — the
+    real maker fee Kalshi charged this account (tier-adjusted; no fee-schedule
+    guessing). Taker (flatten) legs are excluded so the estimate reflects the
+    resting-maker cost the farmer gates on. None when there is no recent
+    maker-fill volume to measure (caller then assumes the Tier-0 schedule fee)."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(fee_usd_micro), 0),
+                  COALESCE(SUM(CAST(price_usd_micro AS REAL) * ABS(count_cc) / 100.0), 0)
+             FROM perp_farm_fills
+            WHERE kalshi_env = ? AND is_taker = 0
+              AND observed_at >= datetime('now', ?)""",
+        (env, f"-{int(since_days)} days"),
+    ).fetchone()
+    if not row:
+        return None
+    fee, notional = float(row[0] or 0), float(row[1] or 0)
+    if notional <= 0:
+        return None
+    return (fee / notional) * 10_000.0
+
+
 def perp_collection_counts(conn, env: str = "production") -> dict:
     out: dict = {"ticks": 0, "trades": 0, "candles": 0, "funding": 0,
                  "firstAt": None, "lastAt": None, "byTicker": []}
