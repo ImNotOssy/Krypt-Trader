@@ -325,10 +325,10 @@ function HourTradeToggles({
   busy: boolean;
   onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
 }) {
-  // crypto15mHours = explicit UTC hours to trade (overrides the start/end
-  // window). null = follow the window. Clicking an hour materializes the current
-  // window into an explicit list, then toggles — so the grid always reflects
-  // what actually trades. Optimistic to survive fast successive clicks.
+  // crypto15mHours = the explicit UTC hours the executor may enter new trades.
+  // null seeds the grid from the legacy start/end window (backward compat) and
+  // any click materializes it into an explicit list. Optimistic to survive fast
+  // successive clicks.
   const start = config?.crypto15mHoursStartUtc ?? 0;
   const end = config?.crypto15mHoursEndUtc ?? 24;
   const [local, apply] = useOptimisticValue<number[] | null>(
@@ -336,28 +336,32 @@ function HourTradeToggles({
     (next) => onPatch({ crypto15mHours: next ?? [] }),
   );
   const on = new Set(local ?? windowHours(start, end));
-  const usingExplicit = local != null;
   const toggle = (h: number): void => {
     const base = local ?? windowHours(start, end);
     const next = base.includes(h) ? base.filter((x) => x !== h) : [...base, h].sort((a, b) => a - b);
     apply(next);
   };
+  const allHours = Array.from({ length: 24 }, (_, i) => i);
   return (
     <div className="mb-3 rounded-xl border border-krypt-border bg-krypt-surface p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2">
         <span className="text-[11px] uppercase tracking-wider text-krypt-dim">Trade hours (UTC)</span>
         <span className="text-[11px] text-krypt-dim">{on.size}/24 on</span>
-        {usingExplicit ? (
-          <button
-            disabled={busy}
-            onClick={() => apply(null)}
-            className="rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[10px] text-krypt-dim transition-colors hover:text-white"
-          >
-            reset to {start}–{end} window
-          </button>
-        ) : (
-          <span className="text-[11px] text-krypt-dim">following the {start}–{end} window — click an hour to pick specific hours</span>
-        )}
+        <button
+          disabled={busy}
+          onClick={() => apply(allHours)}
+          className="rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[10px] text-krypt-dim transition-colors hover:text-white"
+        >
+          all
+        </button>
+        <button
+          disabled={busy}
+          onClick={() => apply([])}
+          className="rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[10px] text-krypt-dim transition-colors hover:text-white"
+        >
+          none
+        </button>
+        <span className="ml-auto text-[11px] text-krypt-dim">green = enter new trades this hour · open positions keep being managed</span>
       </div>
       <div className="grid grid-cols-12 gap-1">
         {Array.from({ length: 24 }, (_, h) => (
@@ -772,18 +776,6 @@ function StrategySettings({
           />
         )}
         </div>
-        <NumField
-          label="Trade from" suffix="UTC h" min={0} max={24} step={1}
-          value={num('crypto15mHoursStartUtc', C15_DEFAULTS.hoursStartUtc)}
-          hint="Only enter between these UTC hours (collected data leans positive 00–12 UTC, negative in the US session). Same start/end or 0–24 = always."
-          onCommit={(v) => void update({ crypto15mHoursStartUtc: Math.round(v) })}
-        />
-        <NumField
-          label="…until" suffix="UTC h" min={0} max={24} step={1}
-          value={num('crypto15mHoursEndUtc', C15_DEFAULTS.hoursEndUtc)}
-          hint="End of the UTC entry window. A start later than the end wraps overnight (e.g. 22 → 6)."
-          onCommit={(v) => void update({ crypto15mHoursEndUtc: Math.round(v) })}
-        />
         <div className={dimCls} title={dimTitle}>
         <SelectField
           label="Bet size by" value={sizingMode}
