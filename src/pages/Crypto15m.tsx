@@ -233,6 +233,7 @@ export function Crypto15mPage() {
       )}
 
       <AssetTradeToggles config={config} busy={busy} onPatch={patchAndReload} />
+      <HourTradeToggles config={config} busy={busy} onPatch={patchAndReload} />
 
       {!snap && loading ? (
         <Empty title="Loading 15-minute crypto markets…" description="Fetching Kalshi markets and spot prices." />
@@ -300,6 +301,82 @@ function AssetTradeToggles({
       <span className="ml-2 text-[11px] text-krypt-dim">
         New entries only — disabled assets are still monitored and open positions keep being managed.
       </span>
+    </div>
+  );
+}
+
+// Hours in the start/end window → an explicit list (for materializing the
+// window when the user first clicks a specific hour). start/end are 0-24.
+function windowHours(start: number, end: number): number[] {
+  const s = ((start % 24) + 24) % 24;
+  const e = end === 24 ? 24 : ((end % 24) + 24) % 24;
+  if (s === e || (s === 0 && end === 24)) return Array.from({ length: 24 }, (_, i) => i);
+  const out: number[] = [];
+  for (let h = 0; h < 24; h++) {
+    if (s < e ? (h >= s && h < e) : (h >= s || h < e)) out.push(h);
+  }
+  return out;
+}
+
+function HourTradeToggles({
+  config, busy, onPatch,
+}: {
+  config?: TraderConfig | null;
+  busy: boolean;
+  onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
+}) {
+  // crypto15mHours = explicit UTC hours to trade (overrides the start/end
+  // window). null = follow the window. Clicking an hour materializes the current
+  // window into an explicit list, then toggles — so the grid always reflects
+  // what actually trades. Optimistic to survive fast successive clicks.
+  const start = config?.crypto15mHoursStartUtc ?? 0;
+  const end = config?.crypto15mHoursEndUtc ?? 24;
+  const [local, apply] = useOptimisticValue<number[] | null>(
+    config?.crypto15mHours ?? null,
+    (next) => onPatch({ crypto15mHours: next ?? [] }),
+  );
+  const on = new Set(local ?? windowHours(start, end));
+  const usingExplicit = local != null;
+  const toggle = (h: number): void => {
+    const base = local ?? windowHours(start, end);
+    const next = base.includes(h) ? base.filter((x) => x !== h) : [...base, h].sort((a, b) => a - b);
+    apply(next);
+  };
+  return (
+    <div className="mb-3 rounded-xl border border-krypt-border bg-krypt-surface p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="text-[11px] uppercase tracking-wider text-krypt-dim">Trade hours (UTC)</span>
+        <span className="text-[11px] text-krypt-dim">{on.size}/24 on</span>
+        {usingExplicit ? (
+          <button
+            disabled={busy}
+            onClick={() => apply(null)}
+            className="rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[10px] text-krypt-dim transition-colors hover:text-white"
+          >
+            reset to {start}–{end} window
+          </button>
+        ) : (
+          <span className="text-[11px] text-krypt-dim">following the {start}–{end} window — click an hour to pick specific hours</span>
+        )}
+      </div>
+      <div className="grid grid-cols-12 gap-1">
+        {Array.from({ length: 24 }, (_, h) => (
+          <button
+            key={h}
+            disabled={busy}
+            onClick={() => toggle(h)}
+            title={`${String(h).padStart(2, '0')}:00 UTC — ${on.has(h) ? 'trading, click to disable' : 'disabled, click to enable'}`}
+            className={cls(
+              'rounded border py-1 text-[10px] font-semibold tabular-nums transition-colors',
+              on.has(h)
+                ? 'border-krypt-win/40 bg-krypt-win/10 text-white'
+                : 'border-krypt-border bg-krypt-surface2 text-krypt-dim line-through',
+            )}
+          >
+            {String(h).padStart(2, '0')}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

@@ -120,6 +120,15 @@ function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
         .map((r: any): RuleCondition => ({ field: r.field, op: r.op, value: Number(r.value) }));
       continue;
     }
+    if (k === 'crypto15mHours') {
+      // numeric UTC-hour list (not a string list); null = use the window.
+      if (v === null) { out[k] = null; continue; }
+      if (Array.isArray(v)) {
+        out[k] = v.filter((x) => typeof x === 'number' && x >= 0 && x <= 23);
+        continue;
+      }
+      drop(k, 'expected an hour list'); continue;
+    }
     const d = defaults[k];
     if (d === null || Array.isArray(d)) {
       // string-list keys; the null-defaulted ones (allowed*Categories,

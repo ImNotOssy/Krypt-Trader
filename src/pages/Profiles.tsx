@@ -92,7 +92,14 @@ export function ProfilesPage() {
     try {
       const text = await file.text();
       const r = await window.krypt.profiles.import(text);
-      if (r.ok) {
+      if (r.ok && r.data) {
+        // Import only adds the profile to the library; users expect an imported
+        // profile to take effect (its cryptos/hours/gates), so activate it now —
+        // apply patches its engine slice and pushes to the backend.
+        const applied = await window.krypt.profiles.apply(r.data.id);
+        toast.success(applied?.ok ? `Imported & applied "${r.data.name}"` : (r.message || 'Imported'));
+        await refresh.state();
+      } else if (r.ok) {
         toast.success(r.message || 'Imported');
         await refresh.state();
       } else toast.error(r.message || 'Import failed');

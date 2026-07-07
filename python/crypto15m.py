@@ -325,6 +325,13 @@ def _blank_asset(entry: dict, spot: Optional[float], error: Optional[str] = None
 
 
 def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
+    # Explicit per-hour allowlist wins over the start/end window when present
+    # (None = use the window; a list = trade ONLY those UTC hours, empty = never).
+    hrs = (cfg or {}).get("crypto15m_hours")
+    if isinstance(hrs, list):
+        if hour is None:
+            hour = datetime.now(timezone.utc).hour
+        return int(hour) in {int(h) for h in hrs}
     try:
         start = int(cfg.get("crypto15m_hours_start_utc", 0) or 0)
         end = int(cfg.get("crypto15m_hours_end_utc", 24) or 24)

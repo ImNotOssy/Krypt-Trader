@@ -150,6 +150,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "crypto15m_maker_cancel_min": 1.0,
     "crypto15m_hours_start_utc": 0,
     "crypto15m_hours_end_utc": 24,
+    "crypto15m_hours": None,                  # None = use the start/end window;
+                                              # a list of UTC hours (0-23) = trade
+                                              # ONLY those hours (empty = never)
     "crypto15m_enabled": False,
     "crypto15m_live": False,
     "crypto15m_sizing_mode": "fixed",
@@ -791,6 +794,15 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_min_macd_hist"] = _clampf(cfg.get("crypto15m_min_macd_hist"), 0.0, 1e9, d["crypto15m_min_macd_hist"])
     cfg["crypto15m_hours_start_utc"] = _clampi(cfg.get("crypto15m_hours_start_utc"), 0, 24, d["crypto15m_hours_start_utc"])
     cfg["crypto15m_hours_end_utc"] = _clampi(cfg.get("crypto15m_hours_end_utc"), 0, 24, d["crypto15m_hours_end_utc"])
+    # crypto15m_hours: None = fall back to the window above; a list restricts to
+    # those UTC hours (0-23, deduped/sorted). Any non-list/non-None → None.
+    hh = cfg.get("crypto15m_hours")
+    if isinstance(hh, list):
+        cfg["crypto15m_hours"] = sorted({
+            int(h) for h in hh if isinstance(h, (int, float)) and 0 <= int(h) <= 23
+        })
+    elif hh is not None:
+        cfg["crypto15m_hours"] = None
     cfg["crypto15m_indicator_detect"] = bool(cfg.get("crypto15m_indicator_detect", True))
     cfg["crypto15m_spot_ws"] = bool(cfg.get("crypto15m_spot_ws", d["crypto15m_spot_ws"]))
     cfg["crypto15m_strict_threshold"] = bool(cfg.get("crypto15m_strict_threshold", d["crypto15m_strict_threshold"]))

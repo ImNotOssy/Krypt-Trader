@@ -126,6 +126,7 @@ export interface TraderConfig {
   crypto15mMakerCancelMin?: number;
   crypto15mHoursStartUtc?: number;
   crypto15mHoursEndUtc?: number;
+  crypto15mHours?: number[] | null;         // explicit UTC hours (0-23) to trade; null = use the window above
   crypto15mRecordSignals?: boolean;
   mainRecordSignals?: boolean;             // record whale/momentum signals while the app runs (forced on when trading is enabled)
   // Perpetual futures (Kalshi margin API) — passive market-data recorder.

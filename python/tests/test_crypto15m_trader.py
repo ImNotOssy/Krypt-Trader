@@ -649,6 +649,29 @@ def test_hours_ok_overnight_wrap(cfg):
     assert crypto15m.hours_ok(cfg, hour=12) is False
 
 
+def test_hours_ok_explicit_list_overrides_window(cfg):
+    # An explicit per-hour list beats the start/end window (which here says "all")
+    cfg["crypto15m_hours_start_utc"] = 0
+    cfg["crypto15m_hours_end_utc"] = 24
+    cfg["crypto15m_hours"] = [9, 10, 11]
+    assert crypto15m.hours_ok(cfg, hour=10) is True
+    assert crypto15m.hours_ok(cfg, hour=14) is False
+
+
+def test_hours_ok_empty_list_is_never(cfg):
+    cfg["crypto15m_hours"] = []           # every hour deselected → never trade
+    for h in range(24):
+        assert crypto15m.hours_ok(cfg, hour=h) is False
+
+
+def test_hours_ok_none_falls_back_to_window(cfg):
+    cfg["crypto15m_hours"] = None
+    cfg["crypto15m_hours_start_utc"] = 6
+    cfg["crypto15m_hours_end_utc"] = 12
+    assert crypto15m.hours_ok(cfg, hour=8) is True
+    assert crypto15m.hours_ok(cfg, hour=20) is False
+
+
 # ───────── stop-loss exit chase (the "stop-loss didn't fill" fix) ──────────
 
 

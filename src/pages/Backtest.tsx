@@ -339,9 +339,25 @@ export function BacktestPage() {
               (monitor mode is enough — no live trading needed) and it records every
               {engine === 'crypto15m'
                 ? ' 15-minute market with its outcome. Make sure the 15m Crypto toggle is on and the environment is Live/production (demo 15m markets are frozen).'
-                : ' whale and momentum signal it sees, with outcomes. Data starts accruing immediately.'}
+                : engine === 'perps'
+                  ? ' perpetual quote, trade and 1-minute candle. Turn on "Collect perpetuals data" on the Perpetuals page and leave the app open; candles start accruing immediately.'
+                  : ' whale and momentum signal it sees, with outcomes. Data starts accruing immediately.'}
               {' '}Check back after a few hours; the charts get sharper every day it runs.
             </p>
+          </div>
+        </Card>
+      )}
+      {res && res.windowsScanned > 0 && res.n === 0 && (
+        <Card className="mt-4">
+          <div className="text-xs leading-relaxed text-krypt-muted">
+            <span className="font-semibold text-krypt-warn">
+              0 trades over {res.windowsScanned.toLocaleString()} {engine === 'crypto15m' ? 'windows' : 'bars'} scanned.
+            </span>{' '}
+            {engine === 'perps'
+              ? ((config?.perpsStratRules?.length ?? 0) === 0
+                  ? 'Your perps strategy has no entry rules, so it never enters — that’s why the backtest is empty. Open the Perpetuals page, add at least one entry rule in the Strategy builder, then re-run here (the backtest replays those exact rules, TP/SL, leverage and fee era).'
+                  : 'Your entry rules never matched anywhere in this window. Loosen them or widen the date range on the Perpetuals page, then re-run.')
+              : 'No entries triggered in this window — loosen the entry gates or widen the date range.'}
           </div>
         </Card>
       )}

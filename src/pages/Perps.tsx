@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, DatabaseZap, Download, RadioTower, Sparkles, Tractor } from 'lucide-react';
+import { AlertTriangle, RadioTower, Sparkles, Tractor } from 'lucide-react';
 import type { PerpPositionRow, PerpsStatus, PerpsWallet, RuleCondition, TraderConfig } from '@shared/types';
 import { Card, Page, Switch, useOptimisticValue } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
@@ -29,6 +29,95 @@ const PERPS_RULE_FIELDS: { v: string; label: string }[] = [
 const RULE_OPS = ['>=', '<=', '>', '<'] as const;
 const PERP_SYMBOLS = ['KXBTCPERP', 'KXETHPERP', 'KXSOLPERP', 'KXXRPPERP', 'KXDOGEPERP'];
 
+// Strategy TEMPLATES — one-click starting points (like the 15m presets). These
+// are NOT proven winners: a wide sweep of the recorded data found no profitable
+// perps configuration (the ~5bps round-trip fee beats every signal). They exist
+// so you can pick a coherent, understandable strategy, backtest it on YOUR data,
+// and paper-trade — not to be armed blindly. Each sets direction + entry rules +
+// TP/SL + a cheap maker entry; Market / size / leverage stay as you set them.
+const PERPS_STRATS: { id: string; name: string; blurb: string; patch: Partial<TraderConfig> }[] = [
+  { id: 'custom', name: 'My custom rules', blurb: 'Build your own from the fields below.', patch: {} },
+  {
+    id: 'momentum', name: 'Momentum burst',
+    blurb: 'Long after a sharp 5-minute up-move (only when it’s moving enough to matter), ride it with a wide take-profit.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'ret5mBps', op: '>=', value: 25 }, { field: 'vol15mBps', op: '>=', value: 8 }],
+      perpsStratTpBps: 40, perpsStratSlBps: 25, perpsStratMaxHoldMin: 45, perpsStratExitOnRulesFail: false,
+    },
+  },
+  {
+    id: 'dip', name: 'Dip reversal',
+    blurb: 'Buy a 15-minute washout, betting on a bounce back.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'ret15mBps', op: '<=', value: -25 }],
+      perpsStratTpBps: 40, perpsStratSlBps: 25, perpsStratMaxHoldMin: 45, perpsStratExitOnRulesFail: false,
+    },
+  },
+  {
+    id: 'breakout', name: 'Breakout',
+    blurb: 'Long when price pushes to its 1-hour high with momentum behind it.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'fromHigh60mBps', op: '<=', value: 5 }, { field: 'ret5mBps', op: '>=', value: 8 }],
+      perpsStratTpBps: 50, perpsStratSlBps: 30, perpsStratMaxHoldMin: 45, perpsStratExitOnRulesFail: false,
+    },
+  },
+  {
+    id: 'fade', name: 'Momentum fade',
+    blurb: 'Short a sharp 5-minute spike, betting it mean-reverts.',
+    patch: {
+      perpsStratDirection: 'short', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'ret5mBps', op: '>=', value: 25 }],
+      perpsStratTpBps: 30, perpsStratSlBps: 20, perpsStratMaxHoldMin: 30, perpsStratExitOnRulesFail: false,
+    },
+  },
+  // ── regime-gated variants: only fire in a specific market state. Run a pair
+  //    (e.g. Trend rider + Chop fader) in two paper shells for a crude
+  //    "switch strategy by regime" behavior the single engine can't do alone. ──
+  {
+    id: 'trend-hivol', name: 'Trend rider (high-vol)',
+    blurb: 'Long a sustained 15-min up-move, but only when volatility is high enough to clear fees.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'ret15mBps', op: '>=', value: 20 }, { field: 'vol15mBps', op: '>=', value: 12 }],
+      perpsStratTpBps: 60, perpsStratSlBps: 35, perpsStratMaxHoldMin: 60, perpsStratExitOnRulesFail: true,
+    },
+  },
+  {
+    id: 'session-mom', name: 'Session momentum',
+    blurb: 'Momentum long, but only during the active US hours (13–21 UTC).',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [
+        { field: 'ret5mBps', op: '>=', value: 20 },
+        { field: 'hourUtc', op: '>=', value: 13 },
+        { field: 'hourUtc', op: '<=', value: 21 },
+      ],
+      perpsStratTpBps: 40, perpsStratSlBps: 25, perpsStratMaxHoldMin: 45, perpsStratExitOnRulesFail: false,
+    },
+  },
+  {
+    id: 'funding-tilt', name: 'Funding harvest',
+    blurb: 'Go long when funding is negative (shorts pay longs) — collect carry while holding.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'fundingRateBps', op: '<=', value: -3 }],
+      perpsStratTpBps: 60, perpsStratSlBps: 40, perpsStratMaxHoldMin: 120, perpsStratExitOnRulesFail: false,
+    },
+  },
+  {
+    id: 'revert-scalp', name: 'Reversion scalp',
+    blurb: 'Buy a fast 1-minute drop for a quick bounce, tight take-profit.',
+    patch: {
+      perpsStratDirection: 'long', perpsStratEntryStyle: 'maker',
+      perpsStratRules: [{ field: 'ret1mBps', op: '<=', value: -15 }],
+      perpsStratTpBps: 15, perpsStratSlBps: 12, perpsStratMaxHoldMin: 10, perpsStratExitOnRulesFail: false,
+    },
+  },
+];
+
 /** Perpetual futures — Kalshi's margin API.
  *
  * Today this page is the DATA side: a passive recorder streaming every
@@ -40,7 +129,6 @@ const PERP_SYMBOLS = ['KXBTCPERP', 'KXETHPERP', 'KXSOLPERP', 'KXXRPPERP', 'KXDOG
 export function PerpsPage() {
   const { config } = useApp();
   const [st, setSt] = useState<PerpsStatus | null>(null);
-  const [backfilling, setBackfilling] = useState(false);
 
   const load = async () => {
     try {
@@ -54,28 +142,12 @@ export function PerpsPage() {
     return () => clearInterval(t);
   }, []);
 
-  const toggleRecording = async (on: boolean) => {
-    await window.krypt.config.update({ perpsRecordSignals: on });
-    void load();
-  };
-
-  const runBackfill = async () => {
-    setBackfilling(true);
-    try {
-      await window.krypt.perps.backfill();
-      await load();
-    } finally {
-      setBackfilling(false);
-    }
-  };
-
   const counts = st?.counts;
-  const bf = st?.backfill;
 
   return (
     <Page
       title="Perpetuals"
-      subtitle="Kalshi perpetual futures (BTC, ETH, SOL…). Right now this is the data engine: while the app is open it records 1-second quotes, the public trade tape, 1-minute candles and funding rates for the symbols below — the dataset the upcoming perps strategies will be tested against. No perps orders are ever placed from this page yet."
+      subtitle="Kalshi perpetual futures (BTC, ETH, SOL…). Pick a strategy template or build your own, backtest it on your recorded candles (Backtest page → Perpetuals), then paper-trade before ever going live. Data collection runs quietly in the background — manage it on the Backtest page."
     >
       <div className="mb-4 rounded-lg border border-krypt-loss/40 bg-krypt-loss/5 p-3">
         <div className="flex items-start gap-2">
@@ -96,57 +168,16 @@ export function PerpsPage() {
         <WalletCard w={st?.wallet ?? null} />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card header={<div className="text-xs uppercase tracking-wider text-krypt-muted">Data collection</div>}>
-          <Switch
-            checked={config?.perpsRecordSignals ?? true}
-            onChange={(v) => void toggleRecording(v)}
-            label="Collect perpetuals data"
-            description="Streams live quotes + trades over WebSocket (needs API keys) with a 30s REST fallback that always records production market data, plus 1m candles and funding rates. Pure recording — no orders, no margin, works with trading fully off."
-          />
-          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <Stat label="Quote ticks" value={counts ? counts.ticks.toLocaleString() : '…'} />
-            <Stat label="Trades" value={counts ? counts.trades.toLocaleString() : '…'} />
-            <Stat label="1m candles" value={counts ? counts.candles.toLocaleString() : '…'} />
-            <Stat label="Funding rates" value={counts ? counts.funding.toLocaleString() : '…'} />
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-krypt-dim">
-            <span className="inline-flex items-center gap-1.5">
-              <RadioTower className={cls('h-3 w-3', st?.wsConnected ? 'text-krypt-win' : 'text-krypt-dim')} />
-              {st?.wsConnected
-                ? `live stream connected (${st.ws.env})`
-                : 'stream offline — REST fallback records every 30s'}
-            </span>
-            {counts?.lastAt && <span>last capture {counts.lastAt.slice(5, 16)} UTC</span>}
-            {(st?.ws.droppedTicks ?? 0) > 0 && (
-              <span className="text-krypt-warn">{st!.ws.droppedTicks} dropped (recorder stalled?)</span>
-            )}
-          </div>
-        </Card>
-
-        <Card header={<div className="text-xs uppercase tracking-wider text-krypt-muted">History backfill</div>}>
-          <p className="text-xs leading-relaxed text-krypt-dim">
-            Candles and funding rates can be fetched retroactively from Kalshi — quotes and the
-            trade tape only record while the app is open. Backfill runs automatically when
-            collection is on; re-run it anytime to repair gaps (already-stored rows are skipped).
-          </p>
-          <div className="mt-3 flex items-center gap-3">
-            <button
-              onClick={() => void runBackfill()}
-              disabled={backfilling || bf?.running}
-              className="inline-flex items-center gap-2 rounded-md border border-krypt-purple/40 bg-krypt-purple/10 px-4 py-2 text-xs font-semibold text-krypt-purple transition-colors hover:bg-krypt-purple/20 disabled:opacity-50"
-            >
-              {bf?.running
-                ? <DatabaseZap className="h-3.5 w-3.5 animate-pulse" />
-                : <Download className="h-3.5 w-3.5" />}
-              {bf?.running ? `Backfilling… ${bf.progress}` : 'Backfill 14 days'}
-            </button>
-            <span className="text-[11px] text-krypt-dim">
-              {bf?.done && !bf.running ? 'backfill complete' : ''}
-              {bf?.error ? ` ⚠ ${bf.error}` : ''}
-            </span>
-          </div>
-        </Card>
+      <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-krypt-border/60 bg-krypt-surface2/40 px-3 py-2 text-[11px] text-krypt-dim">
+        <span className="inline-flex items-center gap-1.5">
+          <RadioTower className={cls('h-3 w-3', st?.wsConnected ? 'text-krypt-win' : 'text-krypt-dim')} />
+          {st?.recording
+            ? (st?.wsConnected ? `recording · live stream (${st.ws.env})` : 'recording · REST fallback (stream offline)')
+            : 'data collection is off'}
+        </span>
+        {counts && <span>{counts.candles.toLocaleString()} candles · {counts.ticks.toLocaleString()} ticks</span>}
+        {counts?.lastAt && <span>last capture {counts.lastAt.slice(5, 16)} UTC</span>}
+        <span className="ml-auto text-krypt-dim/70">Turn collection &amp; 14-day backfill on/off on the Backtest page.</span>
       </div>
 
       <div className="mt-4">
@@ -218,6 +249,8 @@ function StrategyCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: ()
   const [ack, setAck] = useState(false);
   const [history, setHistory] = useState<PerpPositionRow[]>([]);
   const [flattening, setFlattening] = useState(false);
+  const [presetId, setPresetId] = useState('custom');
+  const [showRules, setShowRules] = useState(false);
 
   const update = (patch: Partial<TraderConfig>) => window.krypt.config.update(patch);
 
@@ -241,6 +274,15 @@ function StrategyCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: ()
   const removeRule = (i: number) => setRules(rules.filter((_, idx) => idx !== i));
   const patchRule = (i: number, patch: Partial<RuleCondition>) =>
     setRules(rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+
+  const applyPreset = (p: (typeof PERPS_STRATS)[number]) => {
+    setPresetId(p.id);
+    if (p.id === 'custom') { setShowRules(true); return; }
+    const { perpsStratRules: pr, ...rest } = p.patch;
+    if (pr) setRules(pr as RuleCondition[]);
+    if (Object.keys(rest).length) void update(rest);
+    setShowRules(false);
+  };
 
   const setNum = (key: keyof TraderConfig) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const v = Number(e.target.value);
@@ -285,11 +327,36 @@ function StrategyCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: ()
       </div>
     }>
       <p className="text-xs leading-relaxed text-krypt-dim">
-        Compose your own perps strategy from the same fields the backtester computes — the backtest,
-        paper mode and live mode run the <span className="text-white">identical entry/exit code</span>,
-        so what you test is what trades. Backtest it on the Backtest page (engine: Perpetuals) against
-        the candles this app records.
+        Pick a template to load a ready-made strategy, or build your own. Backtest, paper and live all run
+        the <span className="text-white">identical entry/exit code</span>, so what you test is what trades —
+        backtest on the Backtest page (engine: Perpetuals) first.
       </p>
+      <div className="mt-3">
+        <div className="mb-1.5 text-[10px] uppercase tracking-wide text-krypt-dim">Strategy template</div>
+        <div className="flex flex-wrap gap-1.5">
+          {PERPS_STRATS.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => applyPreset(p)}
+              title={p.blurb}
+              className={cls(
+                'rounded-md border px-2.5 py-1 text-xs transition-colors',
+                presetId === p.id
+                  ? 'border-krypt-purple/60 bg-krypt-purple/10 text-white'
+                  : 'border-krypt-border bg-krypt-surface2 text-krypt-dim hover:text-white',
+              )}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+        {presetId !== 'custom' && (
+          <p className="mt-1.5 text-[11px] leading-relaxed text-krypt-dim">
+            {PERPS_STRATS.find((p) => p.id === presetId)?.blurb}{' '}
+            <span className="text-krypt-warn">Template only — no perps config tested profitable in our data; backtest &amp; paper-trade before arming.</span>
+          </p>
+        )}
+      </div>
       <div className="mt-3 grid gap-4 lg:grid-cols-2">
         <div>
           <div className="grid grid-cols-2 gap-2">
@@ -327,14 +394,21 @@ function StrategyCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: ()
           </div>
 
           <div className="mt-3 rounded-lg border border-krypt-border bg-krypt-surface2 p-3">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-krypt-dim">
-              Entry rules (ALL must pass)
-            </div>
+            <button
+              onClick={() => setShowRules((v) => !v)}
+              className="flex w-full items-center justify-between text-left"
+            >
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-krypt-dim">
+                Entry rules (ALL must pass) · {rules.length} set
+              </span>
+              <span className="text-[11px] text-krypt-dim">{showRules ? '▾ hide' : '▸ edit'}</span>
+            </button>
             {rules.length === 0 && (
               <div className="mt-2 rounded-md border border-krypt-warn/30 bg-krypt-warn/5 px-2 py-1.5 text-[11px] text-krypt-warn">
-                No conditions set — the strategy never enters. Add at least one.
+                No conditions set — the strategy never enters. Pick a template above, or “edit” to add one.
               </div>
             )}
+            {showRules && (<>
             <div className="mt-2 flex flex-col gap-2">
               {rules.map((r, i) => (
                 <div key={i} className="flex items-center gap-2">
@@ -374,6 +448,7 @@ function StrategyCard({ st, onChanged }: { st: PerpsStatus | null; onChanged: ()
               <span className="font-mono">below 1h high ≥ 30</span> (dip),{' '}
               <span className="font-mono">15m vol ≥ 8</span> (only trade when it moves enough to beat fees).
             </p>
+            </>)}
           </div>
 
           <div className="mt-3 grid grid-cols-3 gap-2">
