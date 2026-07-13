@@ -48,35 +48,30 @@ from kalshi_perps_api import usd_micro, cc
 logger = logging.getLogger("perps_ws")
 
 try:
-    import websockets  # type: ignore
+    import websockets
     _WS_IMPORT_OK = True
-except Exception:  # pragma: no cover - websockets missing
-    websockets = None  # type: ignore
+except Exception:
+    websockets = None
     _WS_IMPORT_OK = False
 
 _WS_BASES = {
     "demo": "wss://external-api-margin-ws.demo.kalshi.co/trade-api/ws/v2/margin",
     "production": "wss://external-api-margin-ws.kalshi.com/trade-api/ws/v2/margin",
 }
-_WS_PATH = "/trade-api/ws/v2/margin"   # primary signed path (inferred)
-_WS_PATH_FALLBACK = "/trade-api/ws/v2"  # one-shot fallback on 401 upgrade
+_WS_PATH = "/trade-api/ws/v2/margin"
+_WS_PATH_FALLBACK = "/trade-api/ws/v2"
 
 _DISABLED = os.environ.get("KRYPT_PERPS_WS", "1").strip().lower() in (
     "0", "off", "false", "no",
 )
 
-# ~35 min of 13-symbol 1Hz ticker traffic; drop-oldest beyond this. The
-# recorder drains every ~15s, so hitting the cap means the recorder is dead —
-# the dropped counters surface that in stats()/perpsStatus.
 _TICK_BUF_MAX = 30_000
 _TRADE_BUF_MAX = 30_000
 _RECONNECT_MAX_SEC = 60.0
-# Ticker alone is ~1 msg/s per subscribed market and Kalshi pings every 10s
-# ("heartbeat" body; the websockets lib auto-pongs) — 30s of silence = dead.
 _SILENT_TIMEOUT_SEC = 30.0
 _RECONCILE_MIN_INTERVAL_SEC = 1.0
 
-TickerCb = Callable[[dict], None]  # sync, per ticker frame — must be cheap
+TickerCb = Callable[[dict], None]
 
 
 def _mark(v) -> tuple[Optional[int], Optional[int]]:
@@ -103,28 +98,25 @@ class _Client:
         self._stop: bool = False
         self._task: Optional[asyncio.Task] = None
         self._ws = None
-        self._gen: int = 0  # bumped to force a reconnect (e.g. env switch)
+        self._gen: int = 0
         self._id: int = 0
         self._loop_time: Callable[[], float] = lambda: 0.0
         self.last_msg_t: float = 0.0
-        self._path_ok: Optional[str] = None  # signed path that worked (sticky)
+        self._path_ok: Optional[str] = None
 
-        # desired symbols (WIRE tickers) vs live shared subs per channel
         self.want_symbols: set[str] = set()
-        self._chan_sids: dict[str, int] = {}       # channel -> sid (-1 in flight)
+        self._chan_sids: dict[str, int] = {}
         self._chan_have: dict[str, set[str]] = {"ticker": set(), "trade": set()}
-        self._inflight: dict[int, tuple] = {}      # cmd id -> (kind, key)
+        self._inflight: dict[int, tuple] = {}
 
-        # parsed-row buffers (DB-ready dicts) + latest-quote cache
         self._tick_buf: list[dict] = []
         self._trade_buf: list[dict] = []
         self.dropped_ticks: int = 0
         self.dropped_trades: int = 0
-        self.quotes: dict[str, dict] = {}          # ticker -> latest parsed row
+        self.quotes: dict[str, dict] = {}
 
         self.on_ticker: Optional[TickerCb] = None
 
-    # ───────── lifecycle ─────────────────────────────────────────────
 
     def start(self, env: str, *, on_ticker: Optional[TickerCb] = None) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
@@ -160,7 +152,7 @@ class _Client:
         env = env if env in _WS_BASES else "production"
         if env != self.env:
             self.env = env
-            self._gen += 1  # force reconnect to the new host
+            self._gen += 1
             logger.info(f"perps_ws: env → {env}, reconnecting")
 
     def set_symbols(self, tickers) -> None:
@@ -176,7 +168,6 @@ class _Client:
             except Exception:
                 pass
 
-    # ───────── connection loop ───────────────────────────────────────
 
     async def _run(self) -> None:
         attempt = 0
@@ -184,13 +175,13 @@ class _Client:
             gen = self._gen
             try:
                 await self._connect_once(gen)
-                attempt = 0  # clean exit (gen bump) → reconnect immediately
+                attempt = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 attempt += 1
                 backoff = min(2.0 ** attempt, _RECONNECT_MAX_SEC)
-                backoff *= random.uniform(0.75, 1.25)  # de-sync the user base
+                backoff *= random.uniform(0.75, 1.25)
                 logger.warning(
                     f"perps_ws: disconnected ({type(e).__name__}: {e}); "
                     f"reconnect in {backoff:.0f}s"
@@ -202,8 +193,6 @@ class _Client:
                     raise
 
     def _upgrade_status(self, e: Exception) -> int | None:
-        # websockets >=12: InvalidStatus with .response.status_code;
-        # older: InvalidStatusCode with .status_code.
         sc = getattr(e, "status_code", None)
         if sc is None:
             sc = getattr(getattr(e, "response", None), "status_code", None)
@@ -211,7 +200,6 @@ class _Client:
 
     async def _connect_once(self, gen: int) -> None:
         if not kalshi_auth.credentials_present(self.env):
-            # No creds for this env yet — the REST poll remains the baseline.
             await asyncio.sleep(5)
             return
         url = os.environ.get("KRYPT_PERPS_WS_URL") or _WS_BASES[self.env]
@@ -224,7 +212,7 @@ class _Client:
             headers = kalshi_auth.sign_headers("GET", signed_path)
             try:
                 conn = websockets.connect(url, additional_headers=headers, **kwargs)
-            except TypeError:  # websockets <12
+            except TypeError:
                 conn = websockets.connect(url, extra_headers=headers, **kwargs)
             try:
                 ws = await conn
@@ -266,7 +254,6 @@ class _Client:
                     self._handle(json.loads(raw))
                 except Exception as e:
                     logger.debug(f"perps_ws: handle error: {e}")
-                # Busy-tape floor cadence, same rationale as kalshi_ws.
                 if self._loop_time() - last_reconcile >= _RECONCILE_MIN_INTERVAL_SEC:
                     await self._reconcile(ws)
                     last_reconcile = self._loop_time()
@@ -279,13 +266,10 @@ class _Client:
                 pass
 
     def _reset_sub_state(self) -> None:
-        # Subscriptions never survive a reconnect. BUFFERS ARE KEPT — parsed
-        # rows are valid records regardless of the socket that produced them.
         self._chan_sids.clear()
         self._chan_have = {"ticker": set(), "trade": set()}
         self._inflight.clear()
 
-    # ───────── outbound commands ──────────────────────────────────────
 
     def _next_id(self) -> int:
         self._id += 1
@@ -312,14 +296,14 @@ class _Client:
             if sid is None:
                 cid = self._next_id()
                 self._inflight[cid] = ("chan", ch)
-                self._chan_sids[ch] = -1  # reserved; real sid filled on ack
+                self._chan_sids[ch] = -1
                 await self._send(ws, {"id": cid, "cmd": "subscribe",
                                       "params": {"channels": [ch],
                                                  "market_tickers": sorted(want)}})
                 self._chan_have[ch] = set(want)
                 continue
             if sid == -1:
-                continue  # subscribe in flight
+                continue
             add = sorted(want - have)
             rem = sorted(have - want)
             if add:
@@ -335,7 +319,6 @@ class _Client:
             if add or rem:
                 self._chan_have[ch] = set(want)
 
-    # ───────── inbound dispatch ───────────────────────────────────────
 
     def _handle(self, m: dict) -> None:
         t = m.get("type")
@@ -348,8 +331,6 @@ class _Client:
         elif t == "error":
             msg = m.get("msg") or {}
             logger.debug(f"perps_ws: server error {msg.get('code')}: {msg.get('msg')}")
-            # Release a NAK'd subscribe's reservation or it is never retried
-            # for the connection's lifetime (kalshi_ws learned this the hard way).
             cid = m.get("id")
             kind_key = self._inflight.pop(cid, None) if cid is not None else None
             if kind_key:
@@ -370,7 +351,7 @@ class _Client:
 
     def _buf_append(self, buf: list, row: dict, cap: int, drop_attr: str) -> None:
         if len(buf) >= cap:
-            del buf[: max(1, cap // 10)]  # drop-oldest in blocks
+            del buf[: max(1, cap // 10)]
             setattr(self, drop_attr, getattr(self, drop_attr) + max(1, cap // 10))
         buf.append(row)
 
@@ -387,12 +368,6 @@ class _Client:
         row = {
             "ticker": t,
             "ts_ms": msg.get("ts_ms") or 0,
-            # LOCAL receipt time (wall clock, epoch ms). Distinct from wire
-            # ts_ms: Kalshi's perps ticker is coalesced and thin markets update
-            # their book slowly, so ts_ms (market-event time) can lag real time
-            # by minutes on a perfectly healthy stream. Consumers gauging data
-            # freshness (e.g. the volume farmer) must use recv_ms, not ts_ms.
-            # Ignored by the recorder's explicit-column insert.
             "recv_ms": int(time.time() * 1000),
             "last_usd_micro": usd_micro(msg.get("price")),
             "bid_usd_micro": usd_micro(msg.get("bid")),
@@ -426,18 +401,17 @@ class _Client:
         price = usd_micro(msg.get("price"))
         count = cc(msg.get("count"))
         if price is None or count is None:
-            return  # malformed frame — drop, never poison the feed
+            return
         self._buf_append(self._trade_buf, {
             "trade_id": str(msg.get("trade_id") or ""),
             "ticker": t,
             "ts_ms": msg.get("ts_ms") or 0,
             "price_usd_micro": price,
             "count_cc": count,
-            "taker_side": msg.get("taker_side", ""),  # bid|ask, stored verbatim
+            "taker_side": msg.get("taker_side", ""),
             "kalshi_env": self.env,
         }, _TRADE_BUF_MAX, "dropped_trades")
 
-    # ───────── sync read APIs (recorder + future strategies) ──────────
 
     def drain_ticks(self) -> list[dict]:
         """Swap-and-return every buffered ticker row (each exactly once)."""
@@ -469,7 +443,6 @@ class _Client:
 _client = _Client()
 
 
-# Module-level delegators (the rest of the bot imports these).
 def start(env: str, *, on_ticker: Optional[TickerCb] = None) -> None:
     _client.start(env, on_ticker=on_ticker)
 

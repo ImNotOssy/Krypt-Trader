@@ -43,10 +43,6 @@ export function SettingsPage() {
   const update = <K extends keyof TraderConfig>(key: K, value: TraderConfig[K]): Promise<void> =>
     patch({ [key]: value } as Partial<TraderConfig>);
 
-  // The backend evaluates the trading-hours window at UTC + tradingTimezoneOffsetMin,
-  // which defaults to 0 (= UTC). Auto-fill the offset from this machine's timezone
-  // the first time the user touches the window while it's still at that default —
-  // otherwise a "19:00" start silently means 19:00 UTC.
   const systemOffsetMin = -new Date().getTimezoneOffset();
   const patchTradingWindow = (p: Partial<TraderConfig>): Promise<void> => {
     if (config.tradingTimezoneOffsetMin === 0 && systemOffsetMin !== 0) {
@@ -55,8 +51,6 @@ export function SettingsPage() {
     return patch(p);
   };
 
-  // Switching env is the #1 place users silently lock themselves out (wrong /
-  // missing keys for the target env). Make it loud: switch, then verify + tell them.
   const switchEnv = async (e: 'demo' | 'production'): Promise<void> => {
     if (!config || e === config.kalshiEnv) return;
     if (e === 'production' && !window.confirm(
@@ -218,10 +212,6 @@ export function SettingsPage() {
             value={config.allowedCategories}
             onChange={(v) => void patch({
               allowedCategories: v,
-              // Strategy presets can install hidden per-source category lists
-              // (e.g. Edge Stack's allowedWhaleCategories) that AND with this
-              // global list and survive shallow config patches forever. The
-              // user's explicit pick here is authoritative — clear them.
               allowedWhaleCategories: null,
               allowedMomentumCategories: null,
             })}
@@ -792,8 +782,6 @@ function Field({
 function CategoryPicker({
   value, onChange,
 }: { value: string[] | null; onChange: (v: string[] | null) => void }) {
-  // Optimistic local copy so rapid toggles build on each other instead of on a
-  // stale `config` round-trip (which silently reverted earlier clicks).
   const [local, apply] = useOptimisticValue(value, onChange);
   const allEnabled = local === null;
   const selected = new Set(local ?? []);

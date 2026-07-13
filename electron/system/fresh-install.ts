@@ -4,22 +4,10 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import { dirname, join } from 'node:path';
 import { appendLog } from '../ipc';
 
-// Version-change maintenance. Because productName is constant ("Krypt Trader"),
-// every version shares ONE userData folder — settings, credentials, and the
-// trade/signal DB all carry across updates, and that is intentional: the DB
-// migrates its own schema (python/db.py) and the settings loader merges old
-// files over new defaults, so nothing needs a wipe. On a version change we only
-// snapshot settings + DB into backups/v<prev> as rollback insurance and clear
-// the logs dir. Separately, a freshly-opened version terminates any
-// OTHER-install instance still running so it can take the single-instance lock
-// instead of silently quitting back to the old copy.
 
 const APP_EXE = 'Krypt Trader.exe';
 const BACKEND_EXE = 'krypt-trader-backend.exe';
 
-// Run the destructive/process logic only in a real install. Dev keeps its data
-// and never kills stray Electron processes. KRYPT_FRESH_INSTALL_FORCE=1 opts in
-// for manual testing from a dev checkout.
 function enabled(): boolean {
   return app.isPackaged || process.env.KRYPT_FRESH_INSTALL_FORCE === '1';
 }
@@ -27,7 +15,6 @@ function enabled(): boolean {
 function log(level: 'INFO' | 'WARNING' | 'ERROR', msg: string): void {
   const entry = { ts: new Date().toISOString(), level, source: 'app', msg };
   try { appendLog(entry); } catch {   }
-  // eslint-disable-next-line no-console
   console.log(`[fresh-install] ${level} ${msg}`);
 }
 
@@ -41,9 +28,6 @@ export function sleepSync(ms: number): void {
   } catch {   }
 }
 
-// ---------------------------------------------------------------------------
-// Instance takeover
-// ---------------------------------------------------------------------------
 
 interface ProcRow { ProcessId: number; ExecutablePath: string | null }
 
@@ -57,7 +41,6 @@ function findOtherInstancePids(): number[] {
     "$ErrorActionPreference='SilentlyContinue';" +
     `Get-CimInstance Win32_Process -Filter "Name='${APP_EXE}' OR Name='${BACKEND_EXE}'"` +
     ' | Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress';
-  // -EncodedCommand (UTF-16LE base64) sidesteps all nested-quote escaping.
   const encoded = Buffer.from(ps, 'utf16le').toString('base64');
   let out: string;
   try {
@@ -84,8 +67,6 @@ function findOtherInstancePids(): number[] {
     const pid = Number(row?.ProcessId);
     const exe = row?.ExecutablePath;
     if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-    // Skip processes we can't attribute (null path = access denied) — never
-    // kill something we can't prove is a foreign install.
     if (!exe) continue;
     if (exe.toLowerCase().startsWith(ourDir + '\\') || exe.toLowerCase() === process.execPath.toLowerCase()) {
       continue; // our own install
@@ -97,7 +78,6 @@ function findOtherInstancePids(): number[] {
 
 function killPid(pid: number): void {
   try {
-    // /T kills the process tree (so an old Electron also takes its backend down).
     spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
       timeout: 5000, windowsHide: true,
     });
@@ -125,9 +105,6 @@ export function takeOverOtherInstances(): number {
   return killed;
 }
 
-// ---------------------------------------------------------------------------
-// Version-change maintenance (preserve data, snapshot for rollback)
-// ---------------------------------------------------------------------------
 
 function readPrevVersion(statePath: string): string | null {
   try {
@@ -140,8 +117,6 @@ function readPrevVersion(statePath: string): string | null {
 
 function writeVersion(statePath: string, version: string): void {
   try {
-    // Atomic (tmp+rename) so a kill/power-loss mid-write can't leave a truncated
-    // marker that later reads as null and triggers a same-version wipe.
     const tmp = `${statePath}.tmp`;
     writeFileSync(
       tmp,
@@ -211,8 +186,6 @@ export function runVersionMaintenance(): void {
 
   if (prev === current) return; // already on this version
 
-  // A missing/corrupt marker is a brand-new install (or a marker truncated by
-  // a kill/power-loss) — adopt whatever data exists and just seed the marker.
   if (prev === null) {
     writeVersion(statePath, current);
     return;
@@ -221,24 +194,15 @@ export function runVersionMaintenance(): void {
   const tag = prev.replace(/[^\w.\-]/g, '_');
   const backupsRoot = join(userData, 'backups');
   const backupDir = join(backupsRoot, `v${tag}`);
-  // Clear only THIS tag's stale dir; older snapshots stay until the new one
-  // fully succeeds, so a failed copy can't orphan the only rollback point.
   try { rmSync(backupDir, { recursive: true, force: true }); } catch {   }
 
-  // Snapshot settings + DB. The WAL/SHM sidecars matter: right after an old
-  // backend was killed they can hold commits not yet checkpointed into the
-  // main DB file, and SQLite recovers them from a db+wal copy.
   let snapshotOk = snapshotFile(settingsPath, backupDir, 'settings.json');
   for (const suffix of ['', '-wal', '-shm']) {
     snapshotOk = snapshotFile(`${dbPath}${suffix}`, backupDir, `krypt-trader.db${suffix}`) && snapshotOk;
   }
 
-  // Logs are noise — clear them each version.
   try { rmSync(logsDir, { recursive: true, force: true }); } catch {   }
 
-  // Snapshot complete: only NOW is it safe to prune older ones, keeping this
-  // one. The marker always advances — preserving live data can't fail, and a
-  // best-effort snapshot shouldn't re-run every launch on a full disk.
   if (snapshotOk) pruneBackupsExcept(backupsRoot, `v${tag}`);
   writeVersion(statePath, current);
   log(

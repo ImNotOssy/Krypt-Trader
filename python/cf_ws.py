@@ -32,7 +32,6 @@ logger = logging.getLogger("cf_ws")
 _FRESH_SEC = 10.0
 _SETTLE_FRESH_SEC = 6.0
 
-# BRTI is BTC's legacy id; everything else follows "<SYM>USD_RTI".
 _INDEX_RE = re.compile(r"^([A-Z]+)USD_RTI$")
 _SPECIAL_INDEX = {"BRTI": "BTC"}
 
@@ -56,24 +55,19 @@ def _f(v) -> Optional[float]:
 
 class _State:
     def __init__(self) -> None:
-        # asset -> (wall_ts, raw index value)
         self.values: dict[str, tuple[float, float]] = {}
-        # asset -> (wall_ts, avg_value, window_size, window_end_ms) — the
-        # final-minute settlement average as Kalshi computes it.
         self.settle: dict[str, tuple[float, float, int, float]] = {}
 
-    # ───────── inbound (called by kalshi_ws) ──────────────────────────
 
     def handle_message(self, m: dict) -> None:
         if not isinstance(m, dict) or m.get("type") != "cfbenchmarks_value":
-            return  # acks / indexlist / errors
+            return
         msg = m.get("msg") or {}
         asset = _index_to_asset(str(msg.get("index_id") or ""))
         if not asset:
             return
         now = time.time()
 
-        # Raw index frame (string-encoded JSON) → the true settlement spot.
         val: Optional[float] = None
         data = msg.get("data")
         if isinstance(data, str):
@@ -85,14 +79,10 @@ class _State:
         elif isinstance(data, dict):
             val = _f(data.get("value"))
         if val is None:
-            # Degrade to the trailing 60s average — still the right index,
-            # just smoother.
             val = _f(((msg.get("avg_60s_data") or {}).get("value")))
         if val is not None:
             self.values[asset] = (now, val)
 
-        # Final-minute settlement average (present only inside the last minute
-        # before a quarter-hour close).
         sw = msg.get("last_60s_windowed_average_15min")
         if isinstance(sw, dict):
             avg = _f(sw.get("value"))
@@ -107,7 +97,6 @@ class _State:
             if avg is not None and n > 0:
                 self.settle[asset] = (now, avg, n, end_ms)
 
-    # ───────── sync read APIs ─────────────────────────────────────────
 
     def spot(self, asset: str) -> Optional[float]:
         rec = self.values.get((asset or "").upper())

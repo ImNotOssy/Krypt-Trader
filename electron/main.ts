@@ -22,8 +22,6 @@ if (process.platform === 'win32') {
 let mainWindow: BrowserWindow | null = null;
 
 function iconPath(): string {
-  // Windows uses the multi-resolution .ico; Linux/macOS need a raster .png for
-  // the window/taskbar icon, so list both and pick whichever exists.
   const file = process.platform === 'win32' ? 'krypt.ico' : 'krypt.png';
   const candidates = [
     app.isPackaged
@@ -54,10 +52,6 @@ function createMainWindow(): BrowserWindow {
   const primary = screen.getPrimaryDisplay();
   const width = bounds?.width ?? Math.min(1380, primary.workArea.width - 40);
   const height = bounds?.height ?? Math.min(900, primary.workArea.height - 40);
-  // Only reuse saved x/y if the window would still be visible on a connected
-  // display — a monitor may have been unplugged / resolution changed since, which
-  // would otherwise open the window off-screen and unreachable. Else let Electron
-  // center it on the primary display.
   const onScreen = !!bounds && screen.getAllDisplays().some((d) => {
     const a = d.workArea;
     return (
@@ -86,8 +80,6 @@ function createMainWindow(): BrowserWindow {
       sandbox: true,
       nodeIntegration: false,
       backgroundThrottling: false,
-      // Hard-disable DevTools in shipped builds: openDevTools() and the default
-      // Ctrl+Shift+I accelerator both become no-ops. Kept on in dev.
       devTools: !app.isPackaged,
     },
   });
@@ -130,11 +122,6 @@ function createMainWindow(): BrowserWindow {
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window:maximizeChange', true));
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window:maximizeChange', false));
 
-  // Frameless windows on Windows often regain OS focus WITHOUT handing keyboard
-  // focus to the web contents — so inputs show a caret but silently drop
-  // keystrokes until you alt-tab away and back. Re-focusing the web contents on
-  // every show/focus fixes the intermittent "can't type in a box" bug after a
-  // tray-restore, minimize-restore, or alt-tab.
   const focusContents = (): void => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.focus();
   };
@@ -157,12 +144,6 @@ function createMainWindow(): BrowserWindow {
 
 let quitting = false;
 
-// Try to become the primary instance first. On the common path (fresh launch,
-// nothing else running) the lock is free and we proceed WITHOUT paying the
-// PowerShell process scan. Only when the lock is contended do we evict an
-// OLDER-install instance holding it and retry — so a newly-opened version still
-// takes over from an old one, but a normal launch and a same-install
-// double-click-to-focus don't run the scan.
 let gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   const evicted = takeOverOtherInstances();
@@ -203,19 +184,10 @@ function installCsp(): void {
 }
 
 async function bootstrap(): Promise<void> {
-  // Drop the default application menu (and its Ctrl+Shift+I "Toggle Developer
-  // Tools" accelerator) on Windows/Linux. NOT on macOS: nulling the menu there
-  // also removes the Edit-role Cmd+C/V/X and Cmd+Q accelerators, breaking
-  // clipboard + quit. DevTools is already hard-disabled in packaged builds via
-  // webPreferences.devTools, so the leftover mac menu item is an inert no-op.
   if (process.platform !== 'darwin') {
     Menu.setApplicationMenu(null);
   }
 
-  // On a version change, snapshot settings + DB for rollback and clear old
-  // logs — user data is preserved across updates (the backend migrates the DB
-  // schema itself). Runs BEFORE settings load / backend start so the snapshot
-  // is taken from quiescent files.
   runVersionMaintenance();
 
   registerIpc();
@@ -324,8 +296,6 @@ async function toggleTradingFromTray(): Promise<void> {
     try {
       await pythonBackend.request('setConfig', { config: next.config });
     } catch {
-      // The tray has no toast surface — without this the engine can keep
-      // trading (or stay stopped) while the tray checkmark says otherwise.
       const msg =
         'Trading toggle saved, but the backend did not confirm it — the engine may still be '
         + (cur.config.enableTrading ? 'running' : 'stopped')

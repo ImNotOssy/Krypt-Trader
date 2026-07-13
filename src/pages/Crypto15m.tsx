@@ -265,10 +265,6 @@ function AssetTradeToggles({
   busy: boolean;
   onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
 }) {
-  // null/undefined crypto15mAssets = all enabled. Toggling builds an explicit
-  // list; the executor only opens NEW positions on enabled assets. Optimistic
-  // local copy so two quick toggles don't both build on a stale config and
-  // revert each other.
   const [local, apply] = useOptimisticValue<string[] | null>(
     config?.crypto15mAssets ?? null,
     (next) => onPatch({ crypto15mAssets: next ?? [] }),
@@ -305,8 +301,6 @@ function AssetTradeToggles({
   );
 }
 
-// Hours in the start/end window → an explicit list (for materializing the
-// window when the user first clicks a specific hour). start/end are 0-24.
 function windowHours(start: number, end: number): number[] {
   const s = ((start % 24) + 24) % 24;
   const e = end === 24 ? 24 : ((end % 24) + 24) % 24;
@@ -325,10 +319,6 @@ function HourTradeToggles({
   busy: boolean;
   onPatch: (p: Partial<TraderConfig>) => Promise<void> | void;
 }) {
-  // crypto15mHours = the explicit UTC hours the executor may enter new trades.
-  // null seeds the grid from the legacy start/end window (backward compat) and
-  // any click materializes it into an explicit list. Optimistic to survive fast
-  // successive clicks.
   const start = config?.crypto15mHoursStartUtc ?? 0;
   const end = config?.crypto15mHoursEndUtc ?? 24;
   const [local, apply] = useOptimisticValue<number[] | null>(
@@ -421,6 +411,8 @@ const C15_DEFAULTS = {
   takeProfitCents: 0,
   stopLossPct: 0,
   sessionTakeProfitUsd: 0,
+  hfRecord: false,
+  hfIntervalMs: 200,
   minRsi: 0,
   minMacdHist: 0,
   minDeltaPct: 0,
@@ -433,9 +425,6 @@ const C15_DEFAULTS = {
   maxConcurrent: 3,
 };
 
-// Every preset is a complete strategy choice: the directional presets turn
-// Pairs OFF and the Pairs preset turns the directional engine OFF, so clicking
-// a chip always answers "what is this tab running?" with exactly one thing.
 const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<TraderConfig> }[] = [
   {
     id: 'favorite', name: 'Deep Favorite',
@@ -487,8 +476,6 @@ const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<Trad
   // lose nearly always. The engine keeps the code hard-disabled for research.
 ];
 
-// Snapshot fields a custom entry rule may gate on (mirrors the backend's
-// _CRYPTO15M_RULE_FIELDS allow-list in config.py).
 const C15_RULE_FIELDS: { v: string; label: string }[] = [
   { v: 'favoritePrice', label: 'Favorite price (0–1)' },
   { v: 'entryCost', label: 'Entry cost (0–1)' },
@@ -543,9 +530,6 @@ function StrategySettings({
   };
   const dir = (config?.crypto15mDirectionMode ?? C15_DEFAULTS.directionMode);
   const entryStyle = (config?.crypto15mEntryStyle ?? C15_DEFAULTS.entryStyle);
-  // Pairs was removed (engine hard-disables it), so the directional engine is
-  // always on; the dim wrappers below are inert and kept only to avoid a
-  // sweeping layout diff.
   const dimCls = '';
   const dimTitle = undefined;
 
@@ -851,7 +835,23 @@ function StrategySettings({
           label="Live spot feed (Coinbase)"
           description="Real-time spot prices from Coinbase — a constituent of the CF Benchmarks index Kalshi settles against — plus a final-minute settlement-average tracker that sharpens the model. Off = slower REST price polling only."
         />
+        <Switch
+          checked={config?.crypto15mHfRecord ?? false}
+          onChange={(v) => void update({ crypto15mHfRecord: v })}
+          label="HF book recorder (research)"
+          description="Records the live WebSocket book + spot at up to ~5Hz into crypto15m_ticks_hf — data for the exit-latency study (how much of the intra-window bid overshoot is harvestable as you get faster). Records only, never trades. Needs the live spot feed on + WS connected. Off by default; 7-day retention."
+        />
       </div>
+      {config?.crypto15mHfRecord ? (
+        <div className="mt-2">
+          <NumField
+            label="HF sample interval" suffix="ms" min={50} max={5000} step={50}
+            value={num('crypto15mHfIntervalMs', C15_DEFAULTS.hfIntervalMs)}
+            hint="How often the recorder samples the live WS state. 200ms ≈ 5Hz. Lower = finer resolution and more rows (below ~100ms mostly writes duplicates — the WS rarely updates faster)."
+            onCommit={(v) => void update({ crypto15mHfIntervalMs: Math.round(v) })}
+          />
+        </div>
+      ) : null}
 
       <RuleBuilder config={config} update={update} />
 
@@ -877,8 +877,6 @@ function RuleBuilder({
   update: (patch: Partial<TraderConfig>) => void | Promise<void>;
 }) {
   const useRules = !!config?.crypto15mUseRules;
-  // Optimistic local copy — add/edit/remove on a rule list otherwise rebuilt
-  // each call from a stale config round-trip, so fast edits clobbered earlier ones.
   const [rules, setRules] = useOptimisticValue<RuleCondition[]>(
     config?.crypto15mRules ?? [],
     (next) => update({ crypto15mRules: next }),

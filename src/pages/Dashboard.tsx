@@ -38,10 +38,6 @@ export function DashboardPage({ onNav }: DashboardProps) {
       && p.status !== 'dry_run'
       && (p.status === 'filled' || p.status === 'partial' || p.status === 'submitted'),
   );
-  // The engine's max-open-positions cap only counts bot-managed positions in the
-  // ACTIVE environment — imported/external rows and other-env leftovers don't eat
-  // cap slots (db.count_open_bot_positions). Mirror that filter so "X / cap"
-  // compares the same quantity the engine does.
   const botOpenPos = openPos.filter(
     (p) => p.signalSource !== 'external' && (!config || p.kalshiEnv === config.kalshiEnv),
   );

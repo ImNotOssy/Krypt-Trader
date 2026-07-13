@@ -233,8 +233,6 @@ export function load(): AppState {
   } catch (e) {
     console.error('settings parse failed, backing up + falling back to defaults:', e);
     try {
-      // Preserve the user's (corrupt/locked) file before persistBounds overwrites
-      // settings.json on the next window move — otherwise all profiles are lost.
       renameSync(f, `${f}.corrupt-${Date.now()}.bak`);
     } catch {   }
     cached = { ...DEFAULT_STATE };

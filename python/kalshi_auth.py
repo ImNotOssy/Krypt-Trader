@@ -64,7 +64,7 @@ if sys.platform == "win32":
         ):
             raise OSError("CryptUnprotectData failed")
         return _from_blob(out)
-else:  # pragma: no cover - non-Windows fallback
+else:
     def _dpapi_encrypt(data: bytes) -> bytes:
         raise OSError("DPAPI not available")
 
@@ -82,14 +82,7 @@ def _restrict_dir(d: Path) -> None:
 
 
 def _atomic_write_0600(path: Path, data: bytes) -> None:
-    # Create the temp file with mode 0600 from the start (no world-readable
-    # window), then atomically replace. POSIX honours the mode; on Windows it's a
-    # no-op but DPAPI already protects the contents there. This guards the RSA
-    # private key that signs real-money orders against other local users.
     tmp = path.with_suffix(path.suffix + ".tmp")
-    # O_BINARY is required on Windows — without it os.open uses TEXT mode and
-    # rewrites \n -> \r\n, corrupting the DPAPI marker and the RSA PEM. (No-op on
-    # POSIX, where O_BINARY doesn't exist.)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
     fd = os.open(str(tmp), flags, 0o600)
     try:
@@ -217,17 +210,11 @@ def server_now() -> float:
     return _time.time() + _server_offset_ms / 1000.0
 _last_sync: float = 0.0
 _RESYNC_INTERVAL_SEC = 300
-# Guards the background clock-resync so the interval-triggered HEAD never runs on
-# the asyncio event loop (see now_ms). A single in-flight sync at a time.
 _sync_lock = threading.Lock()
 _sync_in_progress: bool = False
 
 _current_env: str = "production"
 
-# Held while the global env is temporarily flipped (e.g. testing the *other*
-# account's credentials) so concurrent balance fetches can't read — and cache —
-# the wrong environment's balance. Acquire around any temp env switch and around
-# every balance fetch (see trader.refresh_balance).
 ENV_LOCK = asyncio.Lock()
 
 
@@ -395,10 +382,6 @@ def sync_server_time(force: bool = False) -> int:
     now_local = time.time()
     if (not force) and (now_local - _last_sync) < _RESYNC_INTERVAL_SEC:
         return _server_offset_ms
-    # Back off for the FULL interval on every attempt (success or failure).
-    # Previously _last_sync was only set on success, so a failed/missing-Date
-    # sync left the gate permanently open and this blocking 5s HEAD ran on the
-    # event loop for EVERY signed request — freezing the stop-loss/order loop.
     _last_sync = now_local
     try:
         with httpx.Client(timeout=5.0) as c:
@@ -424,13 +407,6 @@ def _bg_sync() -> None:
 
 
 def now_ms() -> int:
-    # sign_headers() -> now_ms() runs on the asyncio event loop for EVERY signed
-    # request and the WS handshake. When the 5-min resync interval elapses, do the
-    # blocking HTTP HEAD in a BACKGROUND THREAD instead of inline — otherwise it
-    # froze the whole loop (WS recv, order polling, the latency-critical 15m
-    # stop-loss/TP chase) for up to the 5s HEAD timeout every 5 minutes. The
-    # current offset (which drifts only slowly) is used until the sync lands; a
-    # single-flight guard prevents piling up threads.
     global _sync_in_progress
     if (time.time() - _last_sync) >= _RESYNC_INTERVAL_SEC:
         start = False

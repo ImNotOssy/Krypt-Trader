@@ -20,36 +20,12 @@ import trader
 
 logger = logging.getLogger("crypto15m")
 
-# Last tick's per-asset entry-block reasons — read by status() so the UI can
-# answer "why isn't it trading" instead of the reasons dying in a local var.
 _block_reasons: dict[str, str] = {}
 
-# ───────── model-calibration drift monitor (the sniper's lifeline) ──────────
-# The model edge exists ONLY while ">=97% predicted" keeps delivering >=~96%
-# realized. Nothing else in the system watches that assumption — a regime
-# change or degraded settlement feed would bleed quietly at high confidence.
-# Rolling check over the last _CAL_WINDOW resolved windows where the model was
-# sniper-confident in the entry band; if the Wilson lower bound of the realized
-# hit rate drops below break-even, model-mode entries auto-pause (and resume
-# with hysteresis once calibration recovers).
 _CAL_CACHE: dict = {"at": 0.0, "ok": True, "n": 0, "rate": None, "lb": None}
 _CAL_CHECK_SEC = 300.0
-_CAL_WINDOW = 40          # rolling windows considered
-_CAL_MIN_N = 20           # below this, not enough evidence to pause
-# Bounds are on the WILSON LOWER BOUND, which sits well under the observed
-# rate at these sample sizes: a PERFECT record's LB is n/(n+z²) — 0.886 at
-# 21/21 and only 0.937 at 40/40 (the rolling-window ceiling). The old bars
-# (pause 0.955 / resume 0.965) were ABOVE that ceiling, so the sniper
-# auto-paused forever once n reached 20 even at a 100% hit rate (observed
-# live 2026-07-03: "hit only 100% over the last 21 windows"). Correct
-# framing: break-even at ~93c entries + fee is ~94% observed; 0.85 LB ≈
-# observed ~95% at n=40, so a record at/under ~90% observed (a real
-# money-loser) pauses while a healthy 97%+ record clears with room.
-# Resume: 0.90 was itself unreachable (wilson_lb(39,40)=0.8954 — only a
-# literally perfect 40/40 cleared it, so one miss anywhere in the trailing
-# 40 kept a recovered model paused for days). 0.88 resumes at 39/40
-# (observed 97.5%, healthy) while 38/40 (LB 0.8597) stays paused —
-# hysteresis preserved: pause at ≤37/40, resume at ≥39/40.
+_CAL_WINDOW = 40
+_CAL_MIN_N = 20
 _CAL_PAUSE_LB = 0.85
 _CAL_RESUME_LB = 0.88
 
@@ -85,7 +61,6 @@ def check_model_calibration(env: str) -> dict:
             ).fetchall()
     except Exception:
         return dict(_CAL_CACHE)
-    # last qualifying tick per window = the prediction the sniper would act on
     last_by_ticker: dict = {}
     for r in rows:
         last_by_ticker[r["ticker"]] = r
@@ -98,7 +73,7 @@ def check_model_calibration(env: str) -> dict:
     lb = _wilson_lb(wins, n)
     prev_ok = bool(_CAL_CACHE.get("ok", True))
     if n < _CAL_MIN_N:
-        ok = True  # not enough evidence to pause on
+        ok = True
     elif prev_ok:
         ok = lb >= _CAL_PAUSE_LB
     else:
@@ -245,10 +220,6 @@ def momentum_filters_ok(asset: dict, cfg: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
-# Final-minute sniper gates (model mode only). 30+ of 60 prints locked means
-# remaining settlement variance has collapsed ~87%; 0.9985 ≈ a 3-sigma
-# distance between the projected average and the strike; 54 prints max leaves
-# ~6s for the order round-trip before the close tick.
 _FM_MIN_PRINTS = 30
 _FM_MAX_PRINTS = 54
 _FM_MIN_PROB = 0.9985
@@ -266,24 +237,9 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         return False, "no market"
     if asset.get("favorite") not in ("up", "down"):
         return False, "no favorite"
-    # The trading-hours gate is a HARD time control and always applies — even
-    # with custom rules, which replace only the favorite/signal EDGE (the rule
-    # vocabulary can't express a wrapping overnight window). Without this,
-    # use_rules would silently trade 24h. The snapshot's hourUtc is passed
-    # through so REPLAY evaluates each tick's recorded hour, not the wall
-    # clock at backtest run time (live snapshots always stamp hourUtc, and
-    # hours_ok falls back to now() when it's None).
     if not crypto15m.hours_ok(cfg, hour=asset.get("hourUtc")):
         return False, "outside trading hours"
-    # Custom rule-set (rule builder): the user's composed conditions REPLACE the
-    # built-in favorite/signal gate. The side bought still comes from
-    # direction_mode; the rules decide WHEN to enter (they can gate on minsLeft
-    # themselves, so the entry window is theirs to control).
     if cfg.get("crypto15m_use_rules"):
-        # User rules replace the built-in gate but NOT the safety rails: a
-        # naive rule-set could otherwise buy a 99c contract 30 seconds before
-        # close (max-gamma, the -$7.12 lesson). Final minute stays model-mode-
-        # only, and the executable ask must respect the entry cap.
         ml = asset.get("minsLeft")
         if ml is not None and float(ml) < 1.0:
             return False, "final minute (custom rules are blocked here — model mode only)"
@@ -297,10 +253,6 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         if rask and float(rask) > crypto15m._const(cfg, "entry_max"):
             return False, f"ask {float(rask)*100:.0f}c above the entry cap"
         return True, "ok"
-    # Settlement sniper (model mode): its own gate, independent of the
-    # favorite/signal machinery — enter only when the settlement model calls
-    # the outcome near-certain AND the quote still leaves fee-adjusted edge.
-    # Backtest on recorded ticks: 0.97 gate ≤5min → 97.7% win, +3.9c/ct net.
     if (cfg.get("crypto15m_direction_mode") or "favorite").lower() == "model":
         mp = asset.get("modelProb")
         if mp is None:
@@ -317,13 +269,6 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         ml = asset.get("minsLeft")
         final_minute = ml is not None and 0.0 < float(ml) < 1.0
         if final_minute:
-            # The largest measured edge in our data (+22.8c/ct, 27/27 wins):
-            # inside the last 60s the settlement average is being REALIZED
-            # print-by-print while stale quotes linger — but only trade it
-            # with real prints in hand, ~3-sigma certainty, and enough runway
-            # for the order round-trip. Model mode only; other modes keep the
-            # hard final-minute block (that block exists because BLIND
-            # favorite-buying here is max-gamma — trade #250's −$7.12).
             if not cfg.get("crypto15m_model_final_minute", True):
                 return False, "final minute (disabled)"
             prints = int(asset.get("settlePrints") or 0)
@@ -349,7 +294,6 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
         return True, "ok"
     if not asset.get("signal"):
         return False, "no signal"
-    # Optional direction-aware RSI/MACD confirmation on top of the favorite gate.
     return momentum_filters_ok(asset, cfg)
 
 
@@ -370,12 +314,8 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
         return False
     if int(position.get("filled_contracts") or 0) <= 0:
         return False
-    # Cents/price stop: the held side has fallen to (or below) the exit price.
     if side_prob < crypto15m._const(cfg, "exit_threshold"):
         return True
-    # Percent-of-entry stop: the position is down >= X% from its entry cost. 0=off.
-    # A binary contract's current mark ≈ side_prob dollars, so current value is
-    # filled*side_prob vs the cost_usd we paid.
     slp = stop_loss_pct(cfg)
     if slp > 0:
         filled = int(position.get("filled_contracts") or 0)
@@ -522,10 +462,6 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
         entry_cost = max(0.01, 1.0 - fav_price)
         conf = entry_cost * 100.0
     elif mode == "model":
-        # NOT `or 0.5`: modelProb of EXACTLY 0.0 (down near-certain — the
-        # strongest snipe there is) is falsy, and the fallback flipped the
-        # side to UP at 50/50 (real trade #346 bought UP with the model at
-        # 0.0000). None can't reach here (should_enter gates it), but guard.
         mp_raw = a.get("modelProb")
         mp = float(mp_raw) if mp_raw is not None else 0.5
         side = "up" if mp >= 0.5 else "down"
@@ -539,21 +475,11 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
     direction = direction_for_favorite(side)
     style = (cfg.get("crypto15m_entry_style") or "maker").lower()
     if mode == "model":
-        # The sniper's edge is minutes from expiry — a resting maker bid would
-        # miss the window. Always take the ask.
         style = "taker"
     if style == "maker":
         limit_cents = maker_limit_cents(side, a.get("yesBid"), a.get("yesAsk"), entry_cost)
     else:
         limit_cents = entry_limit_cents(entry_cost, crypto15m._const(cfg, "entry_diff"))
-    # HARD threshold floor (strict mode, favorite strategy only): the user's
-    # entry_threshold applies to the price actually PAID, not just the
-    # mid-derived favorite probability. On a thin/one-sided book the mid can say
-    # "85c favorite" while the executable ask is far lower (the 71c NO case) —
-    # a favorite that cheap isn't really that strong, so skip. A maker bid is
-    # floored AT the threshold so a fill can never land below it either.
-    # (Model mode has its own gates; flooring its limit at the favorite
-    # threshold would be interference.)
     if (
         mode == "favorite"
         and not cfg.get("crypto15m_use_rules")
@@ -574,14 +500,6 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
         balance_usd=balance_usd,
         order_size=max(1, int(cfg.get("crypto15m_order_size", 1))),
     )
-    # Aggregate 15m exposure cap: the assets' windows are one correlated crypto
-    # bet, so total committed 15m cost is capped at a fraction of the bankroll.
-    # Bankroll = cash + FILLED 15m cost only: Kalshi's balance is NOT reduced
-    # by resting orders (see trader.refresh_balance), so counting resting entry
-    # notional in the bankroll too counted that cash twice and loosened the cap
-    # by resting_notional × cap_pct. The full committed total (filled + resting)
-    # still consumes the budget. Trim the order to the remaining budget rather
-    # than skipping outright.
     cap_pct = _clamp01(cfg.get("crypto15m_max_total_pct", 0.0))
     if cap_pct > 0 and balance_usd > 0:
         with db.get_db() as conn:
@@ -602,23 +520,16 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
             f"(risk budget too small at {limit_cents}c)"
         )
         return None
-    # HARD wall-clock guard at ORDER time (not snapshot time — the snapshot
-    # can be ~3-7s stale): never place an entry within 10s of the close. Real
-    # trade #402 went out at T−2s, its cancel raced a maker fill, and 8
-    # untracked contracts rode into settlement (−$6.56 off the books). Nothing
-    # good happens ordering into the last seconds of the settlement window.
     close_epoch = crypto15m._parse_close_epoch(a.get("closeTime") or "")
     if close_epoch is not None and close_epoch - kalshi_auth.server_now() < 10.0:
         logger.info(f"[crypto15m] skip {a.get('asset')}: <10s to close at order time")
         return None
     ticker = a.get("ticker")
     coid = f"krypt-c15-{a['asset']}-{uuid.uuid4().hex[:8]}"
-    # Stamp WHICH strategy opened this row so per-strategy P&L is computable
-    # (before this, sniper results were indistinguishable from favorite-follow).
     ml = a.get("minsLeft")
     strategy = "rules" if cfg.get("crypto15m_use_rules") else mode
     if mode == "model" and ml is not None and float(ml) < 1.0:
-        strategy = "model_fm"  # final-minute strike — its own risk profile
+        strategy = "model_fm"
     row = {
         "asset": a["asset"], "series": a["series"], "ticker": ticker,
         "side": side, "direction": direction,
@@ -628,12 +539,6 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
         "entry_delta_usd": a.get("deltaUsd"), "kalshi_env": env,
     }
 
-    # Insert the row BEFORE the POST. If the process dies between the POST and
-    # the insert (Electron watchdog SIGKILL, crash, locked DB), the live order
-    # would have NO row and — because this series is excluded from the main
-    # reconcile — zero recovery path: real fills settling completely off-book.
-    # A 'placing' row costs nothing and lets _poll_entry resolve the truth via
-    # the coid on the next tick no matter where we died.
     row.update({"status": "placing", "dry_run": False})
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, row)
@@ -644,11 +549,6 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
             count=order_size, price_cents=limit_cents, client_order_id=coid,
         )
     except Exception as e:
-        # The POST may have reached Kalshi with the response lost (timeout, or a
-        # retry rejected as a duplicate client_order_id). Look the order up by
-        # our coid before booking 'error' — an unacknowledged LIVE order would
-        # otherwise trade real money with no stop-loss, no take-profit and no
-        # settlement booking.
         recovered, lookup_ok = await _lookup_lost_order(coid, ticker or "")
         with db.get_db() as conn:
             if isinstance(recovered, dict) and recovered.get("order_id"):
@@ -661,13 +561,10 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
                     f"after order error: {e}"
                 )
             elif lookup_ok:
-                # Lookup succeeded and found nothing — the POST never landed.
                 db.update_crypto15m_position(conn, pid, error=str(e)[:200])
                 _mark_resolved(conn, pid, status="error")
                 logger.error(f"[crypto15m] entry order failed {a['asset']}: {e}")
             else:
-                # Couldn't check (network down) — leave 'placing'; _poll_entry's
-                # placing branch resolves the truth on the next tick.
                 db.update_crypto15m_position(conn, pid, error=f"UNCONFIRMED: {str(e)[:160]}")
             return db.fetch_crypto15m_by_id(conn, pid)
 
@@ -693,8 +590,6 @@ def _mark_resolved(conn, pid: int, **fields) -> None:
 async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
     pid, kid = pos["id"], pos.get("kalshi_order_id")
     if not kid:
-        # 'placing' (crash between insert and POST resolution) or a lost
-        # response with an unconfirmable lookup: resolve the truth by coid.
         coid = pos.get("client_order_id")
         if not coid:
             return None
@@ -707,7 +602,6 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
                 )
                 logger.warning(f"[crypto15m] adopted orphan entry via coid ({pos.get('asset')})")
             elif confirmed:
-                # Confirmed absent — the order never existed; free the slot.
                 _mark_resolved(conn, pid, status="canceled", exit_reason="never_placed")
             return db.fetch_crypto15m_by_id(conn, pid)
     parsed = None
@@ -747,12 +641,6 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
             await kalshi_api.cancel_order(kid)
         except Exception:
             pass
-        # Read the FINAL fill state with retries — the cancel can race a fill,
-        # and a single stale/failed read here booked a maker-FILLED order as
-        # "canceled 0/8" (real order a18e5ca1: 8 untracked contracts rode into
-        # settlement, −$6.56 off the books). Never book canceled without a
-        # CONFIRMED zero-fill read; on total read failure leave the row
-        # 'submitted' so the next tick retries (a second cancel just 404s).
         final_filled, final_cost, final_avg, final_fees = filled, None, None, None
         read_ok = False
         for attempt in range(3):
@@ -799,14 +687,6 @@ def _entry_expired(pos: dict, cfg: dict) -> bool:
     return kalshi_auth.server_now() >= close_epoch - lead
 
 
-# A MARKETABLE entry limit (ask + markup) that hasn't filled within this
-# long means the book moved away and the order is now a resting bid that
-# only fills when price comes DOWN through it — adverse by construction.
-# Cancel and let a fresh gate pass re-enter on a genuine dip (partials keep
-# their fills via the normal expiry path). Applies to pair entries AND
-# model/sniper entries: the sniper's edge is the stale-quote NOW — a snipe
-# that rested 4 minutes is no longer the trade the model priced (it was
-# left exposed until close−cancel_min before this generalization).
 _PAIR_ENTRY_TTL_SEC = 30.0
 _MARKETABLE_STRATEGIES = ("pair", "model", "model_fm")
 
@@ -845,8 +725,6 @@ async def _place_exit(
     if exit_cents is None:
         sp = side_prob_from_market(market, direction) or 0.0
         exit_cents = int(round(sp * 100)) - 2
-    # Price `slippage` cents THROUGH the bid so a stop-loss sweeps depth and fills
-    # instead of resting at the top of a falling book (0 for a take-profit).
     exit_cents = max(1, min(99, exit_cents - slippage))
 
     coid = f"krypt-c15x-{pos['asset']}-{uuid.uuid4().hex[:8]}"
@@ -856,12 +734,6 @@ async def _place_exit(
             count=filled, price_cents=exit_cents, client_order_id=coid,
         )
     except Exception as e:
-        # The POST may have been DELIVERED despite the exception (timeout after
-        # delivery; the transport retry re-sends the same coid and Kalshi
-        # rejects it as a duplicate). If we book only an error note, the next
-        # tick re-fires the stop with a NEW coid alongside the live sell —
-        # selling more than held on Kalshi's single book BUYS the opposite
-        # side with real cash. Adopt-or-confirm before giving up.
         found, confirmed = await _lookup_lost_order(coid, ticker)
         with db.get_db() as conn:
             if found:
@@ -873,13 +745,8 @@ async def _place_exit(
                 )
                 logger.warning(f"[live] {reason} sell {pos['asset']}: response lost, recovered via coid")
             elif confirmed:
-                # Lookup succeeded and no order exists — the POST really never
-                # landed. Safe to leave 'filled' so the exit re-fires fresh.
                 db.update_crypto15m_position(conn, pid, error=f"{reason} sell failed: {str(e)[:160]}")
             else:
-                # Couldn't even check (network down). Park as 'exiting' with no
-                # kid — _poll_exit's no-kid branch resolves the truth before
-                # any second sell can be placed.
                 db.update_crypto15m_position(
                     conn, pid, status="exiting", exit_reason=reason,
                     exit_client_order_id=coid,
@@ -915,9 +782,6 @@ async def _lookup_lost_order(coid: str, ticker: str) -> tuple[Optional[dict], bo
 async def _poll_exit(pos: dict) -> Optional[dict]:
     pid, kid = pos["id"], pos.get("exit_kalshi_order_id")
     if not kid:
-        # An exit whose POST response was lost parks here with the coid but no
-        # order id (see _place_exit / _chase_exit). Resolve the truth before
-        # anything else may sell again.
         coid = pos.get("exit_client_order_id")
         if not coid:
             return None
@@ -928,8 +792,6 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
                     conn, pid, exit_kalshi_order_id=found.get("order_id")
                 )
             elif confirmed:
-                # Confirmed absent — the sell never landed; go back to 'filled'
-                # so the stop/TP logic re-fires a fresh exit next tick.
                 db.update_crypto15m_position(conn, pid, status="filled")
         return None
     try:
@@ -941,20 +803,9 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
     sold = int(parsed.get("filled") or 0)
     remaining = int(parsed.get("remaining") or 0)
     exit_fees = float(parsed.get("fees_usd") or 0.0)
-    # Kalshi reports a SELL's taker/maker_fill_cost as the OFFSETTING-leg cost
-    # basis (sold*(100-sell_price)), NOT the cash received. Actual cash proceeds =
-    # face value (sold contracts * $1) minus that complement. (A BUY's cost_cents
-    # IS the cost paid, so the entry path is unaffected — this is exit-only.)
     proceeds = sold - parsed["cost_cents"] / 100.0
 
     held = int(pos.get("filled_contracts") or 0)
-    # A position is fully exited ONLY when every held contract is confirmed
-    # sold. `remaining <= 0` alone is NOT that: Kalshi zeroes remaining_count on
-    # a CANCELED order, so a partially-filled exit whose remainder was canceled
-    # (by the chase, by market close, or manually) would be booked as a full
-    # exit while the residual contracts ride on Kalshi unbooked — their
-    # settlement cash would never be recorded. A canceled partial stays
-    # 'exiting' so _settle_if_closed books partial proceeds + residual payout.
     if sold > 0 and remaining <= 0 and sold >= held:
         pnl = (
             proceeds - float(pos.get("cost_usd") or 0.0)
@@ -989,22 +840,12 @@ async def _settle_if_closed(pos: dict) -> Optional[dict]:
 
     kid = pos.get("exit_kalshi_order_id")
     if not kid and pos.get("exit_client_order_id") and pos.get("status") == "exiting":
-        # A lost-response exit is still unresolved — settling now would use
-        # numbers that may be missing its fills. _poll_exit adopts/reverts it
-        # first; settle on a later tick.
         return None
     if kid:
         try:
             await kalshi_api.cancel_order(kid)
         except Exception:
             pass
-        # The exit may have (partially) filled between the last poll and this
-        # cancel — re-read its FINAL fills so the settlement books the real
-        # partial proceeds instead of a stale zero (a same-tick partial fill
-        # would otherwise value already-sold contracts at the settlement payout,
-        # booking a losing trade as a win). If the re-read fails outright,
-        # DO NOT settle from the stale row — a wrong settlement is permanent
-        # (resolved rows are never revisited); retry next tick instead.
         try:
             resp = await kalshi_api.get_order(kid)
             parsed = trader._parse_kalshi_order(
@@ -1081,28 +922,19 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
     except Exception:
         best_bid = 0
     if best_bid <= 0:
-        return None  # no liquidity to sell into — settlement will flatten it
+        return None
     if cur_limit and cur_limit <= best_bid:
-        return None  # our sell is at/under the top bid → still marketable, hold
+        return None
 
-    # Re-price `slippage` cents through the bid as well, matching the initial stop.
     new_cents = max(1, min(99, best_bid - _stop_slippage(cfg)))
     kid = pos.get("exit_kalshi_order_id")
     if not kid:
-        # 'exiting' with no order id = a lost-response sell parked for
-        # resolution (_poll_exit adopts or reverts it). Placing a fresh sell
-        # here could double-sell against the unconfirmed one.
         return None
     if kid:
         try:
             await kalshi_api.cancel_order(kid)
         except Exception:
             pass
-        # CONFIRM the old order is dead before placing a replacement. If its
-        # state can't be read, or it's somehow still live (cancel timed out or
-        # 5xx'd while the order kept resting), skip this tick and retry on the
-        # next one — placing a second full-size sell alongside a live one can
-        # OVERSELL and flip the account into an unintended opposite position.
         try:
             resp = await kalshi_api.get_order(kid)
             parsed = trader._parse_kalshi_order(
@@ -1112,10 +944,6 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
             return None
         sold = int(parsed.get("filled") or 0)
         if sold > 0:
-            # The cancelled order filled in the race — record/resolve instead of
-            # placing a second sell for the same contracts. SELL fill_cost is the
-            # offsetting-leg cost; cash proceeds = face value (sold * $1) minus
-            # that complement (see _poll_exit).
             proceeds = sold - parsed["cost_cents"] / 100.0
             exit_fees = float(parsed.get("fees_usd") or 0.0)
             with db.get_db() as conn:
@@ -1137,10 +965,6 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
                         exit_fees_usd=exit_fees,
                     )
                 return db.fetch_crypto15m_by_id(conn, pos["id"])
-        # Re-place ONLY on a CONFIRMED dead order with zero fills. 'executed'
-        # with a zero parsed fill would mean the fill fields changed shape —
-        # re-placing against an executed exit oversells; let the next tick's
-        # re-read sort it out instead.
         if parsed.get("status") not in ("canceled", "cancelled") or sold > 0:
             return None
 
@@ -1151,9 +975,6 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
             count=filled, price_cents=new_cents, client_order_id=coid,
         )
     except Exception as e:
-        # Same lost-response hazard as _place_exit: the old order is confirmed
-        # dead, but this POST may have landed. Adopt-or-confirm; never leave a
-        # state where the next tick re-places blind.
         found, confirmed = await _lookup_lost_order(coid, pos["ticker"])
         with db.get_db() as conn:
             if found:
@@ -1194,8 +1015,6 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
     status = pos.get("status")
 
     if pos.get("dry_run"):
-        # Legacy simulated position from the removed paper engine — retire it
-        # so it stops showing as open. No real order ever backed it.
         with db.get_db() as conn:
             _mark_resolved(
                 conn, pos["id"], status="canceled", exit_reason="unfilled_expired"
@@ -1208,16 +1027,8 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
         row = await _poll_exit(pos)
         if row:
             return row
-        # _poll_exit may have written a partial fill to the DB and returned None
-        # — re-fetch before chasing/settling. Handing the STALE dict onward made
-        # _chase_exit see exit_filled_contracts=0, cancel the partially-filled
-        # live stop-loss without re-placing it (the residual then rode to
-        # settlement unprotected), and let _settle_if_closed book settlement
-        # from zeroed fill/proceeds numbers.
         with db.get_db() as conn:
             pos = db.fetch_crypto15m_by_id(conn, pos["id"]) or pos
-        # Chase the bid down if the resting stop-loss has gone stale, so it fills
-        # instead of riding to settlement at the full loss.
         row = await _chase_exit(pos, cfg)
         if row:
             return row
@@ -1229,8 +1040,6 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
     if status != "filled":
         return None
 
-    # Pair legs: settlement only — no stop-loss, no take-profit, no WS
-    # quote management (see _manage_pair).
     if (pos.get("strategy") or "") == "pair":
         return await _manage_pair(pos)
 
@@ -1239,11 +1048,6 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
     filled = int(pos.get("filled_contracts") or 0)
     cost_usd = float(pos.get("cost_usd") or 0.0)
 
-    # While the window is still OPEN, settlement is impossible — so stop-loss/
-    # take-profit detection can run off the live WS ticker quote instead of a
-    # REST fetch_market per position per tick (0.2-0.5s each, and the reason
-    # exit reaction was capped at REST cadence). Once close_time passes (or no
-    # fresh quote exists) fall back to REST, which also detects settlement.
     market = None
     ws_market = False
     close_epoch = crypto15m._parse_close_epoch(pos.get("close_time") or "")
@@ -1281,45 +1085,13 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
 
 
 
-# ───────── pairs: temporal complement accumulation ──────────────────────────
-#
-# Both sides of one 15m binary seesaw: when UP dips, DOWN peaks, and vice
-# versa. Buy each side on ITS OWN cheap moment at different times in the
-# window; once both legs are held, each matched YES+NO pair settles at exactly
-# $1 regardless of direction — so a blended pair cost below $1 − fees is
-# LOCKED profit. Instantaneous ask_up + ask_down < $1 essentially never
-# happens; the temporal version has opportunities every window.
-#
-# Rules (adapted from the spread-capture playbook):
-#   * a leg buys only on a DIP: its ask ≥ `pairs_dip_cents` below its rolling
-#     median over the last ~3 minutes of ticks
-#   * second leg only if ask ≤ ceiling − (what the first leg actually cost) —
-#     the hard constraint that keeps the blended pair below the ceiling
-#   * first leg only early in the window (≥5 min left — there must be time to
-#     catch the complement), below `pairs_first_leg_max_cents`, and only when
-#     the OTHER side's recent prices make completion plausible
-#   * NO mid-window exits, no stop-loss, no take-profit: selling a leg
-#     converts locked margin into a naked directional bet. Both legs ride to
-#     settlement (the existing per-row settlement booking nets them correctly).
-#   * an unmatched window (second leg never came cheap) is the accepted
-#     failure mode: one clip rides to settlement like any directional bet.
 
-_PAIR_FIRST_LEG_MIN_MINS = 5.0   # first leg needs time to catch the complement
-_PAIR_LEG_MIN_MINS = 1.0         # final minute = settlement sampling, stay out
-_PAIR_HIST_MIN = 8               # ~30s of ticks before a "dip" means anything
-# First legs need a LONGER baseline (~80s of ticks): in a window's first
-# minute the book is still finding its level, so early "dips" are price
-# discovery / the opening drift — the 04:45:54-entry knife-catches — not the
-# seesaw. Second legs keep the short warm-up (they reduce risk).
+_PAIR_FIRST_LEG_MIN_MINS = 5.0
+_PAIR_LEG_MIN_MINS = 1.0
+_PAIR_HIST_MIN = 8
 _PAIR_FIRST_HIST_MIN = 20
-# Max windows allowed to sit with an UNMATCHED first leg at once. Until its
-# complement fills, a first leg is a small directional bet — and cheap "dips"
-# cluster in trending regimes, so unmatched legs across assets are one
-# correlated reversal bet. Second legs are always allowed (they REDUCE risk).
 _PAIR_MAX_UNMATCHED = 2
 
-# ticker -> {"yes": deque[ask_cents], "no": deque[ask_cents]} — rolling ask
-# history fed once per executor tick (~4s), so maxlen 45 ≈ the last 3 minutes.
 _pair_ask_hist: dict[str, dict[str, deque]] = {}
 
 
@@ -1338,7 +1110,6 @@ def _update_pair_hist(assets: dict) -> None:
             hist["yes"].append(round(float(ya) * 100.0, 1))
         if na:
             hist["no"].append(round(float(na) * 100.0, 1))
-    # Windows roll every 15 minutes — drop histories for dead tickers.
     for t in [t for t in _pair_ask_hist if t not in live_tickers]:
         _pair_ask_hist.pop(t, None)
 
@@ -1365,25 +1136,16 @@ def _pair_leg_ok(
     if med - ask_cents < dip_cents:
         return False, f"no dip (ask {ask_cents:.0f}c vs median {med:.0f}c)"
     if other_cost_cents is not None:
-        # Gate on the MARKETABLE LIMIT we actually send (ask + 1c), not the
-        # raw ask — a leg gated at ask=64 but filled at its 65c limit produced
-        # a 96c blended pair, 1c through the ceiling (real trade #285).
         if ask_cents + 1 > ceiling_cents - other_cost_cents:
             return False, (
                 f"pair would cost up to {ask_cents + 1 + other_cost_cents:.0f}c "
                 f"> {ceiling_cents:.0f}c ceiling"
             )
         return True, "ok"
-    # First leg: there must be time and a plausible path to completion.
     if mins_left < _PAIR_FIRST_LEG_MIN_MINS:
         return False, "too late to start a pair"
     if len(own_hist) < _PAIR_FIRST_HIST_MIN or len(other_hist) < _PAIR_FIRST_HIST_MIN:
         return False, "window too young for a first leg (~80s of ticks needed)"
-    # Price BAND, not just a cap. Pairs only pay where the two sides genuinely
-    # oscillate — near coin-flip. A "dip" below the floor usually means a
-    # strong favorite is trending and this is its LOSING side making new lows:
-    # buying it is a knife-catch whose complement only arrives if the whole
-    # trend reverses (the 20-33c first legs that motivated this band).
     if ask_cents < first_leg_min_cents:
         return False, (
             f"first leg {ask_cents:.0f}c < {first_leg_min_cents:.0f}c floor "
@@ -1393,11 +1155,6 @@ def _pair_leg_ok(
         return False, f"first leg {ask_cents:.0f}c > {first_leg_max_cents:.0f}c max"
     if len(other_hist) < _PAIR_HIST_MIN:
         return False, "other side history warming up"
-    # Plausibility uses the other side's recent LOW, not its median — median
-    # asks sum to >100c (the book's overround), so a median-based check would
-    # never pass. The seesaw is the whole edge: when this side is on a dip the
-    # other is peaking, and its recent low marks where its own next dip
-    # plausibly lands. Without that path this is just a naked directional buy.
     expected_other = min(other_hist)
     if ask_cents > ceiling_cents - expected_other:
         return False, (
@@ -1426,8 +1183,6 @@ async def _open_pair_leg(
             count=count, price_cents=limit_cents, client_order_id=coid,
         )
     except Exception as e:
-        # Same unacked-order recovery as directional entries: the POST may have
-        # reached Kalshi with the response lost.
         recovered = None
         try:
             recovered = await kalshi_api.find_order_by_client_id(coid, ticker=ticker)
@@ -1471,7 +1226,6 @@ async def _run_pairs(
 ) -> list[dict]:
     """One pass of the complement-accumulation engine (already gated on live +
     daily-risk + session-TP by run_tick). At most one clip per side per window."""
-    # The trading-hours window gates pairs exactly like directional entries.
     if not crypto15m.hours_ok(cfg):
         return []
     ceiling = float(cfg.get("crypto15m_pairs_ceiling_cents", 95.0) or 95.0)
@@ -1481,7 +1235,6 @@ async def _run_pairs(
     first_max = float(cfg.get("crypto15m_pairs_first_leg_max_cents", 60.0) or 60.0)
     cap_pct = _clamp01(cfg.get("crypto15m_max_total_pct", 0.0))
 
-    # Pair rows by (ticker, direction); directional rows block the whole asset.
     pair_rows: dict[tuple[str, str], dict] = {}
     directional_assets: set[str] = set()
     for p in open_positions:
@@ -1507,7 +1260,7 @@ async def _run_pairs(
         if not crypto15m.asset_enabled(cfg, sym):
             continue
         if sym in directional_assets:
-            continue  # the directional strategy owns this asset's window
+            continue
         mins_left = a.get("minsLeft")
         if mins_left is None:
             continue
@@ -1515,7 +1268,7 @@ async def _run_pairs(
 
         for direction, ask_key in (("yes", "upAsk"), ("no", "downAsk")):
             if (t, direction) in pair_rows:
-                continue  # this leg already placed for this window
+                continue
             ask = a.get(ask_key)
             if not ask or not (0.0 < float(ask) < 1.0):
                 continue
@@ -1527,29 +1280,13 @@ async def _run_pairs(
             if other is not None:
                 filled = int(other.get("filled_contracts") or 0)
                 if filled <= 0:
-                    # NEVER hedge an unfilled first leg. Second legs skip the
-                    # band/floor protections because they offset held
-                    # inventory — but if the resting first leg dies unfilled
-                    # (book moved away), the "hedge" becomes a naked knife
-                    # bought with no protections at all (real trade #290:
-                    # down@48 never filled, up@23 rode to zero). Wait for the
-                    # fill; the 30s entry TTL recycles dead first legs fast.
                     continue
                 other_cost = float(other.get("avg_entry_cents") or
                                    other.get("entry_limit_cents") or 0)
-                count = filled  # match the inventory that actually exists
+                count = filled
             elif _unmatched_count() >= _PAIR_MAX_UNMATCHED:
-                # Enough windows already waiting on their complement — every
-                # unmatched first leg is directional risk, and cheap dips
-                # cluster in trends, so they'd all be the SAME bet.
                 continue
             else:
-                # Model conviction gate on FIRST legs (fail-open when the
-                # settlement model is unavailable): never open the side the
-                # spot-vs-strike model says is being run over — that "dip" is
-                # a trend leg making new lows, not a seesaw (the down@59 /
-                # down@53 strands). This is the PBOT-6/Bonereaper lesson:
-                # no-edge balanced entries are the drag.
                 mp = a.get("modelProb")
                 if mp is not None and (
                     (direction == "yes" and mp < 0.35)
@@ -1565,11 +1302,7 @@ async def _run_pairs(
             )
             if not ok:
                 continue
-            limit_cents = max(1, min(99, int(round(ask_c)) + 1))  # marketable taker
-            # Aggregate 15m budget applies to pair legs too. Bankroll = cash +
-            # FILLED cost only (resting-order cash is still inside balance_usd
-            # — Kalshi doesn't hold cash for resting orders); the full
-            # committed total (filled + resting) still consumes the budget.
+            limit_cents = max(1, min(99, int(round(ask_c)) + 1))
             if cap_pct > 0 and balance_usd > 0:
                 with db.get_db() as conn:
                     committed = db.open_crypto15m_committed_usd(conn, env)
@@ -1661,10 +1394,6 @@ async def run_tick(
 ) -> list[dict]:
     env = trader.get_env()
     if not cfg.get("crypto15m_enabled"):
-        # The feature toggle gates ENTRIES, never management: turning it off
-        # with live positions open must not abandon them (no stop-loss, no
-        # settlement booking, P&L never recorded). Manage what exists, open
-        # nothing.
         with db.get_db() as conn:
             leftovers = db.get_open_crypto15m(conn, env)
         if not leftovers:
@@ -1683,8 +1412,6 @@ async def run_tick(
     snap = await crypto15m.snapshot(cfg)
     assets = {a["asset"]: a for a in snap.get("assets", [])}
 
-    # Keep the pairs engine's rolling ask history warm even in monitor-only
-    # mode, so enabling it (or arming live) doesn't start from a cold baseline.
     _update_pair_hist(assets)
 
     with db.get_db() as conn:
@@ -1692,8 +1419,6 @@ async def run_tick(
         errored_tickers = db.crypto15m_errored_tickers(conn, env)
         stopped_tickers = db.crypto15m_stopped_tickers(conn, env)
     open_by_asset = {p["asset"]: p for p in open_positions}
-    # Pair legs are market-neutral once matched — they must not consume the
-    # directional correlation cap (max_concurrent), only the $ budget.
     open_count = len([
         p for p in open_positions if (p.get("strategy") or "") != "pair"
     ])
@@ -1708,23 +1433,14 @@ async def run_tick(
         except Exception as e:
             logger.warning(f"[crypto15m] manage {pos.get('asset')} failed: {e}")
 
-    # Entries only happen on a live (production) account — paper simulation was
-    # removed, so demo/unarmed runs monitor existing positions but open nothing.
     if not live:
         return updated
 
-    # The daily stop-loss / take-profit is an account-wide loss limit, so it must
-    # cover the 15m executor too — otherwise it keeps opening live positions after
-    # the main bot has halted for the day. Exits above already ran; only block
-    # NEW entries here.
     blocked, why = trader._is_blocked_by_daily_risk(cfg, env)
     if blocked:
         logger.info(f"[crypto15m] skip entries: {why}")
         return updated
 
-    # 15m-specific session take-profit: once this run's realized 15m P&L reaches
-    # the target, stop opening NEW entries (exits above still run). Independent of
-    # the account-wide daily take-profit checked just above.
     _block_reasons.clear()
     tp_blocked, tp_why, _tp_pnl = is_blocked_by_session_take_profit(cfg, env, session_start)
     if tp_blocked:
@@ -1739,25 +1455,18 @@ async def run_tick(
     )
     balance_usd = await _bankroll_usd(cfg, bool(authed)) if need_balance else 0.0
 
-    # Directional (favorite/contrarian) entries — skippable entirely for
-    # pairs-only mode (Direction = "Off" in the UI).
     if cfg.get("crypto15m_directional_enabled", True):
         for sym, a in assets.items():
             if sym in open_by_asset:
                 continue
             if not crypto15m.asset_enabled(cfg, sym):
-                continue  # asset toggled off in the 15m tab — monitor only
+                continue
             if a.get("ticker") in errored_tickers:
                 continue
             if a.get("ticker") in stopped_tickers:
-                # Already stopped out of this window once — re-entering the
-                # same 15-minute market after a stop just churns fees in chop.
-                # The exclusion dies with the window (each ticker IS one window).
                 continue
             ok, _why = should_enter(a, cfg, has_open=False, open_count=open_count)
             if not ok:
-                # Surface the block reason instead of discarding it — this is
-                # what the "why isn't it trading" panel reads per asset.
                 _block_reasons[a.get("asset") or "?"] = _why
                 continue
             try:
@@ -1770,8 +1479,6 @@ async def run_tick(
 
     if cfg.get("crypto15m_pairs_enabled"):
         try:
-            # Include rows opened THIS tick so pairs never double-book an
-            # asset the directional loop just entered (and vice versa).
             live_rows = open_positions + [
                 r for r in updated if r and not r.get("resolved")
             ]
@@ -1794,7 +1501,7 @@ async def _sizing_preview(cfg: dict, authed: bool) -> dict:
     if mode_now == "contrarian":
         base = 1.0 - thr
     elif mode_now == "model":
-        base = 0.93  # sniper's observed average entry cost
+        base = 0.93
     else:
         base = thr
     if (cfg.get("crypto15m_entry_style") or "maker") == "maker":

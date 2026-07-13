@@ -11,15 +11,11 @@ export interface TradeWarning {
   fixLabel?: string;
 }
 
-// Mirror of the two hard floors in the Python trader (trader.py):
-//   - run_trade_cycle aborts the whole cycle when balance < $5
-//   - execute_signal skips any order whose sized target is < $1
 const MIN_ORDER_USD = 1;
 const MIN_CYCLE_BALANCE_USD = 5;
 
 const isEmptyArr = (a: unknown): boolean => Array.isArray(a) && a.length === 0;
 
-// Keep in sync with KRYPT_CATEGORIES in src/pages/Settings.tsx.
 const ALL_CATEGORIES = ['sports', 'politics', 'economics', 'crypto', 'climate', 'entertainment', 'world', 'exotics'];
 
 /**
@@ -48,7 +44,6 @@ export function computeTradeWarnings(
   const out: TradeWarning[] = [];
   const toSettings = { page: 'settings' as PageId, fixLabel: 'Open Settings' };
 
-  // ── Signal sources / whitelists that can never pass ───────────────────────
   if (!config.tradeWhales && !config.tradeMomentum && !config.tradeConvergence) {
     out.push({ id: 'no-sources', severity: 'block', ...toSettings,
       message: 'No signal sources are on — turn on Whales or Momentum, or nothing can ever trade.' });
@@ -70,9 +65,6 @@ export function computeTradeWarnings(
       message: 'Momentum is on but no signal types are allowed — momentum can never trade.' });
   }
 
-  // Hidden per-source category lists installed by strategy presets: they AND
-  // with the global toggles, so signals drop even when Settings shows every
-  // category on. Surface them or the state is undiagnosable from the UI.
   const whaleShadow = config.tradeWhales
     ? shadowBlocked(config.allowedWhaleCategories, config.allowedCategories) : [];
   if (whaleShadow.length > 0) {
@@ -90,7 +82,6 @@ export function computeTradeWarnings(
         + 'Re-pick categories in Settings to clear it.' });
   }
 
-  // ── Inverted ranges ───────────────────────────────────────────────────────
   if (config.minEntryPriceCents > config.maxEntryPriceCents) {
     out.push({ id: 'price-band', severity: 'block', ...toSettings,
       message: `Entry-price band is inverted (min ${config.minEntryPriceCents}¢ > max ${config.maxEntryPriceCents}¢) — no order can price inside it.` });
@@ -102,10 +93,8 @@ export function computeTradeWarnings(
       message: `15m entry is impossible: the favorite must be ≥ ${Math.round(c15thr * 100)}¢ yet cost ≤ ${Math.round(c15max * 100)}¢. Raise "Entry max" to at least the threshold.` });
   }
 
-  // ── Balance vs sizing dead zone (only when actually trading) ──────────────
   const isFixed = config.sizingMode === 'fixed';
   if (config.enableTrading) {
-    // Fixed-$ sizing below the $1 floor can never place, regardless of balance.
     if (isFixed && config.fixedTradeUsd < MIN_ORDER_USD) {
       out.push({ id: 'fixed-too-small', severity: 'block', ...toSettings,
         message: `Fixed trade size ${fmtUsd(config.fixedTradeUsd)} is below the ${fmtUsd(MIN_ORDER_USD)} minimum order — nothing will place. Raise it to at least ${fmtUsd(MIN_ORDER_USD)}.` });

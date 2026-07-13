@@ -27,7 +27,6 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ───────── whales with missing taker_side are skipped, not flipped ──────────
 
 
 WHALE_CFG = {
@@ -66,10 +65,6 @@ def _stub_network(monkeypatch, tape: list[dict]):
 
 
 def test_scan_whales_skips_sideless_tape_rows(fresh_db, monkeypatch):
-    # kalshi_ws stamps taker_side='' when the WS field is absent. The scorer
-    # priced such rows as NO flow while the executor defaulted '' to a YES buy
-    # (wrong side, wrong cost basis) and resolution booked them as guaranteed
-    # losses. They must never become whale signals.
     _stub_network(monkeypatch, [
         _tape_trade("t-blank", ""),
         _tape_trade("t-missing", None),
@@ -81,8 +76,6 @@ def test_scan_whales_skips_sideless_tape_rows(fresh_db, monkeypatch):
 
 
 def test_scan_whales_keeps_valid_no_side(fresh_db, monkeypatch):
-    # Control: an explicit NO whale over the same tape still lands, priced at
-    # the NO price.
     _stub_network(monkeypatch, [_tape_trade("t-no", "no")])
     n, rows = run_async(scanner.scan_whales(WHALE_CFG))
     assert n == 1
@@ -91,7 +84,6 @@ def test_scan_whales_keeps_valid_no_side(fresh_db, monkeypatch):
     assert rows[0]["dollar_value"] == pytest.approx(3000.0)
 
 
-# ───────── momentum baseline: previous scan, not two scans back ─────────────
 
 
 MOM_CFG = {
@@ -115,18 +107,13 @@ def _market_row(yes_bid: float, volume_24h: float = 1000.0) -> dict:
 def test_momentum_baseline_is_previous_scan_not_two_back(fresh_db, monkeypatch):
     monkeypatch.setattr(kalshi_ws, "recent_trades", lambda limit=1000: [])
     with db.get_db() as conn:
-        db.save_snapshot(conn, "KXMOM-A", _market_row(0.36))  # two scans back
-        db.save_snapshot(conn, "KXMOM-A", _market_row(0.40))  # previous scan
-        db.upsert_market(conn, _market_row(0.45))             # current price
+        db.save_snapshot(conn, "KXMOM-A", _market_row(0.36))
+        db.save_snapshot(conn, "KXMOM-A", _market_row(0.40))
+        db.upsert_market(conn, _market_row(0.45))
 
-    # 0.45 vs the PREVIOUS scan (0.40) is a 5c drift — below the 8c threshold,
-    # so no alert. The old read-rn=2-before-save baseline compared against
-    # 0.36 (TWO scans back, a 9c doubled-window move) and fired.
     n, alerts = run_async(scanner.scan_momentum(MOM_CFG))
     assert n == 0 and alerts == []
 
-    # A genuine >=8c single-scan move still fires: 0.55 vs the 0.45 snapshot
-    # the previous scan_momentum call saved.
     with db.get_db() as conn:
         db.upsert_market(conn, _market_row(0.55))
     n, alerts = run_async(scanner.scan_momentum(MOM_CFG))
@@ -136,13 +123,9 @@ def test_momentum_baseline_is_previous_scan_not_two_back(fresh_db, monkeypatch):
     assert alerts[0]["price_change"] == pytest.approx(10.0, abs=0.01)
 
 
-# ───────── unmapped Kalshi categories land in toggleable buckets ────────────
 
 
 def test_resolve_category_unmapped_falls_to_keyword_bucket(monkeypatch):
-    # An unmapped raw series category must NOT pass through as a raw slug —
-    # that made an untoggleable bucket any category restriction silently
-    # deny-listed. It falls back to the keyword buckets instead.
     async def _series(_st):
         return {"category": "Never Heard Of It"}
 
@@ -154,9 +137,6 @@ def test_resolve_category_unmapped_falls_to_keyword_bucket(monkeypatch):
 
 
 def test_resolve_category_exotics_is_first_class(monkeypatch):
-    # 'Exotics' is a real, high-volume Kalshi series category and the Edge
-    # Stack preset allow-lists 'exotics' — it must map explicitly (and case-
-    # insensitively), never depend on the raw.lower() fallback.
     async def _series(_st):
         return {"category": "Exotics"}
 

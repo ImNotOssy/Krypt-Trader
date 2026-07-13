@@ -28,23 +28,12 @@ const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
 });
 const err = (message: string): ActionResult => ({ ok: false, message });
 
-// Profiles store a full config snapshot, but applying one only patches the
-// slice for its engine — so a main profile never disturbs the 15m crypto
-// settings and vice-versa, and neither re-arms the env / live switches.
-// Webhook URLs are excluded too: profiles can be exported/imported and shared,
-// so applying one must never silently redirect (or inject) a Discord webhook
-// that exfiltrates balance/P&L/positions.
 const MAIN_EXCLUDE = new Set([
   'kalshiEnv', 'enableTrading',
   'eventWebhookUrl', 'statsWebhookUrl', 'whaleWebhookUrl', 'momentumWebhookUrl',
 ]);
 const CRYPTO_ARM_EXCLUDE = new Set(['crypto15mEnabled', 'crypto15mLive']);
 
-// Per-source category lists are preset-only: no Settings control writes them,
-// so a custom profile must neither carry them invisibly nor leave a previous
-// preset's hidden filter active. They are excluded from profile slices and
-// explicitly reset when a main profile is applied (built-in strategies still
-// own them via their full preset config).
 const PRESET_ONLY = new Set(['allowedWhaleCategories', 'allowedMomentumCategories']);
 
 const isCrypto15mKey = (k: string): boolean => k.startsWith('crypto15m');
@@ -62,11 +51,6 @@ function profileSlice(config: TraderConfig, kind: ProfileKind): Partial<TraderCo
   return out as Partial<TraderConfig>;
 }
 
-// Applying a built-in strategy resets the strategy-tunable gates to the
-// preset, but must never factory-reset the user's personal/operational
-// settings: webhooks (MAIN_EXCLUDE — same reasoning as profiles above),
-// notifications, bankroll, daily risk limits, trading hours, and loop
-// intervals are not part of any preset's edge, and no preset declares them.
 const STRATEGY_PRESERVE: string[] = [
   ...MAIN_EXCLUDE,
   'enableDiscord', 'statsPushInterval', 'statsChartWindowHours',
@@ -78,9 +62,6 @@ const STRATEGY_PRESERVE: string[] = [
   'marketRefreshInterval',
 ];
 
-// Shared by both strategy-apply paths: reset the main engine to the preset,
-// but preserve the independently-tuned 15m crypto slice, its arm switches,
-// and every STRATEGY_PRESERVE key from the current config.
 function applyStrategyPreset(s: StrategyPreset): AppState {
   const curCfg = store.get().config;
   const preserved: Record<string, unknown> = {};
@@ -94,10 +75,6 @@ function applyStrategyPreset(s: StrategyPreset): AppState {
   } as TraderConfig);
 }
 
-// Imported profile JSON is untrusted: coerce every known key to the type of
-// its DEFAULT_CONFIG counterpart and drop what doesn't fit — the backend does
-// not re-coerce the main-engine gate keys, so e.g. a string minConfidenceWhale
-// ("60") would crash every trade scan cycle with a float<str TypeError.
 function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
   const out: Record<string, unknown> = {};
   if (!raw || typeof raw !== 'object') return out as Partial<TraderConfig>;
@@ -121,7 +98,6 @@ function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
       continue;
     }
     if (k === 'crypto15mHours') {
-      // numeric UTC-hour list (not a string list); null = use the window.
       if (v === null) { out[k] = null; continue; }
       if (Array.isArray(v)) {
         out[k] = v.filter((x) => typeof x === 'number' && x >= 0 && x <= 23);
@@ -131,8 +107,6 @@ function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
     }
     const d = defaults[k];
     if (d === null || Array.isArray(d)) {
-      // string-list keys; the null-defaulted ones (allowed*Categories,
-      // crypto15mAssets) also accept null = "no restriction".
       if (v === null && d === null) { out[k] = null; continue; }
       if (Array.isArray(v)) { out[k] = v.filter((x) => typeof x === 'string'); continue; }
       drop(k, 'expected a string list');
@@ -166,11 +140,6 @@ function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
 
 const profileKindOf = (p: Profile): ProfileKind => (p.kind === 'crypto15m' ? 'crypto15m' : 'main');
 
-// A manual config edit diverges from any applied strategy/profile snapshot, so
-// drop the matching "active" marker — otherwise the Strategies/Profiles UI keeps
-// flagging a strategy as "Active" after its settings were changed. Env / master
-// switch (MAIN_EXCLUDE) and the 15m arm switches (CRYPTO_ARM_EXCLUDE) aren't part
-// of a saved snapshot, so they don't clear it.
 function clearActiveMarkersForPatch(patch: Partial<TraderConfig>): void {
   const keys = Object.keys(patch || {});
   const touchesMain = keys.some((k) => !isCrypto15mKey(k) && !MAIN_EXCLUDE.has(k));
@@ -195,9 +164,6 @@ function genId(): string {
   return `p_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
 }
 
-// 'ok' = backend confirmed the new config; 'not_running' = nothing to push
-// (config re-syncs on backend:ready); 'failed' = the backend is up but did
-// not acknowledge the change — the engine may still run the OLD config.
 type PushResult = 'ok' | 'not_running' | 'failed';
 
 async function pushConfigToBackend(): Promise<PushResult> {
@@ -255,7 +221,6 @@ export function registerIpc(): void {
   });
   ipcMain.handle('config:replace', async (_e, cfg: TraderConfig) => {
     store.replaceConfig(cfg);
-    // A full replace no longer matches any saved strategy/profile snapshot.
     const next = store.save({
       ...store.get(), activeProfileId: null, activeCrypto15mProfileId: null,
     });
@@ -273,9 +238,6 @@ export function registerIpc(): void {
   ipcMain.handle('config:applyStrategy', async (_e, id: string) => {
     const s = findStrategy(id);
     if (!s || s.comingSoon) return store.get().config;
-    // Applying a main-engine strategy must NOT change the environment, master
-    // kill-switch, the independently-tuned 15m crypto engine, or the user's
-    // personal settings (mirrors the profiles:apply strategy branch).
     const next = applyStrategyPreset(s);
     const stateNext = store.save({ ...store.get(), activeProfileId: id });
     broadcastState(stateNext);
@@ -315,9 +277,6 @@ export function registerIpc(): void {
       const s = findStrategy(id);
       if (s?.comingSoon) return err(`"${s.name}" is coming soon`);
       if (s) {
-        // Strategy presets are main-engine. Reset the main config to the
-        // strategy, but preserve the current 15m crypto settings, env/switch,
-        // and the user's personal settings (STRATEGY_PRESERVE).
         const next = applyStrategyPreset(s);
         const stateNext = store.save({ ...store.get(), activeProfileId: id });
         broadcastState(stateNext);
@@ -327,12 +286,8 @@ export function registerIpc(): void {
       return err('Profile not found');
     }
     const pkind = profileKindOf(p);
-    // Patch only this engine's slice so the other engine is left untouched.
     const slice = profileSlice(p.config, pkind);
     if (pkind === 'main') {
-      // Custom profiles never carry the preset-only per-source category
-      // filters (see PRESET_ONLY) — clear any hidden filter a previously
-      // applied built-in preset left behind so the config matches the UI.
       slice.allowedWhaleCategories = null;
       slice.allowedMomentumCategories = null;
     }
@@ -429,8 +384,6 @@ export function registerIpc(): void {
         kind: p.kind === 'crypto15m' ? 'crypto15m' : 'main',
         createdAt: now,
         updatedAt: now,
-        // Coerce/validate the untrusted config, then normalize it over the
-        // defaults — the same shape a profile loaded from disk ends up with.
         config: { ...store.DEFAULT_CONFIG, ...sanitizeImportedConfig(p.config) },
       };
       const next = store.save({ ...cur, customProfiles: [...cur.customProfiles, dup] });
@@ -519,8 +472,6 @@ export function registerIpc(): void {
   ipcMain.handle('trading:setEnabled', async (_e, enabled: boolean) => {
     const next = store.patchConfig({ enableTrading: !!enabled });
     broadcastState(next);
-    // Don't report success the engine never confirmed: a wedged backend can
-    // keep trading on the OLD setting while every UI surface shows the new one.
     const push = await pushConfigToBackend();
     if (push === 'failed') {
       return err(
@@ -633,8 +584,6 @@ export function registerIpc(): void {
   });
   ipcMain.handle('crypto15m:status', async () => {
     if (!pythonBackend.isRunning()) {
-      // Fall back to the configured values, not literals — the engine default
-      // for maxConcurrent is 3 (a stale "7" here overstated the real cap).
       const cfg = store.get().config;
       return {
         enabled: false, live: false, liveArmed: false, authed: false,

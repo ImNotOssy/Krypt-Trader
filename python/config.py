@@ -16,31 +16,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_edge_pts_momentum": 5.0,
     "min_confidence_whale": 55.0,
     "min_confidence_momentum": 55.0,
-    # Subtract the Kalshi taker fee (~0.07·p·(1−p), in cents/contract) from a
-    # signal's edge BEFORE comparing it to the min_edge gates, so "edge" means
-    # net-of-fee edge. Off = legacy gross-edge gating (near 50c the fee alone
-    # is ~1.75c — a "5pt" gross edge is really ~3.3).
     "fee_aware_edge": True,
-    # Reject an entry when the live order book has moved more than this many
-    # cents past the signal's price (limit_cross pays whatever the book asks —
-    # on a thin book that silently eats the whole edge). 0 = off.
     "max_entry_slippage_cents": 5,
-    # Skip signals on markets with less lifetime volume than this many contracts
-    # (thin books = wide spreads + adverse fills). 0 = off. Unknown volume is
-    # fail-open.
     "min_market_volume": 100.0,
-    # Only count tape trades younger than this many minutes for whale signals
-    # and momentum clusters. Without it, a restart "discovers" hours-old whales
-    # at prices that no longer exist, and 5 trades spread over 6 quiet hours
-    # count as a "cluster".
     "max_trade_age_min": 15,
     "min_entry_price_cents": 15,
     "max_entry_price_cents": 85,
-    # Skip any market whose resolution (close time) is more than this many days
-    # out — e.g. 30 means don't take bets that won't resolve for a month+ (long-
-    # dated politics markets tie up capital for months). 0 = off (no time limit).
-    # Default 30: with 0, a default user's 25 open slots silently fill with
-    # multi-month markets and the bot "stops trading" with capital frozen.
     "max_resolution_days": 30,
     "allowed_momentum_signal_types": ["trade_cluster"],
     "allowed_categories": None,
@@ -48,13 +29,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "allowed_momentum_categories": None,
     "contrarian_only": True,
 
-    # "Secret Strategy" — pure-gambling mode. Ignores every gate and gives each
-    # fresh signal a flat random chance to trade. For fun only.
     "gambling_mode": False,
     "gambling_trade_probability": 0.10,
 
-    # "percent" = edge-scaled % of balance (below). "fixed" = a flat dollar
-    # amount per trade (fixed_trade_usd), ignoring the fractions.
     "sizing_mode": "percent",
     "fixed_trade_usd": 5.0,
 
@@ -62,9 +39,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_size_fraction": 0.02,
     "max_size_fraction": 0.06,
     "sizing_base_edge": 5.0,
-    # Edge at which sizing reaches max_size_fraction. The scorer caps edge at 10
-    # (whale) / 8 (momentum), so anything above 10 leaves edge-scaled sizing
-    # permanently stuck near the minimum (the old default 20 was a dead knob).
     "sizing_max_edge": 10.0,
     "hard_max_position_usd": 50.0,
     "min_cash_reserve_fraction": 0.05,
@@ -77,8 +51,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_positions_per_event": 1,
     "max_daily_new_positions": 40,
     "unlimited_daily_new_positions": False,
-    # 0.35, not 0.75: committing 3/4 of the bankroll by default made the
-    # main engine a full-account drawdown machine for small accounts.
     "max_total_exposure_fraction": 0.35,
 
     "trade_scan_interval": 20,
@@ -94,11 +66,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
     "start_bankroll_usd": 0.0,
     "stop_loss_on_day": -50.0,
-    # Daily stop-loss as a FRACTION of the day-start account total (0..1;
-    # 0.05 = halt new entries once down 5% on the day). Works alongside the
-    # flat-dollar stop above — whichever limit is TIGHTER binds. This is what
-    # protects a $100 account (where a flat -$50 is half the bankroll) and a
-    # $5000 one (where -$50 is noise) with one default. 0 = off.
     "stop_loss_on_day_pct": 0.05,
     "take_profit_on_day": 0.0,
 
@@ -113,36 +80,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
     "crypto15m_time_delay_min": 8.0,
     "crypto15m_entry_threshold": 0.70,
-    # Strict threshold (hard floor): require the price actually PAID (the
-    # favorite side's executable ask / the maker bid, floored) to be at or above
-    # entry_threshold, and require a two-sided book. Off = legacy behaviour: the
-    # threshold checks only the mid-derived favorite probability, so thin books
-    # can fill below it (the "entered at 71c with an 85c threshold" complaint).
     "crypto15m_strict_threshold": True,
     "crypto15m_entry_max": 0.98,
     "crypto15m_exit_threshold": 0.40,
-    # Cents BELOW the bid to price a stop-loss SELL so it sweeps depth and fills
-    # in a fast drop instead of resting at the top of a falling book. 0 = at bid.
     "crypto15m_stop_slippage_cents": 0,
-    # Per-bet take-profit: sell a winning position once the held side reaches this
-    # price (cents). 0 = off / hold to settlement. Set it ABOVE the entry price or
-    # it sells at a loss the moment a position fills.
     "crypto15m_take_profit_cents": 0,
-    # Per-bet stop-loss as a FRACTION of the entry cost (stored 0..1; the UI shows
-    # it as a %). Sell once a position is down >= this share of what it cost. 0 =
-    # off. Works alongside the cents/price stop (crypto15m_exit_threshold) —
-    # whichever triggers first exits.
     "crypto15m_stop_loss_pct": 0.0,
-    # Session take-profit: once the 15m executor's realized P&L since the backend
-    # started reaches $this, stop opening NEW 15m entries (open positions keep
-    # being managed). 0 = off. Resets when the app restarts.
     "crypto15m_session_take_profit_usd": 0.0,
+    "crypto15m_hf_record": False,
+    "crypto15m_hf_interval_ms": 200,
     "crypto15m_min_delta_pct": 0.0,
-    # Direction-aware momentum confirmation layered ON TOP of the built-in
-    # favorite gate (not the rule builder). The underlying MACD/RSI must agree
-    # with the side being bought: an up-bet needs rsi>=min_rsi & macdHist>=min;
-    # a down-bet needs the mirror (rsi<=100-min_rsi & macdHist<=-min). Each 0 =
-    # off. Lets users widen the entry window yet only enter on strong momentum.
     "crypto15m_min_rsi": 0.0,
     "crypto15m_min_macd_hist": 0.0,
     "crypto15m_entry_diff": 0.02,
@@ -150,152 +97,71 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "crypto15m_maker_cancel_min": 1.0,
     "crypto15m_hours_start_utc": 0,
     "crypto15m_hours_end_utc": 24,
-    "crypto15m_hours": None,                  # None = use the start/end window;
-                                              # a list of UTC hours (0-23) = trade
-                                              # ONLY those hours (empty = never)
+    "crypto15m_hours": None,
     "crypto15m_enabled": False,
     "crypto15m_live": False,
     "crypto15m_sizing_mode": "fixed",
     "crypto15m_order_size": 1,
     "crypto15m_balance_pct": 0.02,
     "crypto15m_max_loss_pct": 0.0,
-    # Aggregate 15m risk cap: total committed 15m cost may not exceed this
-    # fraction of the bankroll (0..1; 0 = off). The 7 assets' 15m windows are
-    # essentially ONE correlated bet on crypto direction — without this cap the
-    # only thing between a user and "70% of bankroll on one BTC candle" is the
-    # per-bet size. Applied at entry: order size is trimmed to fit the budget.
     "crypto15m_max_total_pct": 0.10,
-    # Down from 7: all seven assets move together, so 7 concurrent favorites is
-    # one levered position, not diversification.
     "crypto15m_max_concurrent": 3,
-    # Which assets the executor may open NEW positions on. None = all enabled;
-    # a list of symbols restricts to those (set from the 15m tab's Trade toggles).
     "crypto15m_assets": None,
     "crypto15m_poll_sec": 4,
-    # "favorite" buys the market's favorite; "contrarian" fades it; "model"
-    # is the SETTLEMENT SNIPER: buy the side the settlement model (CF index
-    # vs strike, scaled by realized vol) calls near-certain while the quote
-    # still lags — gated by the two crypto15m_model_* knobs below.
     "crypto15m_direction_mode": "favorite",
-    # Sniper gates: minimum model probability for the bought side, and minimum
-    # fee-adjusted edge (model prob − executable ask − taker fee, in cents).
-    # Backtest on recorded ticks (132 markets): gate 0.97 within 5 min won
-    # 97.7% at avg 93c → ~+3.9c/contract net of fees.
     "crypto15m_model_min_prob": 0.97,
     "crypto15m_model_min_edge_cents": 2.0,
-    # Final-minute sniping (model mode ONLY): inside the last 60s the
-    # settlement average is being realized print-by-print, so with >=30 of 60
-    # prints in and the model >=3-sigma certain, stale quotes are the largest
-    # measured edge in our recorded data (+22.8c/contract, 27/27 wins at the
-    # edge>=2c gate). Every other mode keeps the hard final-minute block.
     "crypto15m_model_final_minute": True,
-    # Auto-pause model-mode entries when rolling calibration (realized hit
-    # rate of >=97%-confident predictions) drops below break-even. The edge
-    # lives and dies on calibration holding; this is the alarm.
     "crypto15m_model_autopause": True,
     "crypto15m_record_signals": True,
-    # Record whale/momentum signals while the app runs. Forced ON while
-    # enable_trading is set — the engine cannot follow signals it never sees.
     "main_record_signals": True,
 
-    # ── Kalshi perpetual futures: passive data recorder (no trading) ──
-    # Streams the margin WS ticker/trade channels + polls the public REST API
-    # (always PRODUCTION — market data is unauthenticated) into the perp_*
-    # tables. Feeds the perps research program (sniper filter, consistency
-    # arb, lead-lag); collection must run for ~2 weeks before those are
-    # testable, which is why this exists ahead of any perps strategy. ON by
-    # default like the other recorders — disk is capped by the 30-day tick
-    # retention (~1GB worst case at 24/7 uptime), and the bot cannot research
-    # what it never recorded.
     "perps_record_signals": True,
     "perps_symbols": ["KXBTCPERP", "KXETHPERP", "KXSOLPERP", "KXXRPPERP", "KXDOGEPERP"],
-    "perps_ws_enabled": True,       # WS accelerator; REST poll is the baseline either way
-    "perps_rest_poll_sec": 30,      # public markets snapshot cadence
-    "perps_funding_est_sec": 60,    # live funding-estimate poll (series exists nowhere else)
-    "perps_funding_poll_min": 60,   # finalized-rate top-up cadence
-    "perps_candle_topup_min": 10,   # 1m candle top-up / gap repair cadence
-    "perps_backfill_days": 14,      # deep candle backfill window on first enable
-    # ── Perps volume farmer: maker-only two-sided quoting for the in-app
-    # volume rewards ($25/$50 trade; ~2-4 bps of notional at the volume
-    # tiers). A volume engine with a loss budget, not a profit strategy —
-    # auto-halts for the day when measured cost/volume exceeds max_cost_bps
-    # (i.e. farming costs more than the bonus pays) or the loss cap. ──
+    "perps_ws_enabled": True,
+    "perps_rest_poll_sec": 30,
+    "perps_funding_est_sec": 60,
+    "perps_funding_poll_min": 60,
+    "perps_candle_topup_min": 10,
+    "perps_backfill_days": 14,
     "perps_farm_enabled": False,
     "perps_farm_symbol": "KXBTCPERP",
-    "perps_farm_clip_contracts": 1,          # contracts per resting quote
-    "perps_farm_max_inventory_contracts": 3,  # beyond ±this, quote reduce-side only
-    "perps_farm_min_spread_ticks": 2,        # stand down when book tighter than this
-    "perps_farm_requote_ticks": 1,           # re-join when touch drifts > this
-    "perps_farm_daily_loss_usd": 2.0,        # hard net-loss halt per UTC day
-    "perps_farm_daily_volume_usd": 0.0,      # stop after this much volume (0 = off)
-    "perps_farm_max_cost_bps": 4.0,          # halt when measured cost/volume$ exceeds
-    "perps_farm_max_fee_bps": 0.0,           # pre-trade gate: only farm while the maker
-                                             # fee we're actually charged is <= this many
-                                             # bps (0 = off). Farming cost ≈ the maker fee,
-                                             # so set this to the reward rate (~2 bps) and
-                                             # the farmer sits idle until fees are worth it.
+    "perps_farm_clip_contracts": 1,
+    "perps_farm_max_inventory_contracts": 3,
+    "perps_farm_min_spread_ticks": 2,
+    "perps_farm_requote_ticks": 1,
+    "perps_farm_daily_loss_usd": 2.0,
+    "perps_farm_daily_volume_usd": 0.0,
+    "perps_farm_max_cost_bps": 4.0,
+    "perps_farm_max_fee_bps": 0.0,
 
-    # ── Perps user strategy (rule-composed, like the 15m rule builder).
-    # perps_strat_enabled = paper trading on live quotes (simulated fills,
-    # dry_run rows). perps_strat_live additionally places REAL leveraged
-    # orders — gated in the UI behind an explicit risk acknowledgement.
-    # Same gates run in backtest/paper/live (replay parity). ──
     "perps_strat_enabled": False,
     "perps_strat_live": False,
     "perps_strat_symbol": "KXBTCPERP",
-    "perps_strat_direction": "long",         # long | short
-    "perps_strat_rules": [],                 # {field, op, value} ANDed (perps vocabulary)
-    "perps_strat_entry_style": "taker",      # taker | maker (backtest models both; live is taker IOC)
+    "perps_strat_direction": "long",
+    "perps_strat_rules": [],
+    "perps_strat_entry_style": "taker",
     "perps_strat_contracts": 1,
-    "perps_strat_leverage": 1.0,             # informs margin/liquidation sim + notional cap
-    "perps_strat_tp_bps": 30.0,              # take-profit, bps of entry (0 = off)
-    "perps_strat_sl_bps": 20.0,              # stop-loss, bps of entry (0 = off)
-    "perps_strat_max_hold_min": 60.0,        # time exit (0 = off)
+    "perps_strat_leverage": 1.0,
+    "perps_strat_tp_bps": 30.0,
+    "perps_strat_sl_bps": 20.0,
+    "perps_strat_max_hold_min": 60.0,
     "perps_strat_exit_on_rules_fail": False,
-    "perps_strat_daily_loss_usd": 5.0,       # halt for the UTC day
-    "perps_strat_max_notional_usd": 100.0,   # per-position notional cap
-    "perps_strat_fee_era": "jul8",           # backtest fee scenario: today | jul8
-    # Underlying MACD/RSI on 1-min closes (detection-only rule fields).
+    "perps_strat_daily_loss_usd": 5.0,
+    "perps_strat_max_notional_usd": 100.0,
+    "perps_strat_fee_era": "jul8",
     "crypto15m_indicator_detect": True,
-    # Coinbase WebSocket spot feed (BRTI-constituent proxy — the number Kalshi
-    # actually settles against). Live prices for the listed majors + the
-    # final-minute settlement-average tracker that sharpens modelProb. Off =
-    # REST spot chain only. Env override: KRYPT_SPOT_WS=0.
     "crypto15m_spot_ws": True,
-    # Up+Down ≠ $1 arbitrage flag (market-neutral edge, detection-only).
-    # Min edge 3c: both legs pay a taker fee (~2-4c round trip at mid prices),
-    # so the old 1c default flagged "arbs" that lost money after fees.
     "crypto15m_arb_detect": True,
     "crypto15m_arb_min_edge_cents": 3.0,
-    # Custom entry rule builder: when on, the user's {field,op,value} conditions
-    # REPLACE the built-in favorite/signal gate for the 15m executor.
     "crypto15m_use_rules": False,
     "crypto15m_rules": [],
 
-    # Pairs — temporal complement accumulation: buy YES on its dips and NO on
-    # its peaks at different times in the window; every matched pair settles at
-    # exactly $1, so a blended cost below the ceiling is LOCKED profit,
-    # direction-agnostic. Runs alongside the directional strategy but never on
-    # the same window. No stop-loss/TP by design (selling a leg un-locks the
-    # margin). Off by default.
     "crypto15m_pairs_enabled": False,
-    # The directional (favorite/contrarian) engine. Off = pairs-only mode: the
-    # 15m tab still monitors and manages open positions, but the favorite
-    # strategy opens nothing.
     "crypto15m_directional_enabled": True,
-    # Max blended YES+NO cost per pair, in cents. 95 locks ≥5c gross per pair;
-    # two taker fees eat ~2-4c of that, so ~1-3c net per matched pair.
     "crypto15m_pairs_ceiling_cents": 95.0,
-    # A leg only buys on a DIP: its ask this many cents below its own rolling
-    # median (last ~3 min of ticks).
     "crypto15m_pairs_dip_cents": 2.0,
-    # Contracts per leg (the second leg always matches what the first filled).
     "crypto15m_pairs_clip": 5,
-    # FIRST-leg price band. Pairs only work where the two sides genuinely
-    # seesaw — near coin-flip. Below the floor the market has a strong favorite
-    # and a cheap "dip" is usually the losing side trending to zero (a knife-
-    # catch, not an oscillation); above the cap the complement can't fit under
-    # the ceiling.
     "crypto15m_pairs_first_leg_min_cents": 35.0,
     "crypto15m_pairs_first_leg_max_cents": 60.0,
 
@@ -707,9 +573,6 @@ _UNIT_KEYS = [
     "gambling_trade_probability",
 ]
 
-# Snapshot fields a crypto15m entry rule may gate on (the rule-builder vocabulary).
-# Anything not in this set is dropped by sanitize_rules so the running executor
-# only ever sees rules over fields it actually computes.
 _CRYPTO15M_RULE_FIELDS = [
     "favoritePrice", "entryCost", "upProb", "downProb", "deltaPct",
     "deltaSignedPct", "minsLeft", "hourUtc", "peersAgree", "marketBias",
@@ -742,9 +605,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["max_resolution_days"] = _clampi(cfg.get("max_resolution_days"), 0, 100_000, d["max_resolution_days"])
     cfg["max_daily_new_positions"] = _clampi(cfg.get("max_daily_new_positions"), 0, 100_000, d["max_daily_new_positions"])
     cfg["max_positions_per_event"] = _clampi(cfg.get("max_positions_per_event"), 1, 100_000, d["max_positions_per_event"])
-    # Sign-normalize instead of clamping to 0: a user typing "+50" means "stop at
-    # a $50 loss" — the old clamp silently turned it into 0 = OFF while the UI
-    # kept displaying 50, i.e. a safety rail that looked set but wasn't.
     cfg["stop_loss_on_day"] = -abs(_clampf(cfg.get("stop_loss_on_day"), -1e9, 1e9, d["stop_loss_on_day"]))
     cfg["stop_loss_on_day_pct"] = abs(_clampf(cfg.get("stop_loss_on_day_pct"), -1.0, 1.0, d["stop_loss_on_day_pct"]))
     cfg["take_profit_on_day"] = _clampf(cfg.get("take_profit_on_day"), 0.0, 1e9, d["take_profit_on_day"])
@@ -756,8 +616,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_live"] = bool(cfg.get("crypto15m_live", False))
     cfg["crypto15m_order_size"] = _clampi(cfg.get("crypto15m_order_size"), 1, 10_000, d["crypto15m_order_size"])
     cfg["crypto15m_max_concurrent"] = _clampi(cfg.get("crypto15m_max_concurrent"), 1, 50, d["crypto15m_max_concurrent"])
-    # crypto15m_assets: None = all enabled; a list restricts to valid symbols
-    # (uppercased, unknowns dropped). Any non-list/non-None falls back to all.
     aw = cfg.get("crypto15m_assets")
     if isinstance(aw, list):
         try:
@@ -790,12 +648,12 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_take_profit_cents"] = _clampi(cfg.get("crypto15m_take_profit_cents"), 0, 99, d["crypto15m_take_profit_cents"])
     cfg["crypto15m_stop_loss_pct"] = _clampf(cfg.get("crypto15m_stop_loss_pct"), 0.0, 1.0, d["crypto15m_stop_loss_pct"])
     cfg["crypto15m_session_take_profit_usd"] = _clampf(cfg.get("crypto15m_session_take_profit_usd"), 0.0, 1e9, d["crypto15m_session_take_profit_usd"])
+    cfg["crypto15m_hf_record"] = bool(cfg.get("crypto15m_hf_record", d["crypto15m_hf_record"]))
+    cfg["crypto15m_hf_interval_ms"] = _clampi(cfg.get("crypto15m_hf_interval_ms"), 50, 5000, d["crypto15m_hf_interval_ms"])
     cfg["crypto15m_min_rsi"] = _clampf(cfg.get("crypto15m_min_rsi"), 0.0, 100.0, d["crypto15m_min_rsi"])
     cfg["crypto15m_min_macd_hist"] = _clampf(cfg.get("crypto15m_min_macd_hist"), 0.0, 1e9, d["crypto15m_min_macd_hist"])
     cfg["crypto15m_hours_start_utc"] = _clampi(cfg.get("crypto15m_hours_start_utc"), 0, 24, d["crypto15m_hours_start_utc"])
     cfg["crypto15m_hours_end_utc"] = _clampi(cfg.get("crypto15m_hours_end_utc"), 0, 24, d["crypto15m_hours_end_utc"])
-    # crypto15m_hours: None = fall back to the window above; a list restricts to
-    # those UTC hours (0-23, deduped/sorted). Any non-list/non-None → None.
     hh = cfg.get("crypto15m_hours")
     if isinstance(hh, list):
         cfg["crypto15m_hours"] = sorted({
@@ -810,13 +668,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_arb_min_edge_cents"] = _clampf(cfg.get("crypto15m_arb_min_edge_cents"), 0.0, 100.0, d["crypto15m_arb_min_edge_cents"])
     cfg["crypto15m_use_rules"] = bool(cfg.get("crypto15m_use_rules", False))
     cfg["crypto15m_rules"] = rules.sanitize_rules(cfg.get("crypto15m_rules"), _CRYPTO15M_RULE_FIELDS)
-    # Pairs is HARD-DISABLED: live testing settled it at −$11.69 — on Kalshi's
-    # single complementary book "buying the other side" is just selling the
-    # first (a taker-taker scalp in disguise), and stranded first legs lose
-    # nearly always. Engine code retained for research; no config can enable it.
     cfg["crypto15m_pairs_enabled"] = False
-    # With pairs gone, "directional off" would mean the 15m tab does nothing —
-    # the master 15m toggle is the way to turn it off.
     cfg["crypto15m_directional_enabled"] = True
     cfg["crypto15m_pairs_ceiling_cents"] = _clampf(cfg.get("crypto15m_pairs_ceiling_cents"), 50.0, 99.0, d["crypto15m_pairs_ceiling_cents"])
     cfg["crypto15m_pairs_dip_cents"] = _clampf(cfg.get("crypto15m_pairs_dip_cents"), 0.5, 30.0, d["crypto15m_pairs_dip_cents"])
@@ -827,7 +679,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg["crypto15m_pairs_first_leg_min_cents"], cfg["crypto15m_pairs_first_leg_max_cents"] = (
             cfg["crypto15m_pairs_first_leg_max_cents"], cfg["crypto15m_pairs_first_leg_min_cents"],
         )
-    # Perps recorder — same rate-limit-floor rationale as the intervals below.
     cfg["perps_record_signals"] = bool(cfg.get("perps_record_signals", d["perps_record_signals"]))
     cfg["perps_ws_enabled"] = bool(cfg.get("perps_ws_enabled", d["perps_ws_enabled"]))
     ps = cfg.get("perps_symbols")
@@ -836,7 +687,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         for s in ps:
             if not isinstance(s, str):
                 continue
-            s = s.strip().upper().rstrip("1")  # config always stores prod symbols
+            s = s.strip().upper().rstrip("1")
             if s.startswith("KX") and s.endswith("PERP"):
                 cleaned.append(s)
         cfg["perps_symbols"] = list(dict.fromkeys(cleaned))[:16] or list(d["perps_symbols"])
@@ -869,8 +720,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         _PERPS_FIELDS = []
     cfg["perps_strat_rules"] = rules.sanitize_rules(cfg.get("perps_strat_rules"), _PERPS_FIELDS)
     cfg["perps_strat_contracts"] = _clampi(cfg.get("perps_strat_contracts"), 1, 500, d["perps_strat_contracts"])
-    # Leverage hard-capped at 5x regardless of what the venue allows — this is
-    # a retail research bot, not a liquidation speedrun.
     cfg["perps_strat_leverage"] = _clampf(cfg.get("perps_strat_leverage"), 1.0, 5.0, d["perps_strat_leverage"])
     cfg["perps_strat_tp_bps"] = _clampf(cfg.get("perps_strat_tp_bps"), 0.0, 5000.0, d["perps_strat_tp_bps"])
     cfg["perps_strat_sl_bps"] = _clampf(cfg.get("perps_strat_sl_bps"), 0.0, 5000.0, d["perps_strat_sl_bps"])
@@ -883,8 +732,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["perps_funding_poll_min"] = _clampi(cfg.get("perps_funding_poll_min"), 15, 1440, d["perps_funding_poll_min"])
     cfg["perps_candle_topup_min"] = _clampi(cfg.get("perps_candle_topup_min"), 5, 120, d["perps_candle_topup_min"])
     cfg["perps_backfill_days"] = _clampi(cfg.get("perps_backfill_days"), 1, 90, d["perps_backfill_days"])
-    # Floor the scan/poll intervals so a user can't drive them toward ~1s and get
-    # rate-limited / banned by Kalshi (the UI had no minimum).
     cfg["trade_scan_interval"] = _clampi(cfg.get("trade_scan_interval"), 5, 3600, d["trade_scan_interval"])
     cfg["position_poll_interval"] = _clampi(cfg.get("position_poll_interval"), 5, 3600, d["position_poll_interval"])
     cfg["balance_poll_interval"] = _clampi(cfg.get("balance_poll_interval"), 10, 3600, d["balance_poll_interval"])
@@ -893,8 +740,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["momentum_scan_interval"] = _clampi(cfg.get("momentum_scan_interval"), 30, 3600, d["momentum_scan_interval"])
     cfg["market_refresh_interval"] = _clampi(cfg.get("market_refresh_interval"), 30, 86400, d["market_refresh_interval"])
     cfg["crypto15m_poll_sec"] = _clampi(cfg.get("crypto15m_poll_sec"), 2, 60, d["crypto15m_poll_sec"])
-    # 0/None = never expire (the UI's "0 = never" affordance was previously a
-    # lie: None fell through the clamp to 90s and orders silently canceled).
     _oe = cfg.get("order_expiration_sec")
     if _oe in (None, 0, "0"):
         cfg["order_expiration_sec"] = None

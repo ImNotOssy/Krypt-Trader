@@ -43,7 +43,6 @@ CFG = {
 }
 
 
-# ───────── pure decision helpers ─────────────────────────────────────────────
 
 def test_desired_quotes_two_sided():
     q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000}
@@ -52,13 +51,12 @@ def test_desired_quotes_two_sided():
 
 
 def test_desired_quotes_spread_too_tight():
-    q = {"bid_usd_micro": 6_350_000, "ask_usd_micro": 6_350_100}  # 1 tick
+    q = {"bid_usd_micro": 6_350_000, "ask_usd_micro": 6_350_100}
     assert pf.desired_quotes(q, 0, CFG) == {}
 
 
 def test_desired_quotes_inventory_caps_one_side():
     q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000}
-    # long 3 contracts (cap) → no more buying, only the reducing ask
     assert pf.desired_quotes(q, 300, CFG) == {"ask": 6_353_000}
     assert pf.desired_quotes(q, -300, CFG) == {"bid": 6_349_500}
 
@@ -69,36 +67,30 @@ def test_desired_quotes_crossed_book_stands_down():
 
 
 def test_should_replace_threshold():
-    assert not pf.should_replace(6_350_000, 6_350_100, CFG)  # 1 tick — keep
-    assert pf.should_replace(6_350_000, 6_350_300, CFG)      # 3 ticks — replace
+    assert not pf.should_replace(6_350_000, 6_350_100, CFG)
+    assert pf.should_replace(6_350_000, 6_350_300, CFG)
 
 
 def test_apply_fill_avg_cost_round_trip():
-    # buy 2 @ 6.35 → long 200cc @ 6.35
     inv, avg, r = pf.apply_fill(0, 0.0, "bid", 200, 6_350_000)
     assert (inv, avg, r) == (200, 6_350_000.0, 0)
-    # buy 2 more @ 6.36 → avg 6.355
     inv, avg, r = pf.apply_fill(inv, avg, "bid", 200, 6_360_000)
     assert inv == 400 and avg == pytest.approx(6_355_000.0) and r == 0
-    # sell 4 @ 6.3650 → realized = (6365000-6355000)*400/100 = 40_000 micro = $0.04
     inv, avg, r = pf.apply_fill(inv, avg, "ask", 400, 6_365_000)
     assert inv == 0 and r == 40_000 and avg == 0.0
 
 
 def test_apply_fill_short_side_and_flip():
-    # sell 1 @ 6.36 → short
     inv, avg, r = pf.apply_fill(0, 0.0, "ask", 100, 6_360_000)
     assert inv == -100 and avg == 6_360_000.0 and r == 0
-    # buy back 1 @ 6.35 → +$0.01 realized
     inv, avg, r = pf.apply_fill(inv, avg, "bid", 100, 6_350_000)
     assert inv == 0 and r == 10_000
-    # short 1 @ 6.36 then buy 2 @ 6.37: realize -$0.01, flip long 1 @ 6.37
     inv, avg, r = pf.apply_fill(-100, 6_360_000.0, "bid", 200, 6_370_000)
     assert inv == 100 and r == -10_000 and avg == 6_370_000.0
 
 
 def test_maintenance_window():
-    thu_in = datetime(2026, 7, 9, 7, 30, tzinfo=timezone.utc)   # Thursday
+    thu_in = datetime(2026, 7, 9, 7, 30, tzinfo=timezone.utc)
     thu_out = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
     fri = datetime(2026, 7, 10, 7, 30, tzinfo=timezone.utc)
     assert pf.in_maintenance_window(thu_in) is True
@@ -106,7 +98,6 @@ def test_maintenance_window():
     assert pf.in_maintenance_window(fri) is False
 
 
-# ───────── accounting + halts against the DB ────────────────────────────────
 
 def _seed_fill(farmer, trade_id, side, count_cc, price_micro, fee_micro=0):
     inv, avg, realized = pf.apply_fill(
@@ -123,8 +114,8 @@ def _seed_fill(farmer, trade_id, side, count_cc, price_micro, fee_micro=0):
 
 
 def test_farm_stats_and_status(fresh_db, farmer):
-    _seed_fill(farmer, "t1", "bid", 100, 6_350_000, fee_micro=3_175)   # buy 1
-    _seed_fill(farmer, "t2", "ask", 100, 6_353_000, fee_micro=3_176)   # sell 1, +$0.003
+    _seed_fill(farmer, "t1", "bid", 100, 6_350_000, fee_micro=3_175)
+    _seed_fill(farmer, "t2", "ask", 100, 6_353_000, fee_micro=3_176)
     st = farmer.status(CFG)
     assert st["today"]["fills"] == 2
     assert st["today"]["volumeUsd"] == pytest.approx(12.70, abs=0.02)
@@ -134,7 +125,6 @@ def test_farm_stats_and_status(fresh_db, farmer):
 
 
 def test_daily_loss_halt(fresh_db, farmer):
-    # one ugly round trip: buy 10 @ 6.35, sell 10 @ 6.10 → -$2.50 realized
     _seed_fill(farmer, "t1", "bid", 1000, 6_350_000)
     _seed_fill(farmer, "t2", "ask", 1000, 6_100_000)
     farmer._check_economics(CFG)
@@ -143,14 +133,11 @@ def test_daily_loss_halt(fresh_db, farmer):
 
 
 def test_cost_bps_halt_needs_sample(fresh_db, farmer):
-    # generous loss budget so the MEASURED-COST halt is what fires
     cfg = dict(CFG, perps_farm_daily_loss_usd=100.0)
-    # tiny volume, small loss → NOT halted (below the $500 sample floor)
     _seed_fill(farmer, "t1", "bid", 100, 6_350_000, fee_micro=10_000)
     _seed_fill(farmer, "t2", "ask", 100, 6_349_000, fee_micro=10_000)
     farmer._check_economics(cfg)
     assert not farmer._halted()
-    # scale volume past the floor with cost ≈ 6.3 bps > the 4 bps cap → halts
     for i in range(50):
         _seed_fill(farmer, f"b{i}", "bid", 1000, 6_350_000, fee_micro=40_000)
         _seed_fill(farmer, f"s{i}", "ask", 1000, 6_350_000, fee_micro=40_000)
@@ -175,7 +162,6 @@ def test_halt_expires_next_day(fresh_db, farmer):
     assert not farmer._halted()
 
 
-# ───────── engine tick against fakes ─────────────────────────────────────────
 
 class _FakePapi:
     def __init__(self):
@@ -248,7 +234,6 @@ def test_tick_requotes_on_drift(fresh_db, farmer, monkeypatch):
     _wire_fakes(monkeypatch, farmer, fake, q)
     asyncio.run(farmer.farm_tick(CFG))
     placed_before = len(fake.placed)
-    # touch drifts 3 ticks up → both orders replaced
     q["bid_usd_micro"] += 300
     q["ask_usd_micro"] += 300
     asyncio.run(farmer.farm_tick(CFG))
@@ -262,7 +247,7 @@ def test_tick_keeps_orders_within_tolerance(fresh_db, farmer, monkeypatch):
     _wire_fakes(monkeypatch, farmer, fake, q)
     asyncio.run(farmer.farm_tick(CFG))
     placed_before = len(fake.placed)
-    q["bid_usd_micro"] += 100  # 1 tick = within tolerance
+    q["bid_usd_micro"] += 100
     q["ask_usd_micro"] += 100
     asyncio.run(farmer.farm_tick(CFG))
     assert len(fake.placed) == placed_before
@@ -296,8 +281,8 @@ def test_tick_quotes_on_slow_book_fresh_receipt(fresh_db, farmer, monkeypatch):
     fake = _FakePapi()
     now = int(time.time() * 1000)
     q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000,
-         "ts_ms": now - 90_000,   # wire event 90s ago — normal for thin perps
-         "recv_ms": now}          # ...but we received it just now
+         "ts_ms": now - 90_000,
+         "recv_ms": now}
     _wire_fakes(monkeypatch, farmer, fake, q)
     asyncio.run(farmer.farm_tick(CFG))
     assert {p["side"] for p in fake.placed} == {"bid", "ask"}
@@ -311,7 +296,7 @@ def test_tick_stands_down_when_receipt_stale(fresh_db, farmer, monkeypatch):
     fake = _FakePapi()
     now = int(time.time() * 1000)
     q = {"bid_usd_micro": 6_349_500, "ask_usd_micro": 6_353_000,
-         "ts_ms": now, "recv_ms": now - 200_000}  # received 200s ago
+         "ts_ms": now, "recv_ms": now - 200_000}
     _wire_fakes(monkeypatch, farmer, fake, q)
     asyncio.run(farmer.farm_tick(CFG))
     assert fake.placed == []
@@ -327,7 +312,7 @@ def test_tick_never_raises(fresh_db, farmer, monkeypatch):
     monkeypatch.setattr(papi, "get_perps_fills", boom)
     monkeypatch.setattr(pws, "is_connected", lambda: False)
     monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
-    asyncio.run(farmer.farm_tick(CFG))  # must not raise
+    asyncio.run(farmer.farm_tick(CFG))
     assert farmer.last_error != "" or True
 
 
@@ -342,10 +327,10 @@ def test_poll_fills_parses_kalshi_margin_shape(fresh_db, farmer, monkeypatch):
         "fill_id": "F123",
         "order_id": "o1",
         "ticker": "KXBTCPERP",
-        "side": "ask",                 # our resting ask filled → short 1
-        "count": "1.00",               # FixedPointCount
-        "price": "6.3530",             # FixedPointDollars
-        "fees": "0.0032",              # dollars
+        "side": "ask",
+        "count": "1.00",
+        "price": "6.3530",
+        "fees": "0.0032",
         "is_taker": False,
         "created_time": "2026-07-06T05:00:00Z",
     }
@@ -357,16 +342,15 @@ def test_poll_fills_parses_kalshi_margin_shape(fresh_db, farmer, monkeypatch):
     monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
     asyncio.run(farmer._poll_fills("KXBTCPERP", CFG))
 
-    assert farmer.inventory_cc == -100          # short 1 contract booked
+    assert farmer.inventory_cc == -100
     with db.get_db() as conn:
         assert db.perp_farm_fill_seen(conn, "F123", "production")
         row = conn.execute(
             "SELECT side, count_cc, price_usd_micro, fee_usd_micro "
             "FROM perp_farm_fills WHERE trade_id='F123'"
         ).fetchone()
-    assert tuple(row) == ("ask", 100, 6_353_000, 3200)  # fee = $0.0032 captured
+    assert tuple(row) == ("ask", 100, 6_353_000, 3200)
 
-    # Idempotent: the same fill on the next poll must not double-count.
     asyncio.run(farmer._poll_fills("KXBTCPERP", CFG))
     assert farmer.inventory_cc == -100
 
@@ -379,37 +363,34 @@ def test_demo_env_uses_suffixed_ticker(fresh_db, farmer, monkeypatch):
     assert all(p["ticker"] == "KXBTCPERP1" for p in fake.placed)
 
 
-# ───────── fee gate (only farm when the maker fee is worth it) ───────────────
 
 def test_effective_fee_bps_helper_excludes_taker(fresh_db):
     with db.get_db() as conn:
-        assert db.perp_farm_effective_fee_bps(conn, "production") is None  # empty → unknown
+        assert db.perp_farm_effective_fee_bps(conn, "production") is None
         db.insert_perp_farm_fill(conn, {
             "trade_id": "m", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "bid",
             "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 3000,
             "is_taker": 0, "realized_pnl_usd_micro": 0, "inventory_after_cc": 100,
             "kalshi_env": "production"})
-        # taker (flatten) leg with a huge fee must NOT inflate the maker estimate
         db.insert_perp_farm_fill(conn, {
             "trade_id": "t", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "ask",
             "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 48000,
             "is_taker": 1, "realized_pnl_usd_micro": 0, "inventory_after_cc": 0,
             "kalshi_env": "production"})
         bps = db.perp_farm_effective_fee_bps(conn, "production")
-    assert bps == pytest.approx(5.0)   # 3000 / 6_000_000 * 1e4, maker only
+    assert bps == pytest.approx(5.0)
 
 
 def test_fee_gate_off_by_default(fresh_db, farmer, monkeypatch):
     fake = _FakePapi()
     _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
-    asyncio.run(farmer.farm_tick(CFG))          # CFG has no max_fee → 0 → gate off
+    asyncio.run(farmer.farm_tick(CFG))
     assert {p["side"] for p in fake.placed} == {"bid", "ask"}
 
 
 def test_fee_gate_stands_down_when_fee_above_cap(fresh_db, farmer, monkeypatch):
     fake = _FakePapi()
     _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
-    # No fills → fee unknown → assume Tier-0 5 bps, which exceeds the 2 bps cap.
     cfg = dict(CFG, perps_farm_max_fee_bps=2.0)
     asyncio.run(farmer.farm_tick(cfg))
     assert fake.placed == []
@@ -417,7 +398,7 @@ def test_fee_gate_stands_down_when_fee_above_cap(fresh_db, farmer, monkeypatch):
 
 
 def test_fee_gate_allows_when_measured_fee_below_cap(fresh_db, farmer, monkeypatch):
-    with db.get_db() as conn:      # a real maker fill at ~1.5 bps of notional
+    with db.get_db() as conn:
         db.insert_perp_farm_fill(conn, {
             "trade_id": "cheap", "ticker": "KXBTCPERP", "ts_ms": 1, "side": "bid",
             "count_cc": 100, "price_usd_micro": 6_000_000, "fee_usd_micro": 900,
@@ -425,7 +406,7 @@ def test_fee_gate_allows_when_measured_fee_below_cap(fresh_db, farmer, monkeypat
             "kalshi_env": "production"})
     fake = _FakePapi()
     _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
-    cfg = dict(CFG, perps_farm_max_fee_bps=2.0)   # 1.5 bps measured ≤ 2 → farm
+    cfg = dict(CFG, perps_farm_max_fee_bps=2.0)
     asyncio.run(farmer.farm_tick(cfg))
     assert farmer._maker_fee_bps is not None and farmer._maker_fee_bps < 2.0
     assert {p["side"] for p in fake.placed} == {"bid", "ask"}

@@ -56,7 +56,6 @@ def _trade_row(trade_id="t1", env="production"):
     }
 
 
-# ───────── db helpers ────────────────────────────────────────────────────────
 
 def test_insert_and_count(fresh_db):
     with db.get_db() as conn:
@@ -73,10 +72,9 @@ def test_trade_dedup_on_trade_id(fresh_db):
     with db.get_db() as conn:
         db.insert_perp_trades(conn, [_trade_row("dup")])
         n2 = db.insert_perp_trades(conn, [_trade_row("dup"), _trade_row("new")])
-        assert n2 == 1  # duplicate ignored
+        assert n2 == 1
         total = conn.execute("SELECT COUNT(*) FROM perp_trades").fetchone()[0]
     assert total == 2
-    # same trade_id under a DIFFERENT env is a distinct row (demo vs prod)
     with db.get_db() as conn:
         assert db.insert_perp_trades(conn, [_trade_row("dup", env="demo")]) == 1
 
@@ -102,8 +100,8 @@ def test_candle_upsert_idempotent(fresh_db):
         db.upsert_perp_candles(conn, [_candle_row(600, close=6_400_000)])
         rows = conn.execute("SELECT COUNT(*), MAX(trade_close_usd_micro) "
                             "FROM perp_candles").fetchone()
-    assert rows[0] == 1                # no duplicate period
-    assert rows[1] == 6_400_000        # latest write wins
+    assert rows[0] == 1
+    assert rows[1] == 6_400_000
     with db.get_db() as conn:
         assert db.perp_last_candle_end_ts(conn, "KXBTCPERP", 1) == 600
         assert db.perp_last_candle_end_ts(conn, "KXBTCPERP", 60) is None
@@ -115,7 +113,7 @@ def test_funding_upsert_idempotent(fresh_db):
            "kalshi_env": "production"}
     with db.get_db() as conn:
         assert db.upsert_perp_funding(conn, [row]) == 1
-        assert db.upsert_perp_funding(conn, [row]) == 0  # finalized rates never change
+        assert db.upsert_perp_funding(conn, [row]) == 0
         assert db.perp_last_funding_time(conn) == "2026-07-05 20:00:00"
 
 
@@ -123,7 +121,7 @@ def test_retention_prunes_perp_tables(fresh_db):
     with db.get_db() as conn:
         db.insert_perp_ticks(conn, [_tick_row()])
         db.insert_perp_trades(conn, [_trade_row()])
-        db.upsert_perp_candles(conn, [_candle_row(1_000)])  # epoch 1970 → ancient
+        db.upsert_perp_candles(conn, [_candle_row(1_000)])
         conn.execute("UPDATE perp_ticks SET observed_at='2020-01-01 00:00:00'")
         conn.execute("UPDATE perp_trades SET observed_at='2020-01-01 00:00:00'")
     db.cleanup_old_data()
@@ -142,7 +140,6 @@ def test_factory_reset_wipes_perp_tables(fresh_db):
         assert conn.execute("SELECT COUNT(*) FROM perp_ticks").fetchone()[0] == 0
 
 
-# ───────── recorder ──────────────────────────────────────────────────────────
 
 def _quiet_papi(monkeypatch):
     async def none(*a, **k):
@@ -217,7 +214,7 @@ def test_record_tick_never_raises(fresh_db, monkeypatch):
     monkeypatch.setattr(pws, "drain_ticks", boom_sync)
     monkeypatch.setattr(pws, "drain_trades", boom_sync)
     out = asyncio.run(perps_record.record_tick({"perps_record_signals": True}))
-    assert isinstance(out, dict)  # every phase failed; nothing propagated
+    assert isinstance(out, dict)
 
 
 def test_candle_topup_resumes_from_last(fresh_db, monkeypatch):
@@ -274,13 +271,11 @@ def test_backfill_idempotent_and_state(fresh_db, monkeypatch):
     assert perps_record._backfill_state["done"] is True
     assert not perps_record._backfill_state["running"]
     assert out1["funding"] == 1
-    # rerun: same counts requested, no duplicate rows
     perps_record._backfill_state["done"] = False
     asyncio.run(perps_record.backfill(cfg))
     with db.get_db() as conn:
         assert conn.execute("SELECT COUNT(*) FROM perp_candles").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM perp_funding").fetchone()[0] == 1
-        # trade OHLC survived as NULL (no-trade candle)
         assert conn.execute(
             "SELECT trade_close_usd_micro FROM perp_candles").fetchone()[0] is None
 
@@ -312,7 +307,6 @@ def test_symbols_sanitized():
     assert syms == ["KXBTCPERP", "KXETHPERP"]
 
 
-# ───────── loaders ───────────────────────────────────────────────────────────
 
 def test_loaders_float_conversion_and_env_filter(fresh_db):
     with db.get_db() as conn:
@@ -331,7 +325,7 @@ def test_loaders_float_conversion_and_env_filter(fresh_db):
     conn = sqlite3.connect(str(db.db_path()))
     try:
         ticks = backtest.load_perp_ticks(conn, "KXBTCPERP")
-        assert len(ticks) == 1                      # demo row excluded
+        assert len(ticks) == 1
         assert ticks[0]["bid"] == pytest.approx(6.3495)
         assert ticks[0]["bid_size"] == pytest.approx(1200.0)
 
@@ -345,7 +339,7 @@ def test_loaders_float_conversion_and_env_filter(fresh_db):
         candles = backtest.load_perp_candles(conn, "KXBTCPERP")
         assert candles[0]["ask_close"] == pytest.approx(6.3505)
         assert candles[0]["close"] == pytest.approx(6.35)
-        assert candles[0]["mean"] is None           # None-safe nullable OHLC
+        assert candles[0]["mean"] is None
 
         funding = backtest.load_perp_funding(conn, "KXBTCPERP")
         assert funding[0]["mark"] == pytest.approx(6.2739)
@@ -367,10 +361,8 @@ def test_perp_series_ships_caveats(fresh_db):
     assert out["caveats"], "honesty caveats must ship with the series"
 
 
-# ───────── perps wallet (separate margin wallet) ─────────────────────────────
 
 def _wallet_resp():
-    # Kalshi /margin/balance shape (FixedPointDollars strings).
     return {
         "settled_funds": "10.5000",
         "subaccount_balances": [
@@ -395,7 +387,7 @@ def test_wallet_parses_margin_balance(monkeypatch):
     assert w == {
         "env": "production",
         "settledUsd": 10.5,
-        "availableUsd": 8.25,          # subaccount 0 only, not the sub-1 $99
+        "availableUsd": 8.25,
         "positionValueUsd": 2.25,
         "restingMarginUsd": 1.0,
         "maintenanceMarginUsd": 0.5,
@@ -414,7 +406,7 @@ def test_wallet_no_creds_returns_none(monkeypatch):
 
     monkeypatch.setattr(papi, "get_perps_balance", bal)
     assert asyncio.run(perps_record.wallet("production")) is None
-    assert called["n"] == 0             # never hit the API without creds
+    assert called["n"] == 0
 
 
 def test_wallet_never_flashes_zero_on_failure(monkeypatch):
@@ -431,16 +423,14 @@ def test_wallet_never_flashes_zero_on_failure(monkeypatch):
     first = asyncio.run(perps_record.wallet("production"))
     assert first["settledUsd"] == 10.5
 
-    # Expire the cache so the next call refetches, but make the fetch fail.
     perps_record._wallet_cache["t"] = time.monotonic() - 999
 
     async def boom(**kw):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(papi, "get_perps_balance", boom)
-    assert asyncio.run(perps_record.wallet("production")) == first  # last-known
+    assert asyncio.run(perps_record.wallet("production")) == first
 
-    # Malformed (no primary subaccount) must also not clobber good data.
     perps_record._wallet_cache["t"] = time.monotonic() - 999
 
     async def malformed(**kw):

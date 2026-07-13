@@ -20,15 +20,9 @@ KALSHI_CATEGORY_MAP = {
     "Transportation": "world",
     "World": "world",
     "Crypto": "crypto",
-    # Kalshi's literal series category for novelty markets. Kept as its own
-    # canonical id (not folded into a keyword bucket) because the Edge Stack
-    # preset explicitly allow-lists 'exotics' in allowed_whale_categories.
     "Exotics": "exotics",
 }
 
-# Case-insensitive view: Kalshi's raw category strings have drifted in casing
-# before, and a pure case miss must not dump a known category into the
-# keyword fallback.
 KALSHI_CATEGORY_MAP_CI = {k.lower(): v for k, v in KALSHI_CATEGORY_MAP.items()}
 
 SPORTS_KEYWORDS = [

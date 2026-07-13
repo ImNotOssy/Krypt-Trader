@@ -17,10 +17,6 @@ type LogCallback = (entry: LogEntry) => void;
 
 const STABLE_UPTIME_MS = 30_000;
 const MAX_RAPID_RESTARTS = 5;
-// Hang watchdog: ping the backend on this cadence; after this many consecutive
-// ping timeouts, force-kill + restart. Catches a WEDGED-but-alive backend
-// (event loop blocked, deadlock) that the exit handler can never see — the
-// status stayed 'running' forever while all trading was dead.
 const PING_INTERVAL_MS = 60_000;
 const PING_TIMEOUT_MS = 15_000;
 const PING_FAILS_TO_RESTART = 3;
@@ -53,8 +49,6 @@ class PythonBackend {
     this.requestedStop = false;
     this.gaveUp = false;
     this.restartAttempts = 0;
-    // Cancel any pending auto-restart so it can't fire AFTER we spawn here and
-    // bring up a second backend (two live backends both place real orders).
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -79,8 +73,6 @@ class PythonBackend {
     } catch {
     }
     setTimeout(() => {
-      // Kill the captured child, not this.child — a restart may have spawned a
-      // new one in the grace window, and we must not SIGTERM the new backend.
       if (c && !c.killed) {
         try {
           c.kill('SIGTERM');
@@ -166,8 +158,6 @@ class PythonBackend {
   }
 
   private rejectPending(reason: string): void {
-    // Fail in-flight RPCs immediately when the backend dies, instead of letting
-    // every caller hang for the full 30s timeout.
     for (const [, p] of this.pending) {
       try { p.reject(new Error(reason)); } catch {   }
     }
@@ -231,10 +221,6 @@ class PythonBackend {
   }
 
   private startChild(): void {
-    // Exclusive spawn: never allow two backends. If a child somehow still exists
-    // (restart race), detach its listeners and hard-kill it BEFORE spawning —
-    // otherwise an orphaned backend keeps trading and both feed the shared
-    // stdout buffer, corrupting JSON-RPC framing.
     if (this.child) {
       const stale = this.child;
       this.child = null;
@@ -295,16 +281,11 @@ class PythonBackend {
     child.stdout.on('data', (chunk: string) => this.onStdout(chunk));
     child.stderr.on('data', (chunk: string) => this.onStderr(chunk));
     child.on('error', (err) => {
-      // Ignore a stale child's late error — a slow shutdown during restart can
-      // leave the previous child emitting after a new one was already spawned.
       if (this.child !== child) return;
       this.lastError = `child error: ${err.message}`;
       this.pythonOk = false;
     });
     child.on('exit', (code, signal) => {
-      // Identity guard: if a new child was already assigned (restart race), the
-      // OLD child's late exit must NOT null the new child or schedule another
-      // spawn — that left two live Python backends both placing real orders.
       if (this.child !== child) return;
       this.child = null;
       this.stopPingWatchdog();
@@ -334,7 +315,6 @@ class PythonBackend {
   private startPingWatchdog(child: ChildProcessWithoutNullStreams): void {
     this.stopPingWatchdog();
     this.pingTimer = setInterval(() => {
-      // Only watch the child we were started for; a restart re-arms its own.
       if (this.child !== child || this.status !== 'running' || this.requestedStop) return;
       if (this.pingInFlight) return; // previous ping still deciding
       this.pingInFlight = true;
@@ -346,9 +326,6 @@ class PythonBackend {
           if (this.child !== child || this.requestedStop) return;
           this.pingFails++;
           if (this.pingFails >= PING_FAILS_TO_RESTART) {
-            // Wedged-but-alive: the process exists but its event loop is not
-            // answering. Force-kill; the exit handler owns the restart path
-            // (identity-guarded, so this can never double-spawn).
             this.lastError = `backend unresponsive (${this.pingFails} pings timed out) — force-restarting`;
             const entry: LogEntry = {
               ts: new Date().toISOString(),
@@ -400,8 +377,6 @@ class PythonBackend {
     const delay = Math.min(2000 * this.restartAttempts, 20_000);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      // A stop()/start() may have raced in during the backoff window — don't
-      // resurrect a backend that was asked to stop or already respawned.
       if (this.requestedStop || this.gaveUp || this.child) return;
       this.startChild();
     }, delay);
@@ -496,8 +471,6 @@ class PythonBackend {
   }
 
   private emitStatus(): void {
-    // The registered status handler (main.ts) owns the backend:info window
-    // broadcast — don't also send it here, or every status change fires twice.
     const info = this.info();
     for (const h of this.statusHandlers) h(info);
   }

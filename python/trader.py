@@ -18,8 +18,6 @@ from kalshi_api import (
     place_limit_order,
 )
 
-# Series the 15m-crypto executor owns; the main reconcile must not import these
-# as "external" (it tracks them in its own table — see reconcile import branch).
 _CRYPTO15M_SERIES = {s["series"] for s in crypto15m.SERIES}
 from kalshi_auth import ENV_LOCK, get_env
 
@@ -28,9 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 _balance_cache: dict[str, dict] = {}
-# One-time diagnostic: log the real /portfolio/balance response shape on first
-# success so we can confirm it's cash-only (no portfolio_value) and whether a
-# resting order reduces it — the assumptions the account total / P&L rest on.
 _balance_shape_logged = False
 
 
@@ -38,26 +33,13 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
     interval = float(cfg.get("balance_poll_interval", 60))
     loop = asyncio.get_event_loop()
     now = loop.time()
-    # Read the env + cache under ENV_LOCK (so a credential test's temporary env
-    # flip is waited out, never observed mid-flip), but do the fetch OUTSIDE the
-    # lock — holding it across get_balance's full timeout/retry ladder blocked
-    # every order placement behind a slow balance poll (worst case ~80s, exactly
-    # while a stop-loss wanted out). The cache write re-checks the env so a flip
-    # during the fetch can only ever DROP an update, not file it under the
-    # wrong env (the balance-flicker bug the lock originally fixed).
     async with ENV_LOCK:
         env = get_env()
         cached = _balance_cache.get(env)
         if not force and cached and (now - cached["at"]) < interval:
             return cached["cents"], cached["portfolio_cents"]
     try:
-        # pin_env: if a credential test flips the env mid-fetch, the request
-        # ABORTS instead of returning the other account's balance (which the
-        # restored-env write guard below could not distinguish).
         data = await get_balance(pin_env=env)
-        # A malformed/empty response (no 'balance' key) must NOT be cached as
-        # $0 — that poisons the cache and makes the displayed balance flash to
-        # zero. Treat it like a failed fetch and keep the last-known value.
         if not isinstance(data, dict) or "balance" not in data:
             raise ValueError("balance missing from response")
         global _balance_shape_logged
@@ -129,9 +111,6 @@ async def _compute_limit_price_cents(
     direction = direction.lower()
     style = cfg.get("order_style", "limit_cross")
     if style == "market":
-        # Cross at the user's max entry price, not a hardcoded 99¢. Returning 99
-        # made every market-style order fail the entry-price band check below
-        # (and risked overpaying) whenever max_entry_price_cents < 99.
         return max(1, min(99, int(cfg.get("max_entry_price_cents", 99) or 99)))
     try:
         book = await get_orderbook(ticker)
@@ -233,14 +212,9 @@ def _enrich_close_time(conn, sig: dict) -> None:
 
 
 def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
-    # The 15m-crypto executor owns its series (own table + booking); a main-engine
-    # position on the same ticker would double-count cost in the account total and
-    # book P&L twice at settlement. Mirror of the reconcile-import exclusion.
     if (signal.get("ticker") or "").split("-")[0] in _CRYPTO15M_SERIES:
         return False, "crypto15m series (owned by the 15m executor)"
 
-    # "Secret Strategy" — pure gambling. Ignore every gate (confidence, edge,
-    # category, price); each fresh signal just gets a flat random roll.
     if cfg.get("gambling_mode"):
         prob = float(cfg.get("gambling_trade_probability", 0.10) or 0.0)
         pct = int(round(prob * 100))
@@ -249,8 +223,6 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
         return False, f"\U0001F3B0 gambling: no hit ({pct}%)"
 
     conf = float(signal.get("confidence") or 0.0)
-    # Gates compare NET edge (taker fee subtracted when fee_aware_edge is on) —
-    # a gross gate lets through trades whose whole edge goes to fees.
     edge = _net_edge(signal, source, cfg)
     edge_tag = "net edge" if cfg.get("fee_aware_edge", True) else "edge"
 
@@ -300,9 +272,6 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
         if cat not in {c.lower() for c in src_cats}:
             return False, f"category {cat!r} not in {source} set"
 
-    # Liquidity floor: thin markets mean wide spreads and adverse fills — the
-    # signal rows already carry the market's volume, so gate on it before
-    # paying to find out. Unknown volume fails OPEN (0 / missing).
     min_vol = float(cfg.get("min_market_volume", 0) or 0)
     if min_vol > 0:
         vol = 0.0
@@ -322,10 +291,6 @@ def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
     if cost_cents > cfg["max_entry_price_cents"]:
         return False, f"entry {cost_cents}c > {cfg['max_entry_price_cents']}c"
 
-    # Resolution-horizon cap: skip markets that won't resolve for a long time
-    # (e.g. multi-month politics markets tie up capital). 0 = off. close_time is
-    # enriched onto the signal in scan_for_trades; if it's missing/unparseable we
-    # don't gate (fail-open — we'd rather trade than wrongly block on bad data).
     max_res_days = int(cfg.get("max_resolution_days", 0) or 0)
     if max_res_days > 0:
         days = _days_until_close(signal.get("close_time") or "")
@@ -349,23 +314,7 @@ def _today_pnl_balance_delta(env: str, offset_min: int = 0) -> float | None:
     return today_total - today_baseline
 
 
-# A daily-limit breach must PERSIST before it gates. The balance heartbeat
-# reads cash and portfolio value at different moments, so around every
-# settlement the payout is in flight between ledgers for a minute or two
-# and the account total transiently reads low — observed live 2026-07-03:
-# "today pnl=$-9.67, limit=$-1.45" fired inside the 2-minute window between
-# the portfolio zeroing (00:16:03Z) and the cash payout landing (00:18:13Z)
-# on an account that was UP on the day, blocking entries after EVERY
-# settlement. A genuine drawdown keeps breaching and gates ~3 minutes
-# later; a money-in-flight dip self-heals first.
 _DAY_RISK_PERSIST_SEC = 180.0
-# (env, kind) -> wall-clock (unix seconds) first-breach. Keyed by env so a
-# demo<->production switch can't transfer or destroy a live breach streak.
-# None = known-cleared; a MISSING key = unknown (fresh process), which is when
-# the persisted copy in db.risk_state is consulted — the in-memory dict alone
-# meant any backend restart mid-breach re-enabled both engines for another
-# 180s while the account sat past its daily limit (and restarting the app is
-# exactly what a user does after a losing streak).
 _day_risk_breach: dict = {}
 
 
@@ -373,8 +322,6 @@ def _breach_persists(env: str, kind: str, breached: bool) -> bool:
     now = time.time()
     key = (env, kind)
     if not breached:
-        # Clear the persisted latch too, but only on a transition (or on the
-        # first observation after boot) so the hot path stays DB-free.
         if key not in _day_risk_breach or _day_risk_breach[key] is not None:
             _day_risk_breach[key] = None
             try:
@@ -387,8 +334,6 @@ def _breach_persists(env: str, kind: str, breached: bool) -> bool:
     if first is None:
         persisted = None
         if key not in _day_risk_breach:
-            # Fresh process observing an ongoing breach — restore the
-            # persisted first-breach stamp instead of restarting the window.
             try:
                 with db.get_db() as conn:
                     persisted = db.get_risk_breach_start(conn, env, kind)
@@ -411,10 +356,6 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
     if pnl is None:
         return False, ""
 
-    # The balance-delta P&L values open positions at COST — a day of positions
-    # bleeding toward zero shows $0 until settlement, so the stop-loss fired
-    # only after the money was gone. Add the live mark-to-market of open
-    # positions (marks written by the 30s reconcile) for the stop decision.
     try:
         with db.get_db() as conn:
             unrealized = db.open_unrealized_pnl_usd(conn, env)
@@ -422,9 +363,6 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
         unrealized = 0.0
     pnl_mtm = pnl + unrealized
 
-    # Two stop limits — flat dollars and % of the day-start account total —
-    # whichever is TIGHTER binds. The % limit is what makes one default fit a
-    # $100 account (flat -$50 = half the bankroll) and a $5000 one (noise).
     sl_limits: list[float] = []
     sl = float(cfg.get("stop_loss_on_day", 0))
     if sl < 0:
@@ -440,7 +378,7 @@ def _is_blocked_by_daily_risk(cfg: dict, env: str) -> tuple[bool, str]:
             day_start = float(first_today["total_usd"] or 0.0)
             if day_start > 0:
                 sl_limits.append(-sl_pct * day_start)
-    limit = max(sl_limits) if sl_limits else None  # closest to zero = tighter
+    limit = max(sl_limits) if sl_limits else None
     sl_hit = _breach_persists(env, "sl", limit is not None and pnl_mtm <= limit)
     tp = float(cfg.get("take_profit_on_day", 0))
     tp_hit = _breach_persists(env, "tp", tp > 0 and pnl >= tp)
@@ -532,12 +470,6 @@ async def execute_signal(
         exposure = db.current_total_exposure_usd(conn, env)
         filled_cost = db.open_filled_cost_usd(conn, env)
 
-    # Account value = cash + cost basis of FILLED positions. Kalshi's `balance`
-    # still includes the cash for resting/unfilled orders (it isn't held), so we
-    # must NOT add committed notional into the bankroll — that double-counts and
-    # inflates the cap (which would over-deploy). `exposure` (committed incl.
-    # resting orders) is the RISK we limit to a fraction of that account, so each
-    # in-flight order still consumes headroom and the cap binds within one cycle.
     total_bankroll = max(0.0, balance_usd) + max(0.0, filled_cost)
     target_usd = _compute_position_usd(balance_usd, edge_pts, cfg)
     max_exposure = total_bankroll * float(cfg["max_total_exposure_fraction"])
@@ -559,11 +491,6 @@ async def execute_signal(
             f"(book moved since signal)"
         )
         return None
-    # Slippage cap: limit_cross pays whatever the live book asks — on a thin or
-    # fast-moving book that can be far past the price the signal's edge was
-    # computed at, silently spending the edge before settlement risk even
-    # starts. The edge gate was passed at signal_cost_cents; refuse to pay more
-    # than a few cents beyond it. 0 = off.
     max_slip = int(cfg.get("max_entry_slippage_cents", 0) or 0)
     if max_slip > 0 and limit_cents > signal_cost_cents + max_slip:
         logger.info(
@@ -617,20 +544,6 @@ async def execute_signal(
             client_order_id=client_order_id,
         )
     except KalshiAPIError as e:
-        # 4xx = Kalshi REJECTED the order (confirmed not placed). 5xx and
-        # transport errors may have DELIVERED it — look the coid up before
-        # booking an error, or the resting order becomes an invisible position
-        # that fills hours later on a stale limit while the engine re-fires
-        # the same signal (double position).
-        #
-        # EXCEPTION: a duplicate client_order_id rejection is NOT "not
-        # placed" — the transport layer retries a timed-out POST with the
-        # SAME coid, so "duplicate" means attempt 1 WAS delivered and the
-        # order is live (the exact shape crypto15m's entry path guards
-        # against). Same for the synthesized env-flip 409: attempt 1 may have
-        # been delivered before the abort. Route both through the coid-lookup
-        # recovery instead of booking a phantom 'error' row that hides a live
-        # order from the exposure/open-count/dup-market caps.
         body_l = str(e.body).lower()
         maybe_delivered = (
             "duplicate" in body_l
@@ -716,10 +629,6 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
     def _skip_log(reason: str) -> None:
         last_cycle["skipReason"] = reason
         last_cycle["at"] = time.time()
-        # Dedup on the stable prefix — reasons embed live values ("today
-        # pnl=$-51.37") that change every snapshot, which defeated the dedup
-        # and spammed thousands of identical lines per blocked day (rotating
-        # real errors out of the log window).
         key = reason.split(" (", 1)[0]
         last = _last_scan_skip_log.get(key, 0)
         if now_ts - last < 60:
@@ -749,8 +658,6 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
 
     candidates: list[tuple[dict, str]] = []
     fetched_w = fetched_m = fetched_c = 0
-    # Only pay for the per-signal market lookup (close_time) when the resolution
-    # cap is actually enabled.
     gate_resolution = int(cfg.get("max_resolution_days", 0) or 0) > 0
     with db.get_db() as conn:
         if cfg.get("trade_whales"):
@@ -825,11 +732,6 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
             row = await execute_signal(sig, src, cfg, balance_usd)
             if row:
                 inserted.append(row)
-                # Deduct the committed notional LOCALLY instead of forcing a
-                # balance refresh per order (~0.3-0.5s each, serialized before
-                # the next candidate — exactly when several signals fire
-                # together and speed matters). Conservative: the real fill may
-                # cost less. One forced refresh after the loop trues up.
                 if row.get("status") != "error":
                     balance_usd -= (
                         int(row.get("target_contracts") or 0)
@@ -860,9 +762,6 @@ async def scan_for_trades(cfg: dict) -> list[dict]:
 
 
 _last_scan_skip_log: dict[str, float] = {}
-# Last scan cycle's outcome — cycle-level skip reason (hours/daily-stop/...)
-# and per-gate rejection counts. The "why isn't it trading" panel reads these;
-# before this they were computed every cycle and thrown away.
 last_cycle: dict = {"skipReason": None, "filterCounts": {}, "candidates": 0, "placed": 0, "at": None}
 
 _last_filter_log: dict[tuple[int, str], float] = {}
@@ -878,9 +777,6 @@ def _cap_log_dict(d: dict, cap: int = 2000, keep: int = 1500) -> None:
     if len(d) > cap:
         for k in list(d)[: len(d) - keep]:
             d.pop(k, None)
-# Consecutive reconciles a filled position has been absent from Kalshi's
-# /portfolio/positions. Used to debounce orphan-closing against transient API
-# blips and fresh-fill lag before declaring a position truly gone.
 _orphan_miss_streak: dict[int, int] = {}
 
 
@@ -1008,11 +904,6 @@ def _db_status_from_order(parsed: dict, target: int) -> str:
 _poll_failures: dict[int, int] = {}
 _POLL_FAILURE_THRESHOLD = 6
 
-# Reentrancy guard: the UI's Refresh triggers runOnce('pollOrders') as its own
-# asyncio task, concurrent with the main loop's poll. Two unserialized polls
-# read the same expired 'submitted' row, both cancel it, and the loser's 404
-# used to book 'gone' over the winner's carefully-confirmed outcome (a raced
-# fill left terminal at 0 fills). One poll at a time; extras no-op.
 _poll_orders_active = False
 
 
@@ -1030,8 +921,6 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
 
 async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
     with db.get_db() as conn:
-        # Current env only: rows from the other env would 404 against this
-        # env's API and get killed as 'gone' while their orders live on.
         pending = db.get_pending_bot_positions(conn, get_env())
     if not pending:
         return []
@@ -1163,9 +1052,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
             continue
 
         if not kid:
-            # A lost-response entry (or odd order-response shape) left this row
-            # without an order id. The order may be LIVE — look it up by our
-            # client_order_id and adopt it before any give-up path runs.
             coid = pos.get("client_order_id")
             lookup_ok = False
             if coid:
@@ -1188,12 +1074,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 updated.append(row)
                 continue
             if coid and not lookup_ok:
-                # The coid lookup FAILED (network/API) — that is not evidence
-                # the order doesn't exist. Missing-kid rows exist precisely
-                # because they were created during an outage; counting outage
-                # cycles toward the give-up threshold 'gone'd live orders
-                # after ~3 minutes of a router flap. Only a lookup that
-                # SUCCEEDED and found nothing counts as a miss.
                 logger.debug(
                     f"poll #{pos['id']}: coid lookup failed; not counting "
                     f"toward give-up"
@@ -1223,10 +1103,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 _clear_failure(pos["id"])
                 updated.append(row)
                 continue
-            # Only a genuine 404 (Kalshi says "no such order") counts toward
-            # the give-up threshold — 5xx/throttle responses are transient and
-            # used to pre-charge the counter so the first real 404 fired the
-            # give-up instantly instead of after 6 CONSECUTIVE 404s.
             if e.status != 404:
                 logger.debug(f"order poll {kid}: HTTP {e.status} (transient; not counted)")
                 continue
@@ -1247,9 +1123,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 _clear_failure(pos["id"])
             continue
         except Exception as e:
-            # Transport/parse failure — not evidence of anything. Don't feed
-            # the shared give-up counter (a 3-minute outage must not 'gone' a
-            # live order).
             logger.warning(f"order poll {kid}: {e}")
             continue
 
@@ -1268,13 +1141,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 "status": db_status,
                 "filled_contracts": parsed["filled"],
             }
-            # A partial fill whose remainder Kalshi CANCELED frees the unfilled
-            # cash: collapse target_contracts to the filled qty so
-            # current_total_exposure_usd stops valuing the dead remainder's
-            # notional (target × limit) as committed capital — otherwise exposure
-            # over-counts and needlessly blocks new entries until the position
-            # resolves. A still-RESTING partial (kalshi status 'resting') keeps
-            # its target, so its genuinely-held remainder stays counted.
             if db_status == "partial" and parsed["status"] in ("canceled", "cancelled"):
                 fields["target_contracts"] = parsed["filled"]
             if parsed["avg_cents"] is not None:
@@ -1311,12 +1177,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                     await cancel_order(kid)
                 except KalshiAPIError as e:
                     if e.status == 404:
-                        # Cancel says the order is unknown — but a concurrent
-                        # poll's cancel or a raced FILL produces the same 404.
-                        # Confirm the fill state via get_order before booking a
-                        # terminal status: booking 'gone' blind over a fill left
-                        # a filled order terminal at 0 fills (and once the
-                        # resolution pass flat-resolves it, unrecoverable).
                         final404 = None
                         for _ in range(3):
                             try:
@@ -1327,13 +1187,11 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                                 break
                             except KalshiAPIError as e2:
                                 if e2.status == 404:
-                                    break  # order truly unknown -> 'gone' below
+                                    break
                                 await asyncio.sleep(0.5)
                             except Exception:
                                 await asyncio.sleep(0.5)
                         if final404 is not None and int(final404.get("filled") or 0) > 0:
-                            # Fills exist — leave the row; the next poll's
-                            # normal path books them.
                             logger.warning(
                                 f"cancel {kid}: 404 but order shows "
                                 f"{final404.get('filled')} fills; leaving row for next poll"
@@ -1349,20 +1207,11 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                         if r:
                             updated.append(r)
                     else:
-                        # 5xx/throttle — the order may still be RESTING. Booking
-                        # 'gone' here would untrack a live order; retry next poll.
                         logger.warning(f"cancel {kid}: HTTP {e.status}, will retry")
                     continue
                 except Exception as e:
                     logger.warning(f"cancel exception {kid}: {e}")
                     continue
-                # Cancel accepted — but a fill may have RACED it (the exact
-                # shape that produced an off-book 15m settlement). Book
-                # 'canceled' only from a CONFIRMED post-cancel zero-fill read;
-                # if the re-read shows fills or fails, leave 'submitted' so the
-                # next poll books the truth (a resolved 'canceled 0-fill' row
-                # also blocks the reconcile import for this ticker, so a wrong
-                # write here is unrecoverable).
                 final = None
                 for _ in range(3):
                     try:
@@ -1377,7 +1226,7 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                     logger.warning(f"cancel {kid}: fill state unconfirmed, retrying next poll")
                     continue
                 if int(final.get("filled") or 0) > 0:
-                    continue  # next poll's normal path books the fills
+                    continue
                 with db.get_db() as conn:
                     db.update_bot_position(
                         conn, pos["id"], status="canceled",
@@ -1461,13 +1310,6 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
     for pos in by_env:
         filled = int(pos["filled_contracts"] or 0)
         if filled <= 0:
-            # 'gone' is a GIVE-UP, not a confirmed terminal state — the order
-            # may be resting live on Kalshi (poll give-ups fire during plain
-            # outages). get_pending_bot_positions keeps such zero-cost rows
-            # re-pollable for 24h; flat-resolving one earlier kills that
-            # recovery window AND (via recent_resolved_position_exists) blocks
-            # the reconcile import of a later fill for another 24h. Leave
-            # 'gone' rows to the poll until the retention has elapsed.
             if (pos.get("status") or "") == "gone":
                 try:
                     created = datetime.strptime(
@@ -1542,8 +1384,6 @@ async def mark_resolved_positions(cfg: dict) -> list[dict]:
         fees_usd = float(pos.get("fees_usd") or 0.0)
         our_payout = yes_payout if direction == "yes" else (1.0 - yes_payout)
         settlement_usd = filled * our_payout
-        # Realized P&L is NET of Kalshi trading fees — fill_cost excludes them,
-        # so gross settlement−cost overstates every position by the fee paid.
         pnl_usd = settlement_usd - cost_usd - fees_usd
 
         max_settlement = float(filled)
@@ -1809,9 +1649,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
         return "position_fp" in p or "position" in p
 
     nonzero_count = sum(1 for p in live if _signed_qty(p) != 0)
-    # A genuine field rename means NONE of the rows even expose a known qty key.
-    # All-zero qty WITH the keys present is just a flat account (Kalshi returns a
-    # zero-qty row for every market ever traded) — not a rename.
     qty_key_present = any(_has_qty_key(p) for p in live)
     if live and nonzero_count == 0 and not qty_key_present:
         sample_keys = list(live[0].keys())
@@ -1849,8 +1686,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             (pos["ticker"], pos["direction"]), [],
         ).append(pos)
 
-    # Current per-ticker quotes (markets table is refreshed each cycle by the
-    # resolution pass) → drives live mark-to-market P&L on open positions.
     with db.get_db() as conn:
         quote_by_ticker = db.get_market_quotes(
             conn, {t for (t, _s) in local_by_key},
@@ -1883,7 +1718,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             )
             new_filled = int(round(qty))
 
-            # Live mark (held side's current price, in cents) → unrealized P&L.
             cur_mark = _side_mark_cents(quote_by_ticker.get(ticker), side)
             prev_mark = target.get("mark_price_cents")
             mark_moved = (
@@ -1894,15 +1728,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             cur_filled = int(target.get("filled_contracts") or 0)
             cur_cost_usd = float(target.get("cost_usd") or 0.0)
 
-            # A partially-filled entry whose order is still WORKING (fills so
-            # far < target) must NOT be flipped to 'filled': that frees the
-            # resting remainder's committed notional from the exposure cap
-            # (current_total_exposure_usd values filled rows at cost only),
-            # drops the row from get_pending_bot_positions (so the poll stops
-            # watching the live order — no fee/status updates, no
-            # canceled-partial collapse), and removes it from cancel_all's
-            # selector. Keep it 'partial' until the order reaches a terminal
-            # state; the poll owns the order lifecycle.
             still_working = (
                 not was_terminal
                 and target["status"] in ("submitted", "partial")
@@ -1913,9 +1738,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             else:
                 new_status = "filled"
 
-            # Skip a no-op write so the renderer isn't flooded with
-            # position:update for unchanged rows — but DO write when the mark
-            # moved ≥1c, so live P&L stays current.
             if (
                 not was_terminal
                 and target.get("status") == new_status
@@ -1958,22 +1780,8 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
             else:
                 summary["rescued"] += 1
         else:
-            # Skip positions owned by the 15m-crypto executor — it tracks them in
-            # its own table. Importing them as "external" here would burn the main
-            # engine's open-position slots and contaminate its win/loss/P&L stats.
-            # Their cost is added to the account total in _build_account_snapshot.
             if ticker.split("-")[0] in _CRYPTO15M_SERIES:
                 continue
-            # Our OWN position wrongly resolved (flat orphan-close of an
-            # active market, 0-fill give-up resolve over a raced fill) while
-            # the contracts are still held? Re-link that row instead of
-            # importing an 'external' duplicate: externals never count toward
-            # max_open_positions, so every wrongful resolution would otherwise
-            # convert into a PERMANENT cap exemption for our own money (and
-            # the position would ride untracked for the 24h skip-import
-            # window first). Flat-resolved (pnl $0, settlement $0, no
-            # outcome) is the signature of a wrongful close — a real
-            # settlement books a win's cash or a loss's negative pnl.
             with db.get_db() as conn:
                 stale = db.find_flat_resolved_position(
                     conn, ticker, side, env, int(round(qty)),
@@ -2073,16 +1881,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     f"[reconcile] import failed for {ticker} {side}: {e}",
                 )
 
-    # --- Orphan-closing: local "open" positions Kalshi no longer reports ---
-    # A filled position absent from /portfolio/positions has settled or been
-    # sold/closed outside our tracking. Without closing it, it lingers as "open"
-    # forever — burning concurrency slots, inflating the open-count, and
-    # double-counting its cost in the account total. (This is the 7-shown-vs-
-    # 3-held drift, and why a manual Refresh appeared to do nothing.)
-    # Only a real rename (no known qty key on any row) trips the fail-safe. A
-    # flat account (keys present, all zero) must NOT skip orphan-closing, or
-    # locally-"filled" positions sold/closed outside our tracking linger forever
-    # — burning concurrency slots and skewing the daily-stop baseline.
     field_change_suspected = bool(live) and nonzero_count == 0 and not qty_key_present
     if not field_change_suspected:
         for (ticker, side), rows in local_by_key.items():
@@ -2093,21 +1891,9 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     _orphan_miss_streak.pop(pid, None)
                     continue
                 if r["status"] != "filled":
-                    # resting/submitted orders aren't positions yet — leave them
-                    # to poll_open_orders, which tracks the order lifecycle.
                     continue
                 streak = _orphan_miss_streak.get(pid, 0) + 1
                 _orphan_miss_streak[pid] = streak
-                # ALWAYS require a confirming second consecutive miss. The old
-                # "stale position + non-empty response → close on first miss"
-                # shortcut closed real held positions on a single incomplete
-                # /portfolio/positions read (a cursor page-shift skipping one
-                # row while the rest looked healthy) — freeing cap slots the
-                # engine refilled while the contracts were still held, with no
-                # resurrection path once resolved. Systematic truncation is
-                # handled at the source: get_positions raises
-                # KalshiTruncatedResult at its page cap, aborting the whole
-                # reconcile instead of feeding it a partial snapshot.
                 if streak < 2:
                     continue
 
@@ -2115,9 +1901,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                 cost_usd = float(r["cost_usd"] or 0.0)
                 fees_usd = float(r.get("fees_usd") or 0.0)
                 is_c15 = ticker.split("-")[0] in _CRYPTO15M_SERIES
-                # crypto15m externals carry their real P&L in their own table;
-                # close them flat to avoid double-counting. Everything else
-                # honors a market settlement if one has posted.
                 yes_payout = None
                 if not is_c15:
                     try:
@@ -2128,10 +1911,6 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
                     if yes_payout is None and market is not None:
                         mstatus = (market.get("status") or "").lower()
                         if mstatus in ("closed", "settling", "pending", "determined"):
-                            # Trading ended but the settlement value hasn't posted
-                            # yet — Kalshi drops the position from the book first.
-                            # Defer so the resolution pass assigns the real
-                            # win/loss instead of closing a winner flat.
                             continue
                 _orphan_miss_streak.pop(pid, None)
 
@@ -2204,13 +1983,6 @@ async def cancel_all_open() -> int:
             logger.warning(f"cancel_all: {kid}: {e}")
             continue
         canceled += 1
-        # Cancel accepted — but a fill may have RACED it. Same rule as the
-        # poll's auto-cancel: book 'canceled' ONLY from a CONFIRMED post-cancel
-        # zero-fill read. Writing 'canceled' blind over a partial fill drops
-        # the held contracts out of the open-count cap instantly, and the
-        # resolution pass would flat-resolve the 0-fill row — unrecoverable
-        # (a resolved canceled 0-fill row also blocks the reconcile import
-        # for this ticker for 24h, then feeds the cap-exempt external path).
         final = None
         for _ in range(3):
             try:
@@ -2222,8 +1994,6 @@ async def cancel_all_open() -> int:
             except Exception:
                 await asyncio.sleep(0.5)
         if final is None:
-            # Couldn't confirm the fill state — leave the row as-is
-            # (submitted/partial) so the poll loop books the truth.
             logger.warning(
                 f"cancel_all: {kid}: fill state unconfirmed after cancel; "
                 f"leaving row for the poll loop"
@@ -2238,8 +2008,6 @@ async def cancel_all_open() -> int:
                     "status": db_status,
                     "filled_contracts": final["filled"],
                 }
-                # The canceled remainder's cash is freed — collapse the target
-                # so exposure stops valuing the dead notional (same as poll).
                 if db_status == "partial" and final["status"] in ("canceled", "cancelled"):
                     fields["target_contracts"] = final["filled"]
                 if final["avg_cents"] is not None:

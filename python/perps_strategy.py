@@ -36,6 +36,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import capturetrail
 import db
 import kalshi_auth
 import kalshi_perps_api as papi
@@ -45,30 +46,28 @@ import rules as rules_mod
 
 logger = logging.getLogger("perps_strategy")
 
-# ───────── fee model (bps of notional per fill) ──────────────────────────────
 FEES = {
     "today": {"maker": 5.0, "taker": 80.0},
     "jul8": {"maker": 5.0, "taker": 12.0},
 }
 
 PERPS_RULE_FIELDS = [
-    "price",             # last trade/close USD
-    "spreadBps",         # (ask-bid)/mid at bar close
-    "ret1mBps", "ret5mBps", "ret15mBps", "ret60mBps",   # signed close returns
-    "vol15mBps", "vol60mBps",                            # stdev of 1m returns
-    "fromHigh60mBps", "fromLow60mBps",                   # distance from rolling extremes (+)
-    "volume15m",         # contracts traded, last 15 bars
-    "volumeRatio",       # last-15m volume vs trailing-60m average (1 = normal)
-    "oiChange15mPct",    # open-interest change over 15 bars, percent
-    "fundingRateBps",    # last FINALIZED 8h funding rate, bps
-    "minsToFunding",     # minutes until next 04/12/20 UTC stamp
-    "hourUtc", "dowUtc",  # 0-23, 0=Mon..6=Sun
+    "price",
+    "spreadBps",
+    "ret1mBps", "ret5mBps", "ret15mBps", "ret60mBps",
+    "vol15mBps", "vol60mBps",
+    "fromHigh60mBps", "fromLow60mBps",
+    "volume15m",
+    "volumeRatio",
+    "oiChange15mPct",
+    "fundingRateBps",
+    "minsToFunding",
+    "hourUtc", "dowUtc",
 ]
 
 _FUNDING_HOURS = (4, 12, 20)
 
 
-# ───────── features (shared by backtest + paper/live) ────────────────────────
 
 def compute_features(bars: list[dict], i: int, funding_rate_bps: float | None) -> dict | None:
     """Feature dict for bar index i (uses bars ≤ i only). Bars are dicts with
@@ -182,7 +181,6 @@ def should_exit(
     return False, ""
 
 
-# ───────── backtest ──────────────────────────────────────────────────────────
 
 def _load_funding_windows(conn, ticker: str) -> list[tuple[int, float]]:
     """[(stamp_unix, rate)] ascending, prod rows."""
@@ -229,7 +227,9 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
     fees = FEES.get(fee_era, FEES["jul8"])
     contracts = max(1, int(cfg.get("perps_strat_contracts", 1)))
     leverage = max(1.0, float(cfg.get("perps_strat_leverage", 1)))
-    liq_bps = 10_000 / leverage * 0.9  # simplified maintenance model (caveat)
+    liq_bps = 10_000 / leverage * 0.9
+    ctp = capturetrail.params_from_cfg(cfg, "perps_strat")
+    use_ct = ctp.active() and ctp.override
 
     conn = sqlite3.connect(f"file:{db.db_path()}?mode=ro", uri=True)
     try:
@@ -243,7 +243,6 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
     scanned = 0
 
     def fill_px(bar: dict, action: str) -> float | None:
-        # action buy|sell — taker crosses the spread
         return bar.get("ask_close") if action == "buy" else bar.get("bid_close")
 
     def book_exit(exit_bar: dict, exit_px: float, reason: str, exit_is_taker: bool) -> None:
@@ -256,7 +255,6 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
             move = -move
         fee_in = notional_in * (fees["maker"] if pos["maker_entry"] else fees["taker"]) / 10_000
         fee_out = notional_out * (fees["maker"] if not exit_is_taker else fees["taker"]) / 10_000
-        # funding: stamps crossed while held (long pays positive rate)
         funding_usd = 0.0
         for ts, rate in fund:
             if pos["entry_ts"] < ts <= int(exit_bar["end_ts"]):
@@ -284,22 +282,22 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
                 ok, why = should_enter(feats, cfg)
                 if ok:
                     if entry_style == "maker":
-                        # join at close; filled only if next bar trades through
                         want = bars[i].get("bid_close") if side_cfg == "long" else bars[i].get("ask_close")
                         thru = (nxt.get("low") is not None and want is not None and nxt["low"] < want) \
                             if side_cfg == "long" else \
                             (nxt.get("high") is not None and want is not None and nxt["high"] > want)
                         if thru:
                             pos = {"side": side_cfg, "entry_px": want, "maker_entry": True,
-                                   "entry_ts": int(nxt["end_ts"]), "entry_i": i + 1}
+                                   "entry_ts": int(nxt["end_ts"]), "entry_i": i + 1,
+                                   "ct": capturetrail.CTState.open(want)}
                     else:
                         px = fill_px(nxt, "buy" if side_cfg == "long" else "sell")
                         if px:
                             pos = {"side": side_cfg, "entry_px": px, "maker_entry": False,
-                                   "entry_ts": int(nxt["end_ts"]), "entry_i": i + 1}
+                                   "entry_ts": int(nxt["end_ts"]), "entry_i": i + 1,
+                                   "ct": capturetrail.CTState.open(px)}
         else:
             held_min = (int(bars[i]["end_ts"]) - pos["entry_ts"]) / 60
-            # liquidation check on adverse extreme (conservative: bar extreme)
             adverse = bars[i].get("bid_low") if pos["side"] == "long" else bars[i].get("ask_high")
             if adverse:
                 adv_bps = (adverse - pos["entry_px"]) / pos["entry_px"] * 10_000
@@ -309,23 +307,36 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
                     book_exit(bars[i], adverse, "liquidated", exit_is_taker=True)
                     i += 1
                     continue
-            # intrabar SL first (conservative), then TP, priced at exit side
-            sl = float(cfg.get("perps_strat_sl_bps", 20) or 0)
-            tp = float(cfg.get("perps_strat_tp_bps", 30) or 0)
-            if pos["side"] == "long":
-                lo = bars[i].get("bid_low")
-                hi = bars[i].get("bid_high")
-                if sl > 0 and lo and (lo - pos["entry_px"]) / pos["entry_px"] * 10_000 <= -sl:
-                    book_exit(bars[i], pos["entry_px"] * (1 - sl / 10_000), "sl", True)
-                elif tp > 0 and hi and (hi - pos["entry_px"]) / pos["entry_px"] * 10_000 >= tp:
-                    book_exit(bars[i], pos["entry_px"] * (1 + tp / 10_000), "tp", True)
+            if use_ct:
+                if pos["side"] == "long":
+                    fav_px, adv_px = bars[i].get("bid_high"), bars[i].get("bid_low")
+                else:
+                    fav_px, adv_px = bars[i].get("ask_low"), bars[i].get("ask_high")
+                if fav_px:
+                    capturetrail.step(pos["ct"],
+                                      capturetrail.favorable_mark(pos["side"], fav_px, pos["entry_px"]), ctp)
+                if adv_px:
+                    done_ct, reason_ct = capturetrail.step(
+                        pos["ct"], capturetrail.favorable_mark(pos["side"], adv_px, pos["entry_px"]), ctp)
+                    if done_ct:
+                        book_exit(bars[i], adv_px, reason_ct, exit_is_taker=True)
             else:
-                hi = bars[i].get("ask_high")
-                lo = bars[i].get("ask_low")
-                if sl > 0 and hi and (pos["entry_px"] - hi) / pos["entry_px"] * 10_000 <= -sl:
-                    book_exit(bars[i], pos["entry_px"] * (1 + sl / 10_000), "sl", True)
-                elif tp > 0 and lo and (pos["entry_px"] - lo) / pos["entry_px"] * 10_000 >= tp:
-                    book_exit(bars[i], pos["entry_px"] * (1 - tp / 10_000), "tp", True)
+                sl = float(cfg.get("perps_strat_sl_bps", 20) or 0)
+                tp = float(cfg.get("perps_strat_tp_bps", 30) or 0)
+                if pos["side"] == "long":
+                    lo = bars[i].get("bid_low")
+                    hi = bars[i].get("bid_high")
+                    if sl > 0 and lo and (lo - pos["entry_px"]) / pos["entry_px"] * 10_000 <= -sl:
+                        book_exit(bars[i], pos["entry_px"] * (1 - sl / 10_000), "sl", True)
+                    elif tp > 0 and hi and (hi - pos["entry_px"]) / pos["entry_px"] * 10_000 >= tp:
+                        book_exit(bars[i], pos["entry_px"] * (1 + tp / 10_000), "tp", True)
+                else:
+                    hi = bars[i].get("ask_high")
+                    lo = bars[i].get("ask_low")
+                    if sl > 0 and hi and (pos["entry_px"] - hi) / pos["entry_px"] * 10_000 <= -sl:
+                        book_exit(bars[i], pos["entry_px"] * (1 + sl / 10_000), "sl", True)
+                    elif tp > 0 and lo and (pos["entry_px"] - lo) / pos["entry_px"] * 10_000 >= tp:
+                        book_exit(bars[i], pos["entry_px"] * (1 - tp / 10_000), "tp", True)
             if pos is not None and feats is not None:
                 done, reason = should_exit(
                     feats, side=pos["side"], entry_px=pos["entry_px"],
@@ -337,7 +348,6 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
                         book_exit(nxt, px, reason, exit_is_taker=True)
         i += 1
 
-    # summarize in the Crypto15mBacktest shape
     n = len(trades)
     wins = sum(1 for t in trades if t["won"])
     total = sum(t["pnlUsd"] for t in trades)
@@ -390,14 +400,8 @@ def backtest(cfg: dict, *, since_days: int = 14) -> dict:
     }
 
 
-# ───────── paper / live engine ───────────────────────────────────────────────
 
-_BAR_SEED_MIN = 90          # bars to seed from DB on start
-# Judged against local receipt (recv_ms), not Kalshi's wire ts_ms: the perps
-# ticker is coalesced and thin markets update their book slowly, so ts_ms lags
-# real time by 30-120s on a healthy stream. A tight window here read every such
-# quiet book as "stream offline". Bars still bucket on wire ts_ms below (that's
-# market-event time, correct); only the liveness gate uses recv_ms.
+_BAR_SEED_MIN = 90
 _QUOTE_FRESH_MS = 180_000
 
 
@@ -414,7 +418,7 @@ class _Engine:
         self._cur_bar: dict | None = None
         self.halted_day = ""
         self.halt_reason = ""
-        self.last_reason = ""       # why-not-entering surface for the UI
+        self.last_reason = ""
         self.last_error = ""
         self._seeded_symbol = ""
         self._fund_cache: list[tuple[int, float]] = []
@@ -434,7 +438,6 @@ class _Engine:
         self.halt_reason = reason
         logger.warning(f"perps_strategy: HALTED for the day — {reason}")
 
-    # ── live bar building ────────────────────────────────────────────
 
     def _seed_bars(self, symbol: str) -> None:
         import backtest as bt
@@ -499,7 +502,6 @@ class _Engine:
                 pass
         return self._fund_cache
 
-    # ── order helpers (live mode) ────────────────────────────────────
 
     async def _live_fill(self, cfg: dict, action: str, count_cc: int,
                          *, reduce_only: bool) -> float | None:
@@ -528,7 +530,6 @@ class _Engine:
             return None
         return avg / 1e6
 
-    # ── main tick ────────────────────────────────────────────────────
 
     async def tick(self, cfg: dict) -> None:
         try:
@@ -546,7 +547,6 @@ class _Engine:
         if self._seeded_symbol != symbol:
             self._seed_bars(symbol)
 
-        # daily loss halt (paper and live both respect it)
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with db.get_db() as conn:
             day_pnl = db.perp_strategy_day_pnl(conn, self.env, day)
@@ -607,7 +607,7 @@ class _Engine:
             if avg is None:
                 return
             entry_px = avg
-        fee_bps = FEES["today"]["taker"]  # honest booking at today's real fee
+        fee_bps = FEES["today"]["taker"]
         fee_micro = int(entry_px * contracts * fee_bps / 10_000 * 1e6)
         with db.get_db() as conn:
             db.open_perp_position(conn, {
@@ -665,7 +665,6 @@ class _Engine:
         if side == "short":
             move = -move
         fee_micro = int(exit_px * contracts * FEES["today"]["taker"] / 10_000 * 1e6)
-        # funding while held
         fund = self._funding_windows(self._symbol(cfg))
         opened_ts = int(datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M:%S")
                         .replace(tzinfo=timezone.utc).timestamp())

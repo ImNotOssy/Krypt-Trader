@@ -22,10 +22,7 @@ def test_size_above_max_edge_capped_by_hard_max(cfg):
 
 
 def test_size_interpolates_between_edges(cfg):
-    # sizing_max_edge default is 10 (the scorer's edge ceiling): edge 7.5 is the
-    # midpoint of [5, 10] -> midpoint of [2%, 6%] = 4% of $1000.
     assert trader._compute_position_usd(1000.0, 7.5, cfg) == pytest.approx(40.0)
-    # At/above the ceiling the max fraction applies (6% = $60, capped at $50).
     assert trader._compute_position_usd(1000.0, 12.5, cfg) == pytest.approx(50.0)
 
 
@@ -106,19 +103,16 @@ def test_should_trade_resolution_days_gate(cfg):
     base = {"ticker": "X", "price": 0.60, "confidence": 70.0,
             "taker_side": "yes", "category": "sports"}
 
-    # 0 = off: a far-out market still passes. (The DEFAULT is now 30 —
-    # long-dated markets silently freezing all 25 slots was a footgun.)
     cfg["max_resolution_days"] = 0
     assert trader.should_trade({**base, "close_time": _iso_in_days(120)}, "whale", cfg)[0] is True
 
     cfg["max_resolution_days"] = 30
     ok, reason = trader.should_trade({**base, "close_time": _iso_in_days(120)}, "whale", cfg)
-    assert ok is False and "resolves" in reason                       # ~120d > 30d -> blocked
-    assert trader.should_trade({**base, "close_time": _iso_in_days(10)}, "whale", cfg)[0] is True   # 10d < 30d
-    # Fail-open when the close time is missing/unparseable — don't wrongly block.
+    assert ok is False and "resolves" in reason
+    assert trader.should_trade({**base, "close_time": _iso_in_days(10)}, "whale", cfg)[0] is True
     assert trader.should_trade({**base, "close_time": ""}, "whale", cfg)[0] is True
     assert trader.should_trade({**base, "close_time": "garbage"}, "whale", cfg)[0] is True
-    assert trader.should_trade(base, "whale", cfg)[0] is True          # no close_time key at all
+    assert trader.should_trade(base, "whale", cfg)[0] is True
 
 
 def test_days_until_close_parses_and_fails_soft():
@@ -154,8 +148,7 @@ def test_should_trade_per_source_whale_category_blocks(cfg):
 
 def test_gambling_mode_hits_on_low_roll(cfg, monkeypatch):
     cfg["gambling_mode"] = True
-    monkeypatch.setattr(trader.random, "random", lambda: 0.05)  # < 0.10
-    # a signal every normal gate would reject (junk confidence, excluded category)
+    monkeypatch.setattr(trader.random, "random", lambda: 0.05)
     sig = {"ticker": "X", "price": 0.95, "confidence": 1.0,
            "taker_side": "yes", "category": "world"}
     ok, reason = trader.should_trade(sig, "whale", cfg)
@@ -164,7 +157,7 @@ def test_gambling_mode_hits_on_low_roll(cfg, monkeypatch):
 
 def test_gambling_mode_misses_on_high_roll(cfg, monkeypatch):
     cfg["gambling_mode"] = True
-    monkeypatch.setattr(trader.random, "random", lambda: 0.5)  # >= 0.10
+    monkeypatch.setattr(trader.random, "random", lambda: 0.5)
     sig = {"ticker": "X", "price": 0.60, "confidence": 99.0,
            "taker_side": "yes", "category": "sports"}
     ok, reason = trader.should_trade(sig, "whale", cfg)
@@ -185,24 +178,23 @@ def test_balance_fetch_not_poisoned_by_concurrent_cred_test(monkeypatch):
         kalshi_auth.set_env("production")
         released = asyncio.Event()
 
-        async def cred_test():  # mimics _h_testCredentials temporarily flipping env
+        async def cred_test():
             async with kalshi_auth.ENV_LOCK:
                 kalshi_auth.set_env("demo")
                 await released.wait()
                 kalshi_auth.set_env("production")
 
         t = asyncio.create_task(cred_test())
-        await asyncio.sleep(0)  # cred_test grabs the lock and flips env to demo
+        await asyncio.sleep(0)
         rb = asyncio.create_task(
             trader.refresh_balance(merge_with_defaults({}), force=True))
         await asyncio.sleep(0.05)
-        assert not rb.done()  # blocked on ENV_LOCK while env is temporarily demo
+        assert not rb.done()
         released.set()
         cents, _ = await rb
         await t
         return cents
 
-    # Must return the production balance (9999), never demo's 11.
     assert asyncio.run(scenario()) == 9999
 
 
@@ -355,18 +347,15 @@ def test_yes_payout_none_market_is_none():
     assert trader._market_yes_payout(None) is None
 
 
-# ───────── fee-aware edge gate + liquidity floor (Tier 2) ────────────────────
 
 
 def test_taker_fee_cents_shape():
-    assert trader._taker_fee_cents(50) == pytest.approx(1.75)   # max fee at 50c
+    assert trader._taker_fee_cents(50) == pytest.approx(1.75)
     assert trader._taker_fee_cents(85) == pytest.approx(0.8925)
     assert trader._taker_fee_cents(95) < trader._taker_fee_cents(50)
 
 
 def test_fee_aware_edge_gate_subtracts_taker_fee(cfg):
-    # 50c whale with 9pts of gross edge: the ~1.75c taker fee nets it to ~7.25,
-    # which must fail an 8pt gate. Legacy (gross) gating still passes it.
     sig = {"ticker": "X", "price": 0.50, "confidence": 59.0, "taker_side": "yes"}
     cfg["min_edge_pts_whale"] = 8.0
     ok, reason = trader.should_trade(sig, "whale", cfg)
@@ -381,19 +370,16 @@ def test_min_market_volume_floor_fails_open_on_unknown(cfg):
     ok, reason = trader.should_trade({**base, "market_volume": 40}, "whale", cfg)
     assert ok is False and "volume" in reason
     assert trader.should_trade({**base, "market_volume": 5000}, "whale", cfg)[0] is True
-    # Unknown volume (missing or 0) must fail OPEN, not block everything.
     assert trader.should_trade(base, "whale", cfg)[0] is True
     assert trader.should_trade({**base, "market_volume": 0}, "whale", cfg)[0] is True
 
 
 def test_should_trade_convergence_gates_on_edge_too(cfg):
-    # The convergence branch used to check confidence ONLY — the preset's
-    # min_edge_pts_whale was silently ignored for its own source.
     cfg["trade_convergence"] = True
     cfg["min_confidence_whale"] = 55.0
     cfg["min_edge_pts_whale"] = 4.0
     weak = {"ticker": "X", "price": 0.60, "confidence": 64.0, "direction": "yes"}
     ok, reason = trader.should_trade(weak, "convergence", cfg)
-    assert ok is False and "net edge" in reason        # gross 4 − 1.68 fee < 4
-    strong = {**weak, "confidence": 66.0}              # gross 6 − 1.68 ≥ 4
+    assert ok is False and "net edge" in reason
+    strong = {**weak, "confidence": 66.0}
     assert trader.should_trade(strong, "convergence", cfg)[0] is True

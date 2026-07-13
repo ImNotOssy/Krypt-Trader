@@ -40,13 +40,12 @@ import perps_ws as pws
 logger = logging.getLogger("perps_record")
 
 DEFAULT_SYMBOLS = ["KXBTCPERP", "KXETHPERP", "KXSOLPERP", "KXXRPPERP", "KXDOGEPERP"]
-# = spot_ws coverage, so every perp series has a Coinbase/BRTI-proxy twin.
 
 _last_rest = 0.0
 _last_est = 0.0
 _last_funding = 0.0
 _last_candles = 0.0
-_est_cache: dict[str, dict] = {}  # symbol -> latest funding estimate payload
+_est_cache: dict[str, dict] = {}
 _backfill_state: dict = {"running": False, "done": False, "progress": "", "error": None}
 
 
@@ -56,7 +55,7 @@ def _symbols(cfg: dict) -> list[str]:
     for s in syms:
         s = str(s or "").strip().upper()
         if s.startswith("KX") and "PERP" in s:
-            out.append(s.rstrip("1"))  # stored config is always prod symbols
+            out.append(s.rstrip("1"))
     return list(dict.fromkeys(out))[:16] or list(DEFAULT_SYMBOLS)
 
 
@@ -75,9 +74,6 @@ def ensure_ws(cfg: dict, env: str) -> None:
         if not pws.is_running():
             pws.start(env)
     elif pws.is_running():
-        # Toggled off — stop streaming; buffered rows are flushed on the next
-        # record_tick before the toggle gate stops calling us... which it
-        # won't. Flush synchronously-ish: drain to DB right here.
         try:
             _flush_ws()
         except Exception:
@@ -102,7 +98,7 @@ def _market_to_tick_row(m: dict, est: dict | None) -> dict:
     lmark = m.get("liquidation_mark_price") or {}
     row = {
         "ticker": m.get("ticker", ""),
-        "ts_ms": None,  # REST snapshot rows have no single wire event time
+        "ts_ms": None,
         "last_usd_micro": papi.usd_micro(m.get("price")),
         "bid_usd_micro": papi.usd_micro(m.get("bid")),
         "ask_usd_micro": papi.usd_micro(m.get("ask")),
@@ -119,7 +115,7 @@ def _market_to_tick_row(m: dict, est: dict | None) -> dict:
         "funding_rate": None,
         "next_funding_ms": None,
         "src": "rest",
-        "kalshi_env": "production",  # public REST always reads prod
+        "kalshi_env": "production",
     }
     if est:
         try:
@@ -179,7 +175,6 @@ def _funding_to_row(f: dict) -> dict | None:
 
 
 async def _funding_topup(cfg: dict) -> int:
-    # One unauthenticated call covers ALL markets; overlap is fine (OR IGNORE).
     with db.get_db() as conn:
         last = db.perp_last_funding_time(conn)
     start_ts = None
@@ -216,7 +211,6 @@ def _candle_to_row(ticker: str, period_min: int, c: dict) -> dict | None:
         "bid_low_usd_micro": u(bid.get("low")), "bid_close_usd_micro": u(bid.get("close")),
         "ask_open_usd_micro": u(ask.get("open")), "ask_high_usd_micro": u(ask.get("high")),
         "ask_low_usd_micro": u(ask.get("low")), "ask_close_usd_micro": u(ask.get("close")),
-        # trade OHLC/mean is NULL when no trades printed in the period
         "trade_open_usd_micro": u(px.get("open")), "trade_high_usd_micro": u(px.get("high")),
         "trade_low_usd_micro": u(px.get("low")), "trade_close_usd_micro": u(px.get("close")),
         "trade_mean_usd_micro": u(px.get("mean")),
@@ -233,8 +227,6 @@ async def _candles_topup(cfg: dict) -> int:
     for s in _symbols(cfg):
         with db.get_db() as conn:
             last = db.perp_last_candle_end_ts(conn, s, 1)
-        # Nothing stored yet → a short 6h seed window; backfill() owns the
-        # deep history so a cold topup doesn't hammer the API.
         start = (last + 60) if last else (now - 6 * 3600)
         if start > now:
             continue
@@ -326,7 +318,7 @@ async def backfill(cfg: dict) -> dict:
 
         _backfill_state["progress"] = "funding history"
         try:
-            rates = await papi.fetch_funding_rates_historical()  # full history, all markets
+            rates = await papi.fetch_funding_rates_historical()
             rows = [r for r in (_funding_to_row(f) for f in rates) if r]
             if rows:
                 with db.get_db() as conn:
@@ -335,7 +327,7 @@ async def backfill(cfg: dict) -> dict:
             errors.append(f"funding: {e}")
 
         _backfill_state.update(done=True, progress="done")
-    except Exception as e:  # belt-and-braces: state must never wedge "running"
+    except Exception as e:
         errors.append(str(e))
         _backfill_state["error"] = str(e)
     finally:
@@ -373,11 +365,11 @@ async def wallet(env: str) -> dict | None:
         bal = await papi.get_perps_balance()
     except Exception as e:
         logger.debug(f"perps wallet fetch failed: {e}")
-        return same_env_cache          # last-known, never a spurious zero
+        return same_env_cache
     subs = bal.get("subaccount_balances") if isinstance(bal, dict) else None
     sub0 = next((s for s in (subs or []) if int(s.get("subaccount") or 0) == 0), None)
     if sub0 is None:
-        return same_env_cache          # malformed — don't overwrite good data with nulls
+        return same_env_cache
 
     def d(x):
         return papi.micro_to_usd(papi.usd_micro(x))

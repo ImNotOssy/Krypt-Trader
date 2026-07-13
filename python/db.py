@@ -29,10 +29,6 @@ def get_db():
     conn = sqlite3.connect(str(db_path()), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    # NORMAL is durable-enough under WAL (a power cut can lose the last txn but
-    # never corrupts) and skips the per-commit fsync FULL forces — the trading
-    # loop opens/commits dozens of these per tick on the event-loop thread,
-    # each fsync stalling every coroutine 5-30ms.
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
@@ -340,6 +336,31 @@ CREATE TABLE IF NOT EXISTS crypto15m_ticks (
 CREATE INDEX IF NOT EXISTS idx_c15tick_ticker ON crypto15m_ticks(ticker, observed_at);
 CREATE INDEX IF NOT EXISTS idx_c15tick_time ON crypto15m_ticks(observed_at);
 
+-- crypto15m_ticks_hf: HIGH-FREQUENCY companion to crypto15m_ticks, sampled off
+-- the live WS state (kalshi_ws ticker + spot_ws/cf_ws) at up to ~5Hz and
+-- written on-change. Deliberately LEAN — just the book top + spot + precise
+-- timestamps — because it exists for ONE measurement: how much of the
+-- intra-window bid overshoot (the +24c/ct oracle ceiling that is unharvestable
+-- at the 4-25s REST cadence) returns as the exit sampling interval shrinks.
+-- Prices are INTEGER cents (1..99). Outcomes/strike join from crypto15m_signals
+-- on ticker. Off by default; its own short retention (_C15_HF_KEEP_DAYS).
+CREATE TABLE IF NOT EXISTS crypto15m_ticks_hf (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    recv_ms INTEGER NOT NULL,          -- local capture time, epoch ms (the study clock)
+    quote_ts_ms INTEGER,               -- Kalshi ticker wire ts_ms (lag diagnostics)
+    mins_left REAL,
+    yes_bid INTEGER,                   -- top-of-book, cents 1..99
+    yes_ask INTEGER,
+    spot REAL,                         -- underlying USD at capture
+    spot_ms INTEGER,                   -- spot sample time, epoch ms
+    spot_source TEXT,                  -- 'coinbase_ws' | 'cf_ws' | ...
+    kalshi_env TEXT DEFAULT 'production'
+);
+CREATE INDEX IF NOT EXISTS idx_c15hf_ticker ON crypto15m_ticks_hf(ticker, recv_ms);
+CREATE INDEX IF NOT EXISTS idx_c15hf_time ON crypto15m_ticks_hf(recv_ms);
+
 -- Kalshi perpetual futures (margin API) market data. Prices are INTEGER
 -- micro-dollars (1 = $0.000001; perp tick is $0.0001, wire allows 6dp) and
 -- counts INTEGER centi-contracts (1 = 0.01 contracts) — exact fixed-point,
@@ -560,7 +581,6 @@ def init_db() -> None:
             "ALTER TABLE crypto15m_ticks ADD COLUMN rsi REAL",
             "ALTER TABLE crypto15m_positions ADD COLUMN fees_usd REAL DEFAULT 0",
             "ALTER TABLE crypto15m_positions ADD COLUMN exit_fees_usd REAL DEFAULT 0",
-            # spot-vs-strike settlement model (detection-only recorded fields)
             "ALTER TABLE crypto15m_ticks ADD COLUMN strike REAL",
             "ALTER TABLE crypto15m_ticks ADD COLUMN delta_signed_pct REAL",
             "ALTER TABLE crypto15m_ticks ADD COLUMN sigma1m REAL",
@@ -569,16 +589,9 @@ def init_db() -> None:
             "ALTER TABLE crypto15m_signals ADD COLUMN strike REAL",
             "ALTER TABLE crypto15m_signals ADD COLUMN model_prob REAL",
             "ALTER TABLE crypto15m_signals ADD COLUMN edge_net_cents REAL",
-            # Final-minute settlement context — settle_prints gates the
-            # largest validated edge; spot_source says whether model_prob was
-            # computed off the exact CF settlement feed or a REST fallback.
-            # Without these, final-minute strategies can't be backtested and
-            # recorded model_prob can't be stratified by input quality.
             "ALTER TABLE crypto15m_ticks ADD COLUMN settle_prints INTEGER",
             "ALTER TABLE crypto15m_ticks ADD COLUMN no_ask REAL",
             "ALTER TABLE crypto15m_ticks ADD COLUMN spot_source TEXT",
-            # '' = directional (favorite/contrarian); 'pair' = complement-
-            # accumulation legs (no stop-loss/TP; hold to settlement).
             "ALTER TABLE crypto15m_positions ADD COLUMN strategy TEXT DEFAULT ''",
         ]:
             try:
@@ -588,8 +601,6 @@ def init_db() -> None:
 
 
 def factory_reset(*, wipe_markets: bool = False) -> dict:
-    # The research tables are irreplaceable evidence — snapshot them before
-    # the wipe so "reset" is never "destroy the dataset".
     backup_research()
     targets = [
         "bot_positions",
@@ -656,7 +667,7 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
         pass
 
     if errors:
-        summary["_errors"] = errors  # type: ignore[assignment]
+        summary["_errors"] = errors
     return summary
 
 
@@ -1161,10 +1172,6 @@ def log_event(
 
 
 def count_open_bot_positions(conn, env: str | None = None) -> int:
-    # Excludes signal_source='external' (positions imported from Kalshi, incl.
-    # 15m-crypto fills and manual trades) — the main engine's max_open_positions
-    # cap governs how many positions IT manages, so externals must not eat its
-    # slots. Dollar exposure is still capped separately by current exposure.
     sql = (
         "SELECT COUNT(*) FROM bot_positions "
         "WHERE status IN ('submitted','partial','filled') AND resolved=0 "
@@ -1196,19 +1203,6 @@ def get_market_quotes(conn, tickers) -> dict[str, dict]:
 
 
 def count_new_positions_today(conn, env: str | None = None, offset_min: int = 0) -> int:
-    # offset_min shifts the day boundary to the user's local day (matches the
-    # trading-hours gate); default 0 = UTC, unchanged.
-    #
-    # Count ONLY rows that actually became (or are still working toward) a real
-    # position — 'submitted'/'partial'/'filled', matching count_open_bot_positions.
-    # Terminal non-position rows ('canceled','error','gone','expired','dry_run')
-    # must NOT burn a daily slot: a run of unfilled maker auto-cancels or Kalshi
-    # order rejections would otherwise saturate max_daily_new_positions while zero
-    # contracts are actually held, silently halting all new entries until the day
-    # boundary ("runs for hours then stops trading, empty portfolio, full balance,
-    # works next day"). No resolved=0 filter here on purpose: a position opened
-    # AND resolved today keeps status='filled', so it still counts as taken-today,
-    # which is the cap's intent.
     mod = f"{int(offset_min):+d} minutes"
     sql = (
         "SELECT COUNT(*) FROM bot_positions "
@@ -1307,13 +1301,6 @@ def exists_position_in_market(
 
 
 def current_total_exposure_usd(conn, env: str) -> float:
-    # Count COMMITTED capital, not just settled cost. A resting/in-flight order
-    # (status submitted/partial) is inserted with cost_usd=0 and only gets a real
-    # cost on a later reconcile, so summing cost_usd alone undercounts exposure
-    # and lets a single scan cycle over-deploy past max_total_exposure_fraction.
-    # Value non-filled rows at their committed notional (target_contracts ×
-    # limit_price_cents); Kalshi holds the cash for these, so this is the real
-    # capital tied up in open positions.
     row = conn.execute(
         """SELECT COALESCE(SUM(
               CASE WHEN status='filled' THEN COALESCE(cost_usd, 0)
@@ -1394,7 +1381,6 @@ def _c15_matched_adjusted_cost(conn, env: str) -> float:
         fy, cy = sides.get("yes", (0, 0.0))
         fn, cn = sides.get("no", (0, 0.0))
         matched = min(fy, fn)
-        # Residual (unmatched) contracts stay valued at their average cost.
         total += (cy * (fy - matched) / fy if fy else 0.0)
         total += (cn * (fn - matched) / fn if fn else 0.0)
     return total
@@ -1410,11 +1396,6 @@ def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
 
 
 def get_pending_bot_positions(conn, env: str | None = None) -> list[dict]:
-    # env filter: the poll loop signs for the CURRENT env only — feeding it the
-    # other env's rows made every one of their live orders 404 six polls in a
-    # row and get killed as 'gone' the moment the user switched environments.
-    # Every other consumer (count/exposure/reconcile/resolve) is env-filtered;
-    # rows from the inactive env must simply freeze until that env is active.
     sql = """SELECT * FROM bot_positions
            WHERE resolved=0
              AND signal_source != 'external'
@@ -1706,10 +1687,8 @@ def crypto15m_signal_counts(conn) -> dict:
     }
 
 
-# 60, not 14: ticks+outcomes are the research dataset every strategy verdict
-# came from (sniper validated, pairs killed) — deleting them at 14 days
-# starves user backtests of sample.
 _C15_TICKS_KEEP_DAYS = 60
+_C15_HF_KEEP_DAYS = 7
 _PERP_TICKS_KEEP_DAYS = 30
 _PERP_CANDLES_KEEP_DAYS = 365
 
@@ -1735,6 +1714,34 @@ def insert_crypto15m_tick(conn, row: dict) -> None:
             row.get("kalshi_env", "demo"),
         ),
     )
+
+
+def insert_crypto15m_hf_ticks(conn, rows: list[dict]) -> int:
+    """Batch-insert high-frequency book+spot samples. One executemany keeps the
+    5Hz recorder off the per-row connection churn. Returns the count written."""
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO crypto15m_ticks_hf (
+              ticker, asset, recv_ms, quote_ts_ms, mins_left,
+              yes_bid, yes_ask, spot, spot_ms, spot_source, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            (
+                r["ticker"], r["asset"], int(r["recv_ms"]),
+                r.get("quote_ts_ms"), r.get("mins_left"),
+                r.get("yes_bid"), r.get("yes_ask"),
+                r.get("spot"), r.get("spot_ms"), r.get("spot_source"),
+                r.get("kalshi_env", "production"),
+            )
+            for r in rows
+        ],
+    )
+    return len(rows)
+
+
+def crypto15m_hf_tick_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM crypto15m_ticks_hf").fetchone()[0])
 
 
 def crypto15m_strategy_stats(conn, env: str) -> list[dict]:
@@ -1771,10 +1778,6 @@ def crypto15m_tick_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0])
 
 
-# ───────── perps (margin) market-data recording ─────────────────────────────
-# Rows arrive pre-converted to integer micro-dollars / centi-contracts
-# (kalshi_perps_api.usd_micro / cc at the wire boundary). Helpers take `conn`;
-# callers own the transaction — the recorder batches one txn per flush.
 
 _PERP_TICK_COLS = (
     "ticker", "ts_ms", "last_usd_micro", "bid_usd_micro", "ask_usd_micro",
@@ -1791,9 +1794,6 @@ def insert_perp_ticks(conn, rows: list[dict]) -> int:
         f"INSERT INTO perp_ticks ({','.join(_PERP_TICK_COLS)}) "
         f"VALUES ({','.join('?' * len(_PERP_TICK_COLS))})"
     )
-    # kalshi_env is written explicitly on every row — never rely on the DDL
-    # default (c15 tables default 'demo', perps 'production'; a missed field
-    # would silently mislabel the env).
     conn.executemany(sql, [
         tuple(r.get(c) for c in _PERP_TICK_COLS) for r in rows
     ])
@@ -1848,7 +1848,6 @@ def upsert_perp_candles(conn, rows: list[dict]) -> int:
 def upsert_perp_funding(conn, rows: list[dict]) -> int:
     if not rows:
         return 0
-    # Finalized rates never change → OR IGNORE keeps re-fetch idempotent.
     cur = conn.executemany(
         """INSERT OR IGNORE INTO perp_funding
               (ticker, funding_time, funding_rate, mark_usd_micro, kalshi_env)
@@ -2112,7 +2111,6 @@ def set_risk_breach_start(
 
 
 def earliest_pnl_total(conn, env: str) -> float | None:
-    # Ignore any $0/unknown-balance rows so they can never become a baseline.
     row = conn.execute(
         """SELECT total_usd FROM pnl_snapshots
            WHERE kalshi_env = ? AND total_usd > 0
@@ -2128,12 +2126,6 @@ def earliest_pnl_total(conn, env: str) -> float | None:
 
 
 def first_snapshot_of_today(conn, env: str, offset_min: int = 0) -> dict | None:
-    # Ignore any $0/unknown-balance rows so they can never become today's baseline.
-    # offset_min shifts the day boundary to the user's local day (default 0 = UTC).
-    # The day-start boundary is computed in Python so the predicate is a
-    # SARGABLE range (`at >= ?`) served by idx_pnl_env_at — the old
-    # `date(at, ?) = date('now', ?)` form full-scanned + temp-sorted the
-    # whole snapshot history on every daily-risk check and account build.
     now_local = datetime.utcnow() + timedelta(minutes=int(offset_min))
     day_start_utc = (
         datetime(now_local.year, now_local.month, now_local.day)
@@ -2254,10 +2246,6 @@ def get_pnl_snapshots(
     conn, *, since_hours: int = 168, env: str | None = None,
     max_points: int = 2000,
 ) -> list[dict]:
-    # Sargable predicate: the old per-row julianday() arithmetic could never
-    # use idx_pnl_at — a full table scan (hundreds of thousands of rows after
-    # weeks of 24/7 snapshots) on the event-loop thread, every 30s, for every
-    # dashboard pull.
     since_hours = max(1, min(int(since_hours), 24 * 365))
     sql = "SELECT * FROM pnl_snapshots WHERE at >= datetime('now', ?)"
     args: list = [f"-{since_hours} hours"]
@@ -2266,11 +2254,8 @@ def get_pnl_snapshots(
         args.append(env)
     sql += " ORDER BY at ASC"
     rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
-    # Downsample by stride to a renderable series — a 7-day window of 15s
-    # snapshots is ~40k points, i.e. ~5MB of JSON over stdio into a chart that
-    # can't show more than a few thousand anyway. Keep the newest point exact.
     if max_points and len(rows) > max_points:
-        stride = -(-len(rows) // max_points)  # ceil
+        stride = -(-len(rows) // max_points)
         sampled = rows[::stride]
         if sampled[-1] is not rows[-1]:
             sampled.append(rows[-1])
@@ -2290,8 +2275,6 @@ def recent_balance_transition(conn, env: str, within_sec: int = 180) -> bool:
     matches the measured worst settlement-payout gap (~130s observed) and
     the daily-risk persistence window (180s)."""
     args = (env, f"-{int(within_sec)} seconds", f"-{int(within_sec)} seconds")
-    # bot_positions has no dry_run column; crypto15m_positions does (its
-    # dry-run rows never move real money, so they must not flag syncing).
     for table, extra in (("bot_positions", ""),
                          ("crypto15m_positions", "AND dry_run = 0")):
         row = conn.execute(
@@ -2391,13 +2374,11 @@ def cleanup_old_data(
     deleted += _delete_batched("created_time < ?", (trade_cutoff,), "trades")
     deleted += _delete_batched("snapshot_at < ?", (snap_cutoff,), "market_snapshots")
     deleted += _delete_batched("observed_at < ?", (ticks_cutoff,), "crypto15m_ticks")
-    # Perps recording: ticks/trades are the bulky raw series (5 symbols @1Hz ≈
-    # 430k rows/day); candles+funding are the compact long-horizon record —
-    # candles kept a year, funding never pruned (13 tickers × 3 rows/day).
+    hf_cutoff_ms = int((now - timedelta(days=_C15_HF_KEEP_DAYS)).timestamp() * 1000)
+    deleted += _delete_batched("recv_ms < ?", (hf_cutoff_ms,), "crypto15m_ticks_hf")
     deleted += _delete_batched("observed_at < ?", (perp_tick_cutoff,), "perp_ticks")
     deleted += _delete_batched("observed_at < ?", (perp_tick_cutoff,), "perp_trades")
     deleted += _delete_batched("end_ts < ?", (perp_candle_cutoff_epoch,), "perp_candles")
-    # order_events + resolved 15m signals were never swept → unbounded growth.
     deleted += _delete_batched("created_at < ?", (event_cutoff,), "order_events")
     deleted += _delete_batched(
         "resolved = 1 AND observed_at < ?", (c15sig_cutoff,), "crypto15m_signals")
@@ -2414,27 +2395,18 @@ def cleanup_old_data(
         deleted += c.execute(
             "DELETE FROM whale_trades WHERE resolved = 1 AND created_at < ?", (alert_cutoff,)
         ).rowcount or 0
-        # UNRESOLVED alerts/whales must age out too: the resolvers only look
-        # back 30 days, so a signal on a delisted/never-settling market stays
-        # resolved=0 FOREVER — permanent growth the resolved-only sweep missed.
         deleted += c.execute(
             "DELETE FROM alerts WHERE resolved = 0 AND created_at < ?", (alert_cutoff,)
         ).rowcount or 0
         deleted += c.execute(
             "DELETE FROM whale_trades WHERE resolved = 0 AND created_at < ?", (alert_cutoff,)
         ).rowcount or 0
-        # Keep one ANCHOR row per env — the first-ever positive-total
-        # snapshot. earliest_pnl_total() is the all-time P&L/ROI baseline;
-        # pruning it silently re-baselined "all-time" to a trailing
-        # 45-day window every maintenance pass.
         deleted += c.execute(
             """DELETE FROM pnl_snapshots WHERE at < ?
                AND id NOT IN (SELECT MIN(id) FROM pnl_snapshots
                               WHERE total_usd > 0 GROUP BY kalshi_env)""",
             (pnl_cutoff,),
         ).rowcount or 0
-        # events had NO pruning rule at all (sync_events upserts every 10 min
-        # forever); anything not touched in `event_days` is long closed.
         deleted += c.execute(
             "DELETE FROM events WHERE last_updated < ?", (event_cutoff,)
         ).rowcount or 0
@@ -2474,14 +2446,13 @@ def backup_research(keep: int = 7) -> str | None:
         stamp = datetime.utcnow().strftime("%Y%m%d")
         dest = os.path.join(bdir, f"research-{stamp}.db")
         if os.path.exists(dest):
-            return dest  # already taken today
+            return dest
         with get_db() as conn:
             out = sqlite3.connect(dest)
             try:
                 conn.backup(out)
             finally:
                 out.close()
-        # rotate: keep the newest `keep`
         snaps = sorted(
             f for f in os.listdir(bdir)
             if f.startswith("research-") and f.endswith(".db")

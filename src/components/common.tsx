@@ -300,11 +300,7 @@ export function useOptimisticValue<T>(
   onCommit: (next: T) => void | Promise<void>,
 ): [T, (next: T) => void] {
   const [local, setLocal] = useState<T>(value);
-  // Keyed on the serialized value, not `value` itself: arrays/objects get a
-  // fresh reference every render, which would clobber an in-flight optimistic
-  // edit on each render. Only a real external change should re-seed.
   const key = JSON.stringify(value ?? null);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { setLocal(value); }, [key]);
   const apply = (next: T): void => {
     setLocal(next);
@@ -325,9 +321,6 @@ export function NumberInput({
   prefix?: string;
   disabled?: boolean;
 }) {
-  // Local text buffer committed on blur/Enter (type=text so a trailing "0." or
-  // "-" survives mid-type) — a controlled type=number bound to round-tripped
-  // config snapped values back on every keystroke, making decimals un-typeable.
   const [text, setText] = useState(String(Number.isFinite(value) ? value : 0));
   useEffect(() => { setText(String(Number.isFinite(value) ? value : 0)); }, [value]);
   const commit = (): void => {

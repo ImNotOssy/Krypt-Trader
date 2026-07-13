@@ -22,12 +22,10 @@ def test_v2_fields_yes_sell():
 
 
 def test_v2_fields_no_buy_mirrors_to_yes_ask():
-    # buy NO @ 94c  ==  sell YES @ 6c
     assert kalshi_api._v2_order_fields("no", "buy", 94) == ("ask", "0.0600")
 
 
 def test_v2_fields_no_sell_mirrors_to_yes_bid():
-    # sell NO @ 30c  ==  buy YES @ 70c
     assert kalshi_api._v2_order_fields("no", "sell", 30) == ("bid", "0.7000")
 
 
@@ -51,9 +49,9 @@ def test_place_limit_order_posts_v2_events_path(monkeypatch):
     assert captured["json"] == {
         "ticker": "KXBTC15M-T1",
         "client_order_id": "cid-1",
-        "side": "ask",       # buy NO -> ask on the YES book
+        "side": "ask",
         "count": "5.00",
-        "price": "0.0600",   # 1 - 0.94
+        "price": "0.0600",
         "time_in_force": "good_till_canceled",
         "self_trade_prevention_type": "taker_at_cross",
     }
@@ -107,18 +105,13 @@ def test_place_limit_order_rejects_bad_inputs():
         raise AssertionError(f"expected ValueError for {bad}")
 
 
-# ───────── /portfolio/positions pagination must signal truncation ─────────
-# A silent break at the page cap made everything past the cut look "no longer
-# held" — reconcile then orphan-closed real positions off the partial list,
-# and the cut is PERSISTENT (same account state → same truncation), so no
-# consecutive-miss debounce could save them.
 
 
 def test_get_positions_raises_on_page_cap(monkeypatch):
     async def fake_signed(method, path, *, json=None, params=None, **kw):
         return {
             "market_positions": [{"ticker": "T", "position": 1}],
-            "cursor": "more",  # never exhausts
+            "cursor": "more",
         }
 
     monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)

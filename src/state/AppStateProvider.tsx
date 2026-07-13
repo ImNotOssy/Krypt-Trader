@@ -38,8 +38,6 @@ export function useApp(): AppStateApi {
   return ctx;
 }
 
-// Logs stream frequently; keeping them in their own context means a new log line
-// only re-renders log consumers (the Logs page), not the whole app via useApp().
 const LogsCtx = createContext<LogEntry[]>([]);
 
 export function useLogs(): LogEntry[] {
@@ -59,7 +57,6 @@ const DEFAULT_BACKEND: BackendInfo = {
  * Notification permission by default; failures are silently ignored. */
 function notify(title: string, body: string): void {
   try {
-    // eslint-disable-next-line no-new
     new Notification(title, { body, silent: true });
   } catch { /* headless / permission denied — never break state flow */ }
 }
@@ -203,8 +200,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     const offBackend = window.krypt.backend.onInfo((b) => setBackend(b));
     const offAccount = window.krypt.data.onAccount((a) => setAccount(a));
     const offPos = window.krypt.data.onPosition((p) => {
-      // Money-moment notifications: diff status transitions so fills,
-      // stop-outs and settlements surface without staring at a table.
       const prev = positionsByIdRef.current.get(p.id);
       if (prev && prev.status !== p.status) {
         const name = p.title || p.ticker;

@@ -39,7 +39,7 @@ def asset_enabled(cfg: dict, asset: str) -> bool:
     raw = (cfg or {}).get("crypto15m_assets")
     if isinstance(raw, list):
         return asset.upper() in {str(a).upper() for a in raw}
-    return True  # None / unset → all enabled
+    return True
 
 _DEFAULTS: dict[str, float] = {
     "time_delay_min": 8.0,
@@ -186,13 +186,6 @@ _SPOT_SOURCES = [
 
 
 async def fetch_spots() -> tuple[dict[str, float], str]:
-    # Spot priority chain, best-first overlay:
-    #   1. cf_ws  — Kalshi's own CF Benchmarks value feed: the EXACT index the
-    #      markets settle on, pushed ~1/sec over the authed socket.
-    #   2. spot_ws — Coinbase (a BRTI constituent) as the keyless proxy.
-    #   3. REST chain (CryptoCompare → Coinbase → CoinGecko) for whatever the
-    #      sockets don't cover and whenever they're down.
-    # Strict accelerator: never worse than pure REST.
     cf = cf_ws.fresh_spots()
     cb = spot_ws.fresh_spots()
 
@@ -229,21 +222,9 @@ async def fetch_spots() -> tuple[dict[str, float], str]:
     return merged, "+".join(parts) if parts else source
 
 
-# ───────── underlying technical indicators (detection-only) ───────────
-#
-# MACD/RSI on the underlying's 1-minute closes, surfaced as OPTIONAL rule
-# fields + logged by the recorder so backtest.py can measure whether they add
-# edge before they ever gate a trade. Candles come from Hyperliquid's public
-# `candleSnapshot` (keyless, US-reachable, and it lists every asset we track
-# incl. HYPE/BNB). One POST per asset, cached ~60s (candles are 1-minute, so
-# polling faster only spends rate limit). Fully degradable: any failure leaves
-# the indicator fields None, like a missing market.
 _HYPERLIQUID_URL = "https://api.hyperliquid.xyz/info"
-# Minutes of 1-min history to pull — enough warm-up for a stable MACD signal
-# line (slow 26 + signal 9 = 35) with comfortable headroom.
 _INDICATOR_LOOKBACK_MIN = 90
 _INDICATOR_CACHE_TTL = 60.0
-# asset -> {"at": loop_time, "data": {macdHist, macdCross, rsi, ...}}
 _indicator_cache: dict[str, dict] = {}
 
 
@@ -292,8 +273,6 @@ async def asset_indicators(asset: str) -> dict:
         return data
     except Exception as e:
         logger.debug(f"crypto15m indicators {asset} failed: {e}")
-        # Don't blank MACD/RSI rule fields for a full 60s on a transient fetch
-        # failure — keep the last good bundle (if any) and retry sooner.
         data = cached["data"] if cached else indicators.compute([])
         _indicator_cache[asset] = {"at": now, "data": data, "ttl": 10.0}
         return data
@@ -307,26 +286,17 @@ def _blank_asset(entry: dict, spot: Optional[float], error: Optional[str] = None
         "upProb": None, "downProb": None, "favorite": None,
         "favoritePrice": None, "entryCost": None, "yesBid": None, "yesAsk": None,
         "inWindow": False, "signal": False, "openMarketCount": 0, "error": error,
-        # timing + cross-asset correlation (filled in by snapshot()); exposed as
-        # optional rule-builder fields, never forced gates.
         "hourUtc": None, "peersAgree": None, "marketBias": None,
-        # Up + Down ≠ $1 arbitrage (market-neutral edge), detection-only.
         "upAsk": None, "downAsk": None, "arbEdgeCents": None, "arbSignal": None,
-        # underlying technical indicators (detection-only, optional rule fields).
         "macd": None, "macdSignal": None, "macdHist": None,
         "macdCross": None, "rsi": None,
-        # spot-vs-strike settlement model (detection-only rule fields).
         "strikeUsd": None, "deltaSignedPct": None, "sigma1m": None,
         "modelProb": None, "edgeNetCents": None,
-        # prints of the final-minute settlement average already observed via
-        # the Coinbase WS sampler (0 outside the final minute / feed cold).
         "settlePrints": 0,
     }
 
 
 def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
-    # Explicit per-hour allowlist wins over the start/end window when present
-    # (None = use the window; a list = trade ONLY those UTC hours, empty = never).
     hrs = (cfg or {}).get("crypto15m_hours")
     if isinstance(hrs, list):
         if hour is None:
@@ -383,21 +353,14 @@ def model_up_prob(
         return None
     if spot <= 0 or strike <= 0 or sigma_1m <= 0:
         return None
-    t = max(0.05, float(mins_left))  # floor: at 3s left a 0-σ window divides by 0
+    t = max(0.05, float(mins_left))
     sd_abs = sigma_1m * math.sqrt(t) * spot
     if sd_abs <= 0:
         return None
     return max(0.0, min(1.0, _norm_cdf((spot - strike) / sd_abs)))
 
 
-# Kalshi settlement = the average of ~one print per second over the final
-# minute (CF Benchmarks Real-Time Index). 60 prints, fixed.
 _SETTLE_PRINTS = 60
-# Variance of the mean of a 60-print random walk, in "equivalent minutes" of
-# terminal diffusion: Σ_{i,j≤n} min(i,j) = n(n+1)(2n+1)/6 seconds² → for n=60,
-# (60·61·121/6)/60²/60 ≈ 0.342 min. The averaging makes settlement ~3× less
-# variable than the final-minute endpoint — a terminal model systematically
-# UNDERprices deep favorites near the close.
 _SETTLE_AVG_EQUIV_MIN = (60 * 61 * 121 / 6) / (60.0 ** 2) / 60.0
 
 
@@ -437,8 +400,6 @@ def settlement_up_prob(
     k = max(0, min(int(partial_count or 0), elapsed))
     s = float(partial_sum or 0.0) if k > 0 else 0.0
     if k > 0 and partial_count and k < int(partial_count):
-        # Clock skew put more observed prints than elapsed seconds — scale the
-        # sum down to the k we can attribute.
         s = s * (k / float(partial_count))
     missing = elapsed - k
     mean = (s + (missing + n_future) * spot) / float(_SETTLE_PRINTS)
@@ -523,11 +484,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
     candidates.sort(key=lambda x: x[0])
     close_epoch, m = candidates[0]
 
-    # Overlay the live WS ticker quote when it's fresher than the REST list
-    # response (the loop subscribes every ACTIVE window ticker, so entry and
-    # pairs decisions read real-time prices instead of the snapshot cache's
-    # 0-7s-stale ones). On Kalshi's complementary book the NO ask is exactly
-    # 100c − yes_bid, so the overlay covers both sides.
     wsq = kalshi_ws.ticker_quote(m.get("ticker") or "")
     if wsq:
         ts_ms = float(wsq.get("ts_ms") or 0)
@@ -545,10 +501,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
 
     window_start = int(close_epoch - _QUARTER_SEC)
     open15m = _track_window_open(asset, window_start, spot)
-    # Reference level: Kalshi's actual strike when the market carries it (it
-    # does for the up/down series); the self-tracked window-open spot is only
-    # the fallback — it can be a pre-window price up to ~14s stale and is wrong
-    # for any window observed first mid-way (e.g. right after an app start).
     strike = _market_strike(m)
     ref = strike if strike is not None else open15m
     delta_signed = ((spot - ref) / ref) if (ref and spot is not None) else None
@@ -568,25 +520,9 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
 
     mins_left = (close_epoch - now_epoch) / 60.0
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
-    # HARD floor on new entries: Kalshi's final 60s IS the settlement sampling
-    # window (the 60-print average is being computed), and binary gamma is at
-    # its maximum — a favorite bought at 89c with 37s left can settle at 0
-    # (real trade #250: −$7.12, the session's biggest loss). No signal fires
-    # inside the final minute regardless of the entry-window setting.
     in_window = 1.0 <= mins_left <= _const(cfg, "time_delay_min")
-    # Strict threshold (default ON): entry_threshold is a HARD floor on the
-    # price actually paid (the executable ask of the favorite side), not just
-    # the mid-derived probability. On thin/one-sided books the mid can call an
-    # 85c favorite while the real ask is way below (e.g. a 71c NO) — the
-    # favorite isn't actually that strong, so no signal. Also requires a
-    # two-sided book: a mid built from one quote or last_price is exactly the
-    # degenerate snapshot that produces those phantom favorites.
     strict = bool(cfg.get("crypto15m_strict_threshold", True))
     two_sided = bool(yes_bid and yes_ask)
-    # min_delta_pct is direction-AWARE when the signed move is known: the
-    # underlying must have moved toward the favorite by ≥ the gate, not merely
-    # moved (an adverse move used to satisfy the old abs() check — buying the
-    # favorite precisely as the spot ran against it).
     min_dp = _const(cfg, "min_delta_pct")
     if delta_signed is None or min_dp <= 0:
         delta_ok = True
@@ -618,15 +554,9 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         "inWindow": in_window, "signal": signal, "hourUtc": hour_utc,
     })
 
-    # Both sides' asks are always exposed — the pairs engine and rule builder
-    # need them regardless of the arb detector toggle.
     out["upAsk"] = round(yes_ask, 4) if yes_ask else None
     out["downAsk"] = round(no_ask, 4) if no_ask else None
 
-    # Up + Down ≠ $1 arbitrage detection (market-neutral edge). Detection only.
-    # On Kalshi a single binary market carries both sides, so if yes_ask + no_ask
-    # sums below $1 you could buy both for a locked profit — computed for free
-    # from the quotes we already have (no extra API call).
     if cfg.get("crypto15m_arb_detect", True) and yes_ask and no_ask:
         thresh = float(cfg.get("crypto15m_arb_min_edge_cents", 1.0) or 0.0)
         up_ask_c = round(yes_ask * 100.0, 1)
@@ -635,10 +565,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         out["arbEdgeCents"] = edge_c
         out["arbSignal"] = edge_c >= thresh
 
-    # Underlying MACD/RSI (record → rule field; does NOT drive entries unless a
-    # user composes a rule on macdHist/macdCross/rsi). Cached ~60s per asset.
-    # Hard-cap the (non-critical) fetch so a slow Hyperliquid call can't blow the
-    # whole asset-snapshot budget; degrades to all-None and retries next pass.
     if cfg.get("crypto15m_indicator_detect", True):
         try:
             ind = await asyncio.wait_for(asset_indicators(asset), 4.0)
@@ -650,14 +576,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         out["macdCross"] = ind.get("macdCross")
         out["rsi"] = ind.get("rsi")
         out["sigma1m"] = ind.get("sigma1m")
-        # Spot-vs-strike settlement model (detection-only): P(up) under
-        # Kalshi's real settlement rule (60s BRTI average). Inside the final
-        # minute the Coinbase WS sampler supplies the prints already realized,
-        # so the probability sharpens second by second while the market quote
-        # lags. Recorded by the tick logger + exposed to the rule builder so
-        # users can gate on `edgeNetCents >= X` once their data supports it.
-        # Realized settlement prints: prefer Kalshi's own final-minute average
-        # (the exact number, with its print count) over the Coinbase sampler.
         psum, pcount = cf_ws.settle_partial(asset, close_epoch)
         if pcount == 0:
             psum, pcount = spot_ws.window_partial(asset, close_epoch)
@@ -715,6 +633,24 @@ def active_tickers() -> set[str]:
         a["ticker"] for a in snap.get("assets", [])
         if a.get("hasMarket") and a.get("ticker")
     }
+
+
+def active_market_meta() -> list[dict]:
+    """Per-ticker metadata for the CURRENT 15m window from the last snapshot —
+    what the HF recorder needs to stamp each sample without re-fetching:
+    {ticker, asset, closeTime, minsLeft, strikeUsd, favorite}. Reads the same
+    ~3s snapshot cache active_tickers() does."""
+    snap = _snapshot_cache.get("data") or {}
+    out = []
+    for a in snap.get("assets", []):
+        if not (a.get("hasMarket") and a.get("ticker")):
+            continue
+        out.append({
+            "ticker": a["ticker"], "asset": a.get("asset"),
+            "closeTime": a.get("closeTime"), "minsLeft": a.get("minsLeft"),
+            "strikeUsd": a.get("strikeUsd"), "favorite": a.get("favorite"),
+        })
+    return out
 
 
 async def snapshot(cfg: dict) -> dict:

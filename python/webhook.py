@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os as _os
 
-# Stamped into leaderboard/stats payloads so krypt.cc can key results by build.
 APP_VERSION = _os.environ.get("KRYPT_APP_VERSION", "")
 
 import asyncio
@@ -15,9 +14,6 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Webhooks may be set by importing a shared profile, so only allow https POSTs to
-# real Discord webhook hosts. A fixed allowlist also blocks SSRF to internal /
-# loopback targets (they can never match) and exfiltration to an attacker host.
 _ALLOWED_WEBHOOK_HOSTS = frozenset({
     "discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com",
 })
@@ -347,8 +343,6 @@ async def send_stats(url: str, snap: dict, env: str) -> None:
         return
     payload = {
         "username": "Krypt Trader · Stats",
-        # Machine-readable version for the krypt.cc leaderboard — lets it key
-        # results by build and nudge users off releases with known bugs.
         "appVersion": APP_VERSION,
         "embeds": [stats_embed(snap, env)],
     }

@@ -91,7 +91,6 @@ export function BacktestPage() {
       const is15m = k.startsWith('crypto15m');
       if ((kind === 'crypto15m') === is15m) out[k] = v;
     }
-    // Never let a replayed profile arm anything.
     delete out.enableTrading;
     delete out.crypto15mLive;
     return out as Partial<TraderConfig>;

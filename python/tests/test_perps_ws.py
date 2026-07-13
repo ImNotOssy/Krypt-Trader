@@ -60,7 +60,6 @@ def test_ticker_parsed_to_micro_units(client):
     assert r["ts_ms"] == 1783295841500
     assert r["src"] == "ws"
     assert r["kalshi_env"] == "production"
-    # drain is exactly-once
     assert client.drain_ticks() == []
 
 
@@ -98,12 +97,12 @@ def test_trade_parsed_and_taker_side_verbatim(client):
     r = rows[0]
     assert r["price_usd_micro"] == 6_352_100
     assert r["count_cc"] == 500
-    assert r["taker_side"] == "bid"  # NEVER mapped to yes/no
+    assert r["taker_side"] == "bid"
     assert client.drain_trades() == []
 
 
 def test_malformed_frames_dropped_silently(client):
-    client._handle({"type": "ticker", "msg": {}})              # no ticker
+    client._handle({"type": "ticker", "msg": {}})
     client._handle({"type": "trade", "msg": {"market_ticker": "X",
                                              "price": "junk", "count": "1.00"}})
     client._handle({"type": "unknown_type", "msg": {"x": 1}})
@@ -120,13 +119,11 @@ def test_quote_cache_latest_wins(client):
 
 
 def test_subscribe_ack_nak_bookkeeping(client):
-    # simulate an in-flight subscribe reservation
     client._chan_sids["ticker"] = -1
     client._inflight[7] = ("chan", "ticker")
     client._handle({"type": "subscribed", "id": 7, "msg": {"channel": "ticker", "sid": 42}})
     assert client._chan_sids["ticker"] == 42
 
-    # NAK must release the reservation so reconcile retries
     client._chan_sids["trade"] = -1
     client._inflight[8] = ("chan", "trade")
     client._handle({"type": "error", "id": 8, "msg": {"code": 6, "msg": "nope"}})
@@ -140,8 +137,6 @@ def test_reconnect_clears_subs_keeps_buffers(client):
     client._reset_sub_state()
     assert client._chan_sids == {}
     assert client._inflight == {}
-    # rows recorded before the reconnect are still drainable — they are
-    # write-once records, not caches
     assert len(client.drain_ticks()) == 1
 
 
@@ -152,7 +147,6 @@ def test_buffer_cap_drops_oldest(client, monkeypatch):
     rows = client.drain_ticks()
     assert len(rows) <= 50
     assert client.dropped_ticks > 0
-    # newest survive
     assert rows[-1]["ts_ms"] == 59
 
 

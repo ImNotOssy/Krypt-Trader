@@ -333,15 +333,6 @@ def load_crypto15m_signals(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
-# ───────── perps (margin) dataset loaders ────────────────────────────────────
-# Read-only over the perp_* tables (raw sqlite3 conn like every loader here —
-# the CLI stays usable on any DB copy). DB stores exact integer micro-dollars /
-# centi-contracts; loaders hand research code floats (USD / contracts).
-#
-# Do NOT route perps P&L through summarize(): it hard-codes binary
-# settle-to-$1 economics and the 0.07·p·(1−p) fee curve. Perps fees are
-# bps-of-notional (tier 0: 12 taker / 5 maker) plus funding cash flows — any
-# perps sim must model those itself.
 
 def _perp_f(v) -> Optional[float]:
     return None if v is None else v / 1_000_000
@@ -441,8 +432,6 @@ def load_perp_candles(
             "ask_high": _perp_f(r["ask_high_usd_micro"]),
             "ask_low": _perp_f(r["ask_low_usd_micro"]),
             "ask_close": _perp_f(r["ask_close_usd_micro"]),
-            # trade OHLC/mean are None for no-trade periods — quote OHLC is
-            # the always-present series.
             "open": _perp_f(r["trade_open_usd_micro"]),
             "high": _perp_f(r["trade_high_usd_micro"]),
             "low": _perp_f(r["trade_low_usd_micro"]),
@@ -497,7 +486,6 @@ def perp_dataset_summary(conn: sqlite3.Connection, env: str = "production") -> d
             (t, env),
         ).fetchone()
         n, first, last = int(row[0]), row[1], row[2]
-        # Median gap between consecutive WS ticks (sampled, cheap).
         gaps = [r[0] for r in conn.execute(
             """SELECT ts_ms - LAG(ts_ms) OVER (ORDER BY ts_ms) AS gap
                FROM (SELECT ts_ms FROM perp_ticks
@@ -543,9 +531,6 @@ def crypto15m_eval(
             cost = s["entry_cost"]
             correct = s["fav_won"]
         built.append({"cost": cost, "correct": correct, "confidence": fp * 100.0})
-    # contracts=1 models the shipped 15m default (1-lot orders), where Kalshi's
-    # per-order round-UP dominates: at 95c the real fee is 1c/contract, 3× the
-    # continuous rate — the difference between a "+2.8c edge" and reality.
     return summarize(built, fee_coeff, contracts=1)
 
 

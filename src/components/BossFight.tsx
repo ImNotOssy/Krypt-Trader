@@ -3,7 +3,6 @@ import { X, Swords } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import spriteUrl from '../assets/mossy.png';
 
-// ── Boss ladder: profit milestones, fought one at a time. ──
 const MIL = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 const NAMES = [
   'Slimeling', 'Gnawbat', 'Penny Wraith', 'Bench Golem', 'Margin Imp',
@@ -119,7 +118,6 @@ function drawScene(ctx: CanvasRenderingContext2D, w: number, h: number, sprite: 
   const mid = (x0 + x1) / 2, col = COLORS[g.idx];
   const by = h * 0.82, bh = h * 0.1;
   if (compact) {
-    // widget: big readable label fills the centre (the widget has no DOM text)
     ctx.textAlign = 'center';
     ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = h * 0.06; ctx.fillStyle = '#fff';
     ctx.font = `700 ${Math.round(h * 0.36)}px "Chakra Petch", sans-serif`;
@@ -129,7 +127,6 @@ function drawScene(ctx: CanvasRenderingContext2D, w: number, h: number, sprite: 
     ctx.font = `600 ${Math.round(h * 0.16)}px "Chakra Petch", sans-serif`;
     ctx.fillText(g.won ? 'CHAMPION' : 'PROFIT', mid, h * 0.67);
   } else {
-    // arena: small target label by the bar (the modal's DOM carries the detail)
     ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
     ctx.font = `700 ${Math.round(h * 0.15)}px "Chakra Petch", sans-serif`;
     ctx.fillText(g.won ? 'CHAMPION' : `$${MIL[g.idx].toLocaleString()}`, mid, by - h * 0.08);

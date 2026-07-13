@@ -118,6 +118,8 @@ export interface TraderConfig {
   crypto15mTakeProfitCents?: number;             // per-bet: sell when the held side reaches this price (¢); 0 = off
   crypto15mStopLossPct?: number;                 // per-bet: sell when down >= this fraction of entry cost (0..1); 0 = off
   crypto15mSessionTakeProfitUsd?: number;        // halt new 15m entries once this session's realized 15m P&L hits $this; 0 = off
+  crypto15mHfRecord?: boolean;                    // research: record the live WS book+spot at ~5Hz into crypto15m_ticks_hf (exit-latency study)
+  crypto15mHfIntervalMs?: number;                // HF recorder sampling period, ms (50–5000; default 200 ≈ 5Hz)
   crypto15mMinRsi?: number;                      // direction-aware RSI confirmation (0–100); 0 = off
   crypto15mMinMacdHist?: number;                 // direction-aware MACD-histogram confirmation (magnitude); 0 = off
   crypto15mMinDeltaPct?: number;
@@ -129,15 +131,9 @@ export interface TraderConfig {
   crypto15mHours?: number[] | null;         // explicit UTC hours (0-23) to trade; null = use the window above
   crypto15mRecordSignals?: boolean;
   mainRecordSignals?: boolean;             // record whale/momentum signals while the app runs (forced on when trading is enabled)
-  // Perpetual futures (Kalshi margin API) — passive market-data recorder.
-  // Public REST always reads production (unauthenticated) so research data
-  // flows in any env; the WS accelerator follows the active env's creds.
   perpsRecordSignals?: boolean;
   perpsWsEnabled?: boolean;
   perpsSymbols?: string[];                 // prod tickers (KXBTCPERP…); demo '1' suffix handled internally
-  // Perps volume farmer — maker-only two-sided quoting for the in-app volume
-  // rewards. Loss-budgeted volume engine, auto-halts when measured cost per
-  // $ of volume exceeds perpsFarmMaxCostBps or the daily loss cap.
   perpsFarmEnabled?: boolean;
   perpsFarmSymbol?: string;
   perpsFarmClipContracts?: number;
@@ -146,9 +142,6 @@ export interface TraderConfig {
   perpsFarmDailyVolumeUsd?: number;        // 0 = no daily volume target
   perpsFarmMaxCostBps?: number;
   perpsFarmMaxFeeBps?: number;             // pre-trade gate: only farm while the charged maker fee ≤ this (0 = off)
-  // Perps user strategy (rule-composed like the 15m builder; same gates run
-  // in backtest, paper and live). perpsStratEnabled = paper trading;
-  // perpsStratLive = REAL leveraged orders (explicit risk-ack modal in UI).
   perpsStratEnabled?: boolean;
   perpsStratLive?: boolean;
   perpsStratSymbol?: string;
@@ -170,8 +163,6 @@ export interface TraderConfig {
   crypto15mArbMinEdgeCents?: number;             // minimum edge (cents) to flag an arb
   crypto15mUseRules?: boolean;                   // use the composed rule-set as the entry gate
   crypto15mRules?: RuleCondition[];              // composed entry conditions (all AND-ed)
-  // Pairs — temporal complement accumulation (buy YES on dips + NO on peaks;
-  // matched pairs settle at exactly $1, so blended cost < ceiling = locked profit)
   crypto15mPairsEnabled?: boolean;
   crypto15mDirectionalEnabled?: boolean;         // favorite/contrarian engine; false = pairs-only mode
   crypto15mPairsCeilingCents?: number;           // max blended YES+NO cost per pair (¢)
@@ -465,22 +456,18 @@ export interface Crypto15mAsset {
   signal: boolean;
   openMarketCount: number;
   error: string | null;
-  // timing + cross-asset correlation (optional rule-builder fields)
   hourUtc?: number | null;       // current UTC hour 0-23
   peersAgree?: number | null;    // 0..1 — fraction of other coins favoring the same side
   marketBias?: number | null;    // -1..1 — market-wide up/down lean (breadth)
-  // Up+Down ≠ $1 arbitrage (market-neutral edge, detection-only)
   upAsk?: number | null;         // best ask to BUY the up/yes side (0..1)
   downAsk?: number | null;       // best ask to BUY the down/no side (0..1)
   arbEdgeCents?: number | null;  // 100 − (upAsk+downAsk)*100; > 0 = buyable arb (gross of fees)
   arbSignal?: boolean;           // arbEdgeCents >= the configured minimum
-  // underlying technical indicators (MACD/RSI on the 1-min underlying; rule fields)
   macd?: number | null;          // MACD line
   macdSignal?: number | null;    // MACD signal line
   macdHist?: number | null;      // MACD histogram = macd − signal
   macdCross?: number | null;     // +1 bullish / −1 bearish / 0 no cross on this bar
   rsi?: number | null;           // Wilder RSI(14), 0..100
-  // spot-vs-strike settlement model (detection-only rule fields)
   strikeUsd?: number | null;       // Kalshi strike (fallback: tracked window open)
   deltaSignedPct?: number | null;  // (spot − strike)/strike; + = above strike
   sigma1m?: number | null;         // realized 1-min return vol (fraction/√min)

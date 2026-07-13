@@ -34,7 +34,6 @@ def _value_msg(index_id="BRTI", value="68000.12", *, settle=None):
     return {"type": "cfbenchmarks_value", "sid": 1, "seq": 1, "msg": msg}
 
 
-# ───────── index mapping + message parsing ───────────────────────────────────
 
 
 def test_index_mapping():
@@ -79,12 +78,9 @@ def test_stale_values_not_served():
     assert c.fresh_spots() == {}
 
 
-# ───────── kalshi_ws integration: routing + subscribe params ─────────────────
 
 
 def test_kalshi_ws_routes_cf_frames_to_cf_state(monkeypatch):
-    # A cfbenchmarks_value frame arriving on the trade-api socket must land in
-    # cf_ws state via the module delegator.
     fresh = cf_ws._State()
     monkeypatch.setattr(cf_ws, "_client", fresh)
     kc = kalshi_ws._Client()
@@ -106,7 +102,6 @@ def test_kalshi_ws_subscribes_cf_channel_with_index_ids():
                if m.get("params", {}).get("channels") == ["cfbenchmarks_value"]]
     assert len(cf_subs) == 1
     assert cf_subs[0]["params"]["index_ids"] == ["all"]
-    # Plain account channels never carry index_ids.
     others = [m for m in sent if m not in cf_subs]
     assert others and all("index_ids" not in m["params"] for m in others)
 
@@ -125,12 +120,11 @@ def test_kalshi_ws_omits_cf_channel_when_disabled():
     )
 
 
-# ───────── final-minute settlement average ────────────────────────────────────
 
 
 def test_settle_partial_matches_window_and_returns_sum_count():
     c = _fresh_client()
-    close = time.time() + 30  # final minute in progress, 30s to close
+    close = time.time() + 30
     c.handle_message(_value_msg("BRTI", "68000", settle={
         "value": "68010.5", "window_size": 30,
         "window_start_ts_ms": (close - 60) * 1000,
@@ -139,9 +133,7 @@ def test_settle_partial_matches_window_and_returns_sum_count():
     s, n = c.settle_partial("BTC", close)
     assert n == 30
     assert s == pytest.approx(68010.5 * 30)
-    # A different window's close (previous quarter) must not match.
     assert c.settle_partial("BTC", close - 900) == (0.0, 0)
-    # Unknown asset → nothing.
     assert c.settle_partial("SOL", close) == (0.0, 0)
 
 
@@ -152,7 +144,6 @@ def test_settle_partial_goes_stale():
     assert c.settle_partial("BTC", close) == (0.0, 0)
 
 
-# ───────── snapshot integration: WS quote overlay + active tickers ───────────
 
 
 def _snapshot_with(monkeypatch, market, cfg, spot=None, indicators=False):
@@ -185,7 +176,7 @@ def test_asset_snapshot_overlays_fresh_ws_quote(monkeypatch):
     assert out["yesBid"] == pytest.approx(0.48)
     assert out["yesAsk"] == pytest.approx(0.52)
     assert out["upAsk"] == pytest.approx(0.52)
-    assert out["downAsk"] == pytest.approx(0.52)   # 100 − ws yes_bid
+    assert out["downAsk"] == pytest.approx(0.52)
     assert out["upProb"] == pytest.approx(0.50)
 
 
@@ -196,7 +187,7 @@ def test_asset_snapshot_ignores_stale_ws_quote(monkeypatch):
         "ts_ms": time.time() * 1000.0 - 60_000,
     })
     out = _snapshot_with(monkeypatch, _rest_market(), merge_with_defaults({}))
-    assert out["yesBid"] == pytest.approx(0.40)    # REST values kept
+    assert out["yesBid"] == pytest.approx(0.40)
     assert out["yesAsk"] == pytest.approx(0.60)
     assert out["downAsk"] == pytest.approx(0.62)
 
@@ -212,7 +203,6 @@ def test_active_tickers_reads_snapshot_cache(monkeypatch):
     assert crypto15m.active_tickers() == set()
 
 
-# ───────── spot priority chain: cf > coinbase > REST ─────────────────────────
 
 
 def test_fetch_spots_prefers_cf_over_coinbase_over_rest(monkeypatch):
@@ -227,14 +217,13 @@ def test_fetch_spots_prefers_cf_over_coinbase_over_rest(monkeypatch):
         return await crypto15m.fetch_spots()
 
     spots, source = run_async(_run())
-    assert spots["BTC"] == pytest.approx(68000.0)   # cf wins
-    assert spots["ETH"] == pytest.approx(3500.0)    # coinbase fills
-    assert spots["HYPE"] == pytest.approx(30.0)     # REST fills the rest
+    assert spots["BTC"] == pytest.approx(68000.0)
+    assert spots["ETH"] == pytest.approx(3500.0)
+    assert spots["HYPE"] == pytest.approx(30.0)
     assert source == "kalshi-cf+coinbase-ws+cryptocompare"
 
 
 def test_settle_partial_feeds_model_before_sampler(monkeypatch):
-    # cf_ws has the exact partial average → the Coinbase sampler is not used.
     from config import merge_with_defaults
     monkeypatch.setattr(kalshi_ws, "ticker_quote", lambda t: None)
     monkeypatch.setattr(cf_ws, "settle_partial", lambda a, ce: (68000.0 * 30, 30))

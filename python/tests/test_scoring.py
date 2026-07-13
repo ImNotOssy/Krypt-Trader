@@ -13,7 +13,6 @@ def test_whale_score_basic_yes_favorite():
 
 
 def test_whale_score_no_side_with_all_bonuses():
-    # $10-25k whales now get +1.5 (was +1, which scored a $12k whale BELOW a $7k one).
     score = scanner.compute_whale_score(
         dollar_value=12_000, price=0.55, taker_side="no",
         market_volume=300_000, open_interest=60_000,
@@ -23,7 +22,6 @@ def test_whale_score_no_side_with_all_bonuses():
 
 
 def test_whale_size_bonus_is_monotonic():
-    # A bigger whale must never score lower than a smaller one, all else equal.
     scores = [
         scanner.compute_whale_score(dollar_value=d, price=0.70, taker_side="yes")
         for d in (1_000, 3_000, 7_000, 12_000, 30_000)

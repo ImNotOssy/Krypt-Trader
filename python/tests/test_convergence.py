@@ -62,10 +62,8 @@ def test_three_same_side_whales_build_a_signal(fresh_db):
     assert s["ticker"] == "KXTEST-A"
     assert s["direction"] == "yes"
     assert s["whale_count"] == 3
-    assert s["id"] == last                      # newest whale id = stable dedup key
-    # dollar-weighted price: (0.60·3k + 0.62·4k + 0.64·5k) / 12k
+    assert s["id"] == last
     assert s["price"] == pytest.approx(0.6233, abs=1e-3)
-    # 3-whale bonus = +4 over implied
     assert s["confidence"] == pytest.approx(62.3 + 4.0, abs=0.2)
     assert s["event_ticker"] == "KXTEST"
     assert s["total_usd"] == pytest.approx(12000)
@@ -82,15 +80,13 @@ def test_opposite_sides_do_not_merge(fresh_db):
     _seed_whale(side="yes")
     _seed_whale(side="no")
     _seed_whale(side="no")
-    assert _build() == []   # neither side reaches 3
+    assert _build() == []
 
 
 def test_stale_group_is_not_fresh(fresh_db):
-    # 3 whales but the NEWEST is 30 minutes old — a restart must not chase it.
     for _ in range(3):
         _seed_whale(ago_sql="-30 minutes")
     assert _build(max_age_sec=120) == []
-    # A fresh fourth whale re-arms the group.
     _seed_whale(price=0.61)
     sigs = _build(max_age_sec=120)
     assert len(sigs) == 1 and sigs[0]["whale_count"] == 4
@@ -102,7 +98,7 @@ def test_convergence_score_scales_with_pack_size():
     s5 = scanner.compute_convergence_score(count=5, total_usd=15_000, implied=60)
     big = scanner.compute_convergence_score(count=5, total_usd=30_000, implied=60)
     assert s3 == 64.0 and s4 == 66.0 and s5 == 68.0
-    assert big == 69.0                       # +1 for ≥ $25k combined
+    assert big == 69.0
     assert scanner.compute_convergence_score(count=9, total_usd=99_000, implied=95) <= 97.0
 
 
@@ -111,11 +107,9 @@ def test_trade_age_sec_parses_and_fails_open():
     fresh = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
     age = scanner._trade_age_sec({"created_time": fresh})
     assert age is not None and 55 <= age <= 70
-    # SQLite-style timestamps (whale_trades.created_at) parse too.
     sqlite_fmt = (datetime.now(timezone.utc) - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
     age = scanner._trade_age_sec({"created_time": sqlite_fmt})
     assert age is not None and 85 <= age <= 100
-    # Unknown/garbage → None (callers fail open).
     assert scanner._trade_age_sec({"created_time": ""}) is None
     assert scanner._trade_age_sec({}) is None
     assert scanner._trade_age_sec({"created_time": "not-a-date"}) is None

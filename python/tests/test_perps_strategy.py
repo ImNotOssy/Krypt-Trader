@@ -57,11 +57,10 @@ BASE_CFG = {
 }
 
 
-# ───────── features + gates ──────────────────────────────────────────────────
 
 def test_compute_features_basics():
     bars = _bars(120)
-    bars[-1] = _bar(bars[-1]["end_ts"], 6.35 * 1.001)  # +10bps last minute
+    bars[-1] = _bar(bars[-1]["end_ts"], 6.35 * 1.001)
     f = ps.compute_features(bars, len(bars) - 1, funding_rate_bps=1.5)
     assert f is not None
     assert f["ret1mBps"] == pytest.approx(10.0, abs=0.5)
@@ -85,13 +84,12 @@ def test_should_enter_rules_and_empty():
 
 def test_should_exit_tp_sl_hold():
     cfg = dict(BASE_CFG)
-    f = {"price": 6.35 * (1 + 0.0035)}  # +35bps
+    f = {"price": 6.35 * (1 + 0.0035)}
     done, r = ps.should_exit(f, side="long", entry_px=6.35, held_min=5, cfg=cfg)
     assert done and r == "tp"
-    f = {"price": 6.35 * (1 - 0.0025)}  # -25bps
+    f = {"price": 6.35 * (1 - 0.0025)}
     done, r = ps.should_exit(f, side="long", entry_px=6.35, held_min=5, cfg=cfg)
     assert done and r == "sl"
-    # short direction mirrors: -35bps move = +35bps gain for a short → tp
     f = {"price": 6.35 * (1 - 0.0035)}
     done, r = ps.should_exit(f, side="short", entry_px=6.35, held_min=5, cfg=cfg)
     assert done and r == "tp"
@@ -100,7 +98,6 @@ def test_should_exit_tp_sl_hold():
     assert done and r == "max_hold"
 
 
-# ───────── backtest ──────────────────────────────────────────────────────────
 
 def _seed_candles(bars, ticker="KXBTCPERP"):
     u = lambda v: int(round(v * 1e6)) if v is not None else None
@@ -125,17 +122,14 @@ def _seed_candles(bars, ticker="KXBTCPERP"):
 
 
 def _recent_ts() -> int:
-    # within the loader's since_days window
     return (int(time.time()) // 60) * 60 - 5 * 86400
 
 
 def test_backtest_taker_entry_next_bar_and_tp(fresh_db):
     start = _recent_ts()
     bars = [_bar(start + i * 60, 6.35) for i in range(80)]
-    # bar 65: +10bps 5m return triggers rules; entry should fill at bar 66 ASK
     for i in range(61, 70):
         bars[i] = _bar(bars[i]["end_ts"], 6.35 * (1 + 0.0012 * (i - 60)))
-    # bar 70+: price jumps so bid_high clears TP
     for i in range(70, 80):
         bars[i] = _bar(bars[i]["end_ts"], 6.35 * 1.02)
     _seed_candles(bars)
@@ -153,10 +147,8 @@ def test_backtest_sl_first_when_both_hit(fresh_db):
     start = _recent_ts()
     lvl = 6.35 * 1.001
     bars = [_bar(start + i * 60, 6.35) for i in range(80)]
-    # single rules trigger at bar 65 (+10bps 5m return); entry fills at bar 66
     for i in range(65, 80):
         bars[i] = _bar(bars[i]["end_ts"], lvl)
-    # bar 67: bid range hits BOTH the SL and the TP → SL must win (conservative)
     wild = _bar(bars[67]["end_ts"], lvl)
     wild["bid_low"] = lvl * (1 - 0.01)
     wild["bid_high"] = lvl * (1 + 0.01)
@@ -181,31 +173,28 @@ def test_backtest_fees_scale_with_era(fresh_db):
                             "perps_strat_tp_bps": 0, "perps_strat_sl_bps": 0,
                             "perps_strat_max_hold_min": 5}, since_days=14)
     assert res_cheap["n"] == res_dear["n"] >= 1
-    assert res_dear["totalPnlUsd"] < res_cheap["totalPnlUsd"]  # 80bps vs 12bps taker
+    assert res_dear["totalPnlUsd"] < res_cheap["totalPnlUsd"]
 
 
 def test_backtest_maker_requires_trade_through(fresh_db):
     start = _recent_ts()
     bars = [_bar(start + i * 60, 6.35) for i in range(80)]
-    # monotone ramp; every bar's trade low stays AT its close — the resting
-    # bid one bar back is never traded through, so a maker entry never fills
     for i in range(61, 80):
         bars[i] = _bar(bars[i]["end_ts"], 6.35 * (1 + 0.0012 * (i - 60)))
         bars[i]["low"] = bars[i]["close"]
     _seed_candles(bars)
     res = ps.backtest({**BASE_CFG, "perps_strat_entry_style": "maker"}, since_days=14)
-    assert res["n"] == 0  # touched is not filled
+    assert res["n"] == 0
 
 
 def test_backtest_funding_applied(fresh_db):
     start = _recent_ts()
-    # place a funding stamp inside the hold window
     stamp_ts = start + 66 * 60
     stamp_dt = datetime.fromtimestamp(stamp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with db.get_db() as conn:
         db.upsert_perp_funding(conn, [{
             "ticker": "KXBTCPERP", "funding_time": stamp_dt,
-            "funding_rate": 0.01,  # absurdly large to dominate the P&L
+            "funding_rate": 0.01,
             "mark_usd_micro": 6_350_000, "kalshi_env": "production",
         }])
     bars = [_bar(start + i * 60, 6.35) for i in range(90)]
@@ -216,7 +205,6 @@ def test_backtest_funding_applied(fresh_db):
            "perps_strat_max_hold_min": 10}
     res = ps.backtest(cfg, since_days=14)
     assert res["n"] >= 1
-    # long through a +1% funding stamp pays ≈ $0.0635 on one $6.35 contract
     assert res["trades"][0]["pnlUsd"] < -0.05
 
 
@@ -226,7 +214,7 @@ def test_backtest_liquidation_at_leverage(fresh_db):
     for i in range(61, 66):
         bars[i] = _bar(bars[i]["end_ts"], 6.35 * (1 + 0.0015 * (i - 60)))
     crash_i = 68
-    crash = _bar(bars[crash_i]["end_ts"], 6.35 * 0.75)  # −25% > 18% liq at 5x
+    crash = _bar(bars[crash_i]["end_ts"], 6.35 * 0.75)
     crash["bid_low"] = 6.35 * 0.70
     bars[crash_i] = crash
     for i in range(crash_i + 1, 80):
@@ -245,17 +233,15 @@ def test_backtest_empty_rules_no_trades(fresh_db):
     assert res["n"] == 0
 
 
-# ───────── paper engine ──────────────────────────────────────────────────────
 
 @pytest.fixture
 def engine(monkeypatch, fresh_db):
     eng = ps._Engine()
     monkeypatch.setattr(ps, "_engine", eng)
     monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
-    # seed candles so the engine warm-starts past the 60-bar window
     start = (int(time.time()) // 60) * 60 - 100 * 60
     bars = [_bar(start + i * 60, 6.35) for i in range(95)]
-    for i in range(89, 95):  # momentum into the present → rules fire
+    for i in range(89, 95):
         bars[i] = _bar(bars[i]["end_ts"], 6.35 * (1 + 0.0015 * (i - 88)))
     _seed_candles(bars)
     return eng
@@ -283,7 +269,6 @@ def test_paper_entry_and_flatten(engine, monkeypatch):
     assert pos["side"] == "long"
     st = engine.status(cfg)
     assert st["openPosition"]["contracts"] == 1
-    # flatten closes it at the live bid with fees booked
     out = asyncio.run(engine.flatten(cfg))
     assert out["closed"] == 1
     with db.get_db() as conn:
@@ -300,11 +285,10 @@ def test_paper_no_entry_when_rules_fail(engine, monkeypatch):
     asyncio.run(engine.tick(cfg))
     with db.get_db() as conn:
         assert db.get_open_perp_position(conn, "production") is None
-    assert engine.last_reason  # surfaced why-not for the UI
+    assert engine.last_reason
 
 
 def test_paper_daily_loss_halts(engine, monkeypatch):
-    # book a big closed loss today, then tick — engine must halt, no entry
     with db.get_db() as conn:
         pid = db.open_perp_position(conn, {
             "ticker": "KXBTCPERP", "side": "long", "dry_run": True,
@@ -324,8 +308,6 @@ def test_paper_daily_loss_halts(engine, monkeypatch):
 def test_stale_quote_stands_down(engine, monkeypatch):
     cfg = dict(BASE_CFG, perps_strat_enabled=True)
     q = _live_quote()
-    # Not received for well over the freshness window → treated as stream-dead.
-    # (A merely old wire ts_ms with fresh receipt is a normal slow book, below.)
     q["recv_ms"] = int(time.time() * 1000) - 200_000
     monkeypatch.setattr(pws, "quote", lambda t: q)
     asyncio.run(engine.tick(cfg))

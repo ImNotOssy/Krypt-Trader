@@ -61,7 +61,6 @@ def _trade_age_sec(t: dict, now: datetime | None = None) -> float | None:
     if ct in (None, ""):
         return None
     now_dt = now or datetime.now(timezone.utc)
-    # WS trades stamp created_time with ts_ms (epoch millis) or ts (epoch secs).
     if isinstance(ct, (int, float)) or (isinstance(ct, str) and ct.isdigit()):
         try:
             v = float(ct)
@@ -69,7 +68,7 @@ def _trade_age_sec(t: dict, now: datetime | None = None) -> float | None:
             return None
         if v <= 0:
             return None
-        if v > 1e11:  # millis (≈1.7e12 today) vs seconds (≈1.7e9)
+        if v > 1e11:
             v /= 1000.0
         return now_dt.timestamp() - v
     if not isinstance(ct, str):
@@ -107,12 +106,6 @@ async def _resolve_category(ticker: str, title: str = "") -> str:
                 )
                 if mapped:
                     return mapped
-                # Unmapped Kalshi category: DON'T pass the raw string through.
-                # The category gate (trader.should_trade) and the Settings
-                # picker only know the canonical ids, so a raw slug became an
-                # untoggleable bucket that any specific category selection
-                # silently deny-listed. Bucket by keywords instead — always a
-                # representable, toggleable id — and say so in the log.
                 fallback = categorize_by_keywords(title)
                 logger.info(
                     f"unmapped Kalshi category {raw!r} for series {series_ticker}; "
@@ -149,8 +142,6 @@ def compute_whale_score(
         elif price >= 0.35: edge -= 5
         else:               edge -= 8
 
-    # Monotonic in size — the old table gave $10-25k LESS than $5-10k (+1 vs
-    # +1.5), so a bigger whale scored lower.
     if dollar_value >= 25_000:   edge += 2
     elif dollar_value >= 10_000: edge += 1.5
     elif dollar_value >= 5_000:  edge += 1.5
@@ -309,8 +300,6 @@ async def sync_events() -> int:
 
 
 async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
-    # Prefer the real-time WS tape (complete, no 1000-row REST cap / missed
-    # bursts); fall back to the REST snapshot when the socket is cold.
     raw = kalshi_ws.recent_trades(limit=1000)
     if raw is None:
         raw = await kalshi_api.fetch_recent_trades(limit=1000)
@@ -324,9 +313,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
 
     candidates: list[dict] = []
     for t in raw:
-        # Age-gate the tape: the REST snapshot (and a WS buffer surviving a
-        # long stall) can hold hours-old trades — "discovering" those after a
-        # restart chases whales at prices that no longer exist.
         age = _trade_age_sec(t, now)
         if age is not None and age > max_age:
             continue
@@ -335,11 +321,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
         no_p = _to_float(t.get("no_price_dollars", 0))
         side = (t.get("taker_side") or "").lower()
         if side not in ("yes", "no"):
-            # A side-less tape row (WS stamps '' when the field is absent)
-            # can't be handled consistently: this scorer would price it as NO
-            # while the executor (trader._signal_cost_cents) defaults '' to a
-            # YES buy — the wrong side at the wrong cost basis — and
-            # resolution could never mark it correct. Skip it outright.
             logger.debug(
                 f"skip tape trade {t.get('trade_id', '')!r}: missing taker_side"
             )
@@ -367,8 +348,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
     if not candidates:
         return 0, []
 
-    # Phase 1: collect genuinely-new candidates + their cached market using a
-    # SHORT read connection — no write lock is held across the network calls below.
     with db.get_db() as conn:
         pending: list[dict] = []
         for entry in candidates:
@@ -382,12 +361,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
     if not pending:
         return 0, []
 
-    # Network I/O (fetch_market for cache misses + category resolution) happens
-    # OUTSIDE any transaction, so the SQLite write lock is never held across an
-    # await — which previously caused intermittent 'database is locked' failures
-    # for concurrent IPC writes (manual order, Sync, Resolve All, config save).
-    # Cache-miss market fetches run CONCURRENTLY (capped) — serially they cost
-    # ~0.3s × N fresh whales, paid on the hot tape-to-order path.
     miss_tickers = {e["ticker"] for e in pending if not e["mkt"]}
     api_markets = await kalshi_api.fetch_markets_map(miss_tickers) if miss_tickers else {}
     fetched_markets: dict[str, dict] = {}
@@ -456,7 +429,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
             "confidence": confidence,
         }
 
-    # Phase 2: tight write transaction with NO awaits inside (lock held ms, not s).
     new_rows: list[dict] = []
     with db.get_db() as conn:
         for entry in pending:
@@ -464,8 +436,6 @@ async def scan_whales(cfg: dict) -> tuple[int, list[dict]]:
                 continue
             m = fetched_markets.get(entry["ticker"])
             if m:
-                # Persist the resolved category so repeat whale markets in this
-                # series don't trigger another fetch_series next scan.
                 m["category"] = entry["data"].get("category", "") or m.get("category", "")
                 db.upsert_market(conn, m)
             wid = db.insert_whale_trade(conn, entry["data"])
@@ -491,9 +461,6 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
     recent_trades = kalshi_ws.recent_trades(limit=1000)
     if recent_trades is None:
         recent_trades = await kalshi_api.fetch_recent_trades(limit=1000)
-    # Cluster counting only sees trades inside the age window. The raw last-1000
-    # tape has NO time bound — in quiet hours 5 trades spread over 6+ hours
-    # would count as a "cluster", which is "market had volume", not momentum.
     max_age = _max_trade_age_sec(cfg)
     now_utc = datetime.now(timezone.utc)
     trades_by_ticker: dict[str, list[dict]] = defaultdict(list)
@@ -534,20 +501,10 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 )
 
     with db.get_db() as conn:
-        # Save THIS scan's snapshot for every market FIRST, so the rn=2 row the
-        # bulk baseline query returns is the PREVIOUS scan's snapshot. The old
-        # order (read rn=2, then save) meant rn=1 was already the previous scan
-        # at read time, so deltas were measured against the snapshot from TWO
-        # scans ago — a doubled window that fired the price-move/vol-spike
-        # thresholds on drifts half as fast as tuned, and delayed a fresh
-        # ticker's first delta by one scan.
         for market in markets:
             tk = market.get("ticker")
             if tk and not is_micro_market(tk):
                 db.save_snapshot(conn, tk, market)
-        # Bulk-load the previous snapshot for every market in ONE query instead
-        # of a per-market lookup inside the loop (was a ~500× N+1 on a table
-        # that grows every scan).
         prev_snaps = db.get_previous_snapshots_bulk(
             conn, [m.get("ticker") for m in markets if m.get("ticker")]
         )
@@ -591,8 +548,6 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
                 for t in no_trades
             )
 
-            # Direction by DOLLARS, not trade count — five $10 lottery tickets
-            # must not outvote four $5k orders on which side the flow is on.
             if yes_dollars > no_dollars:
                 cluster_dir = "yes"
                 cluster_count = yes_count
@@ -622,9 +577,6 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
             for stype in signals:
                 if stype not in allowed_signals:
                     continue
-                # Direction PER signal type — a price_move's sign must not override
-                # a trade_cluster's dominant side (that bought the wrong side);
-                # volume_spike has no inherent side, so it follows the cluster.
                 if stype == "price_move":
                     direction = "yes" if price_change > 0 else "no"
                 else:
@@ -763,9 +715,6 @@ async def resolve_alerts_from_markets() -> int:
 
     tickers = list({a["ticker"] for a in unresolved if a["ticker"]})
     resolved = 0
-    # Fetch every market concurrently (capped) instead of serially with a sleep
-    # between each — a 100-signal backlog was a ~10-minute serial crawl that
-    # blocked the trader loop; now it's one bounded burst.
     markets = await kalshi_api.fetch_markets_map(tickers)
     with db.get_db() as conn:
         for ticker in tickers:
@@ -797,7 +746,6 @@ async def resolve_whales_from_markets() -> int:
         return 0
     tickers = list({t["ticker"] for t in unresolved if t["ticker"]})
     resolved = 0
-    # Concurrent (capped) market fetch instead of a serial sleep-throttled crawl.
     markets = await kalshi_api.fetch_markets_map(tickers)
     with db.get_db() as conn:
         for ticker in tickers:
@@ -809,10 +757,6 @@ async def resolve_whales_from_markets() -> int:
             if status not in ("determined", "finalized", "settled") or not result:
                 continue
             for t in [x for x in unresolved if x["ticker"] == ticker]:
-                # dollar_value is the trade COST (contracts × price), so the
-                # contract count is dollar_value/price and a win profits
-                # contracts × (1 − price). (The old per-side math scaled by cost,
-                # not contracts, and used the wrong price on the NO side.)
                 p = float(t["price"]) or 0.0
                 contracts = (t["dollar_value"] / p) if p else 0.0
                 correct = result == t["taker_side"]

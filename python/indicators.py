@@ -35,7 +35,7 @@ def _floats(values) -> list[float]:
             f = float(v)
         except (TypeError, ValueError):
             continue
-        if f == f:  # drop NaN
+        if f == f:
             out.append(f)
     return out
 
@@ -79,8 +79,6 @@ def macd(
     ema_slow = ema_series(vals, slow)
     if not ema_fast or not ema_slow:
         return None
-    # Align the two EMA series at their newest points (ema_fast is longer
-    # because the shorter period needs less warm-up).
     m = min(len(ema_fast), len(ema_slow))
     macd_line = [ema_fast[-m + i] - ema_slow[-m + i] for i in range(m)]
     signal_line = ema_series(macd_line, signal)
@@ -106,7 +104,6 @@ def rsi(closes: list[float], period: int = RSI_PERIOD) -> Optional[float]:
     if len(vals) < period + 1:
         return None
     gains, losses = 0.0, 0.0
-    # Seed average over the first `period` deltas.
     for i in range(1, period + 1):
         ch = vals[i] - vals[i - 1]
         if ch >= 0:
@@ -115,7 +112,6 @@ def rsi(closes: list[float], period: int = RSI_PERIOD) -> Optional[float]:
             losses -= ch
     avg_gain = gains / period
     avg_loss = losses / period
-    # Wilder smoothing across the remaining deltas.
     for i in range(period + 1, len(vals)):
         ch = vals[i] - vals[i - 1]
         gain = ch if ch > 0 else 0.0

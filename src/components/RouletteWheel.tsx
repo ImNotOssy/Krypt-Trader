@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { cls } from '../utils/format';
 
-// 10 pockets → exactly one green = the 10% trade odds of the Secret Strategy.
 const SEGMENTS = 10;
 const GREEN = 0;
 const SEG = 360 / SEGMENTS;

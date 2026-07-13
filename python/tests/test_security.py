@@ -25,8 +25,6 @@ def test_min_size_cannot_exceed_max_size():
 
 
 def test_stop_loss_forced_nonpositive_take_profit_nonnegative():
-    # A positive stop-loss input means "stop at a $50 loss" — sign-normalize it.
-    # (The old clamp-to-0 silently DISABLED the stop while the UI showed 50.)
     assert merge_with_defaults({"stop_loss_on_day": 50})["stop_loss_on_day"] == -50.0
     assert merge_with_defaults({"stop_loss_on_day": -50})["stop_loss_on_day"] == -50.0
     assert merge_with_defaults({"stop_loss_on_day": 0})["stop_loss_on_day"] == 0.0

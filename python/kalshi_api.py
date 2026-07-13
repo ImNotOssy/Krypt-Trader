@@ -24,13 +24,7 @@ PATH_PREFIX = "/trade-api/v2"
 REQUEST_TIMEOUT = 25.0
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.5
-# Hot-path budget for latency-critical calls (order place/cancel, order status,
-# orderbook): one hung socket must cost seconds, not the bulk 25s — a stop-loss
-# waiting out 3 × 25s retries rides a crash for over a minute.
 HOT_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=6.0, pool=6.0)
-# Keep-alive: httpx's default expiry is 5s, and hot signed calls are often
-# spaced further apart than that — so most order placements paid a fresh
-# TCP+TLS handshake (~100-300ms). 60s keeps the connection warm between polls.
 KEEPALIVE_SEC = 60.0
 
 _pub_client: Optional[httpx.AsyncClient] = None
@@ -354,8 +348,6 @@ async def _signed_request(
         if resp.status_code == 401 and attempt < MAX_RETRIES:
             code = ((body.get("error") or {}).get("code") or "") if isinstance(body, dict) else ""
             if "timestamp" in code:
-                # Blocking 5s HTTP HEAD — run it off the event loop so a clock
-                # resync can't freeze every other coroutine (incl. exits).
                 await asyncio.to_thread(sync_server_time, True)
                 await asyncio.sleep(0.2)
                 continue
@@ -402,10 +394,6 @@ async def get_positions(
         if not paginate or not cursor:
             break
         if pages >= _POSITIONS_MAX_PAGES:
-            # Silently returning the truncated list made everything past the
-            # cut look "no longer held" — reconcile then orphan-closed real
-            # positions, and (same account state → same cut) the truncation
-            # PERSISTS across polls, so no miss-debounce can save them.
             raise KalshiTruncatedResult(
                 f"/portfolio/positions pagination hit the {pages}-page cap "
                 f"with more rows remaining; refusing to return a truncated "
@@ -526,10 +514,6 @@ def _normalize_orderbook(raw: Any) -> dict:
 
 
 async def get_orderbook(ticker: str) -> dict:
-    # Prefer the real-time WebSocket book when it's live + validated for this
-    # market — it's effectively current vs the ~seconds-stale REST snapshot, and
-    # is what the 15m stop-loss/TP chase reads. Returns None (→ REST) when the
-    # socket is down, the market isn't subscribed, or a seq gap invalidated it.
     wb = kalshi_ws.orderbook(ticker)
     if wb is not None and (wb["yes"] or wb["no"]):
         return wb
@@ -587,13 +571,6 @@ async def place_limit_order(
         "time_in_force": "good_till_canceled",
         "self_trade_prevention_type": "taker_at_cross",
     }
-    # Serialize against an in-progress credential test / env switch (which
-    # briefly flips the global signing env) WITHOUT holding the lock across the
-    # HTTP call: the env is read under ENV_LOCK (so a flip-in-progress is waited
-    # out) and pinned across every attempt inside _signed_request — a flip after
-    # the read makes the request ABORT rather than sign for the other account.
-    # A slow send / 429 ladder no longer wedges every other caller behind the
-    # lock (the old design held it across the whole call, worst case ~80s).
     async with ENV_LOCK:
         env0 = get_env()
     return await _signed_request(
@@ -603,7 +580,7 @@ async def place_limit_order(
 
 async def cancel_order(order_id: str) -> dict:
     async with ENV_LOCK:
-        env0 = get_env()  # wait out any env flip, pin; see place_limit_order
+        env0 = get_env()
     return await _signed_request(
         "DELETE", f"{ORDERS_V2_PATH}/{order_id}", timeout=HOT_TIMEOUT, pin_env=env0,
     )

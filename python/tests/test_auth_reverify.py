@@ -15,7 +15,6 @@ def run_async(coro):
 
 @pytest.fixture(autouse=True)
 def _base(monkeypatch):
-    # Default: latched off, valid env, priming is a no-op, events swallowed.
     service.STATE.auth_ok = False
 
     async def _noop_emit(*a, **k):
@@ -30,8 +29,6 @@ def _base(monkeypatch):
 
 
 def test_reverify_recovers_when_creds_valid(monkeypatch):
-    # The core regression: a latched-off auth state flips back True once a
-    # verify succeeds, re-enabling trading without user intervention.
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: True)
 
     async def _bal(*a, **k):
@@ -53,12 +50,10 @@ def test_reverify_noop_without_credentials(monkeypatch):
     monkeypatch.setattr(kalshi_api, "get_balance", _bal)
     assert run_async(service._reverify_auth_if_needed()) is False
     assert service.STATE.auth_ok is False
-    assert calls["n"] == 0  # never hits the network when no creds are present
+    assert calls["n"] == 0
 
 
 def test_reverify_stays_off_when_verify_fails(monkeypatch):
-    # A failed re-verify must NOT flip auth_ok True; the loop's try/except keeps
-    # the exception from killing the loop and retries later.
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: True)
 
     async def _bal(*a, **k):
@@ -81,4 +76,4 @@ def test_reverify_noop_when_already_authed(monkeypatch):
     monkeypatch.setattr(kalshi_auth, "credentials_present", lambda env=None: True)
     monkeypatch.setattr(kalshi_api, "get_balance", _bal)
     assert run_async(service._reverify_auth_if_needed()) is False
-    assert calls["n"] == 0  # no redundant balance poll when already healthy
+    assert calls["n"] == 0

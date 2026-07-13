@@ -37,10 +37,10 @@ from typing import Optional
 logger = logging.getLogger("spot_ws")
 
 try:
-    import websockets  # type: ignore
+    import websockets
     _WS_IMPORT_OK = True
-except Exception:  # pragma: no cover - websockets missing
-    websockets = None  # type: ignore
+except Exception:
+    websockets = None
     _WS_IMPORT_OK = False
 
 _URL = os.environ.get("KRYPT_SPOT_WS_URL") or "wss://advanced-trade-ws.coinbase.com"
@@ -49,8 +49,6 @@ _DISABLED = os.environ.get("KRYPT_SPOT_WS", "1").strip().lower() in (
     "0", "off", "false", "no",
 )
 
-# Kalshi 15m assets listed on Coinbase. HYPE (Hyperliquid) and BNB are not —
-# they stay on the REST chain, which is exactly the per-asset fallback path.
 PRODUCTS: dict[str, str] = {
     "BTC": "BTC-USD",
     "ETH": "ETH-USD",
@@ -60,12 +58,9 @@ PRODUCTS: dict[str, str] = {
 }
 _ASSET_BY_PRODUCT = {v: k for k, v in PRODUCTS.items()}
 
-# A price older than this is not served (consumer falls back to REST).
 _FRESH_SEC = 10.0
-_SILENT_TIMEOUT_SEC = 30.0  # no message for this long → force a reconnect
+_SILENT_TIMEOUT_SEC = 30.0
 _RECONNECT_MAX_SEC = 60.0
-# Sample ring: one print/second, sized to comfortably cover a settlement
-# window (60 prints) plus reconnect slop.
 _SAMPLES_MAX = 180
 _SETTLE_WINDOW_SEC = 60
 
@@ -77,16 +72,12 @@ class _Client:
         self._task: Optional[asyncio.Task] = None
         self._sampler_task: Optional[asyncio.Task] = None
         self._ws = None
-        self.last_msg_t: float = 0.0  # wall clock (time.time)
-        # asset -> (wall_ts, price). Wall clock throughout: settlement windows
-        # (close_time) are wall-clock UTC and samples must align with them.
+        self.last_msg_t: float = 0.0
         self.prices: dict[str, tuple[float, float]] = {}
-        # asset -> deque[(epoch_sec:int, price)] — one entry per wall second.
         self.samples: dict[str, deque] = {
             a: deque(maxlen=_SAMPLES_MAX) for a in PRODUCTS
         }
 
-    # ───────── lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
@@ -124,7 +115,6 @@ class _Client:
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    # ───────── connection loop ───────────────────────────────────────
 
     async def _run(self) -> None:
         attempt = 0
@@ -155,8 +145,6 @@ class _Client:
             self._ws = ws
             self.connected = True
             self.last_msg_t = time.time()
-            # Heartbeats keep the connection scored as live during quiet tapes;
-            # ticker delivers a message per trade batch for each product.
             await ws.send(json.dumps({
                 "type": "subscribe", "channel": "heartbeats",
             }))
@@ -181,11 +169,10 @@ class _Client:
         self.connected = False
         self._ws = None
 
-    # ───────── inbound ────────────────────────────────────────────────
 
     def handle_message(self, m: dict) -> None:
         if not isinstance(m, dict) or m.get("channel") != "ticker":
-            return  # heartbeats / subscribe acks / errors — nothing to store
+            return
         now = time.time()
         for ev in m.get("events") or []:
             for tk in (ev or {}).get("tickers") or []:
@@ -199,7 +186,6 @@ class _Client:
                 if px > 0:
                     self.prices[asset] = (now, px)
 
-    # ───────── once-per-second settlement sampler ─────────────────────
 
     def _sample_once(self, now: Optional[float] = None) -> None:
         """Append at most one (second, price) sample per asset per wall second
@@ -207,16 +193,14 @@ class _Client:
         count maps 1:1 onto settlement prints."""
         if now is None:
             import kalshi_auth
-            # close_epoch comes from Kalshi — attribute prints on the SERVER
-            # clock or a slow local clock shifts them into the wrong window.
             now = kalshi_auth.server_now()
         sec = int(now)
         for asset, (ts, px) in list(self.prices.items()):
             if now - ts > _FRESH_SEC:
-                continue  # stale quote — a gap in samples is honest
+                continue
             ring = self.samples[asset]
             if ring and ring[-1][0] >= sec:
-                continue  # already sampled this second
+                continue
             ring.append((sec, px))
 
     async def _sampler(self) -> None:
@@ -227,7 +211,6 @@ class _Client:
                 logger.debug(f"spot_ws: sampler error: {e}")
             await asyncio.sleep(1.0)
 
-    # ───────── sync read APIs ─────────────────────────────────────────
 
     def spot(self, asset: str) -> Optional[float]:
         rec = self.prices.get((asset or "").upper())
@@ -284,7 +267,6 @@ class _Client:
 _client = _Client()
 
 
-# Module-level delegators.
 def start() -> None:
     _client.start()
 

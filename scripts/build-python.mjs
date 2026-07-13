@@ -5,8 +5,6 @@ import { ensureVenv, run, VENV_PY, PY_DIR } from './python-utils.mjs';
 ensureVenv();
 
 console.log('>> Installing PyInstaller');
-// Range, not an exact pin: an exact pin (==6.6.0) rotted out of PyPI for the CI
-// runners' Python, failing the build. Any 6.x works for our usage.
 run(VENV_PY, ['-m', 'pip', 'install', 'pyinstaller>=6.6,<7', '--disable-pip-version-check']);
 
 console.log('>> Cleaning previous build');
@@ -31,15 +29,11 @@ run(VENV_PY, [
   '--hidden-import', 'categorize',
   '--hidden-import', 'config',
   '--hidden-import', 'webhook',
-  '--hidden-import', 'leaderboard',
   '--hidden-import', 'kalshi_ws',
   '--hidden-import', 'crypto15m',
   '--hidden-import', 'crypto15m_trader',
   '--hidden-import', 'crypto15m_record',
   '--hidden-import', 'backtest',
-  // Currently caught by static analysis, but pinned explicitly so a future
-  // lazy-import refactor can't silently drop them from the frozen bundle
-  // (replay is ALREADY lazy-imported inside the backtest RPC handlers).
   '--hidden-import', 'spot_ws',
   '--hidden-import', 'cf_ws',
   '--hidden-import', 'indicators',

@@ -18,14 +18,11 @@ from datetime import datetime
 from typing import Optional
 
 import backtest as bt
+import capturetrail as ct
 import crypto15m
 import crypto15m_trader
 import db as dbmod
 
-# Every field the live gates (built-in modes + rule vocabulary) can read,
-# derivable from a recorded tick. Rules referencing anything else fail closed
-# (0 trades) — replay detects that and says so instead of returning a silent
-# zero.
 _DERIVABLE = {
     "hasMarket", "favorite", "favoritePrice", "entryCost", "minsLeft",
     "inWindow", "signal", "modelProb", "edgeNetCents", "settlePrints",
@@ -44,7 +41,7 @@ def tick_to_asset(row: dict, cfg: dict, close_iso: str) -> dict:
     yes_bid, yes_ask = row.get("yes_bid"), row.get("yes_ask")
     no_ask = row.get("no_ask")
     if no_ask is None and yes_bid is not None:
-        no_ask = round(1.0 - float(yes_bid), 4)  # single complementary book
+        no_ask = round(1.0 - float(yes_bid), 4)
     fav = None
     fav_price = None
     if up_prob is not None:
@@ -66,11 +63,6 @@ def tick_to_asset(row: dict, cfg: dict, close_iso: str) -> dict:
         entry_cost = yes_ask
     elif fav == "down":
         entry_cost = no_ask
-    # Rebuild the built-in favorite signal EXACTLY as the live snapshot does
-    # (crypto15m.py signal expression): window + hours + threshold + the
-    # entry_max cap + direction-aware min-delta + strict-threshold (the
-    # executable ask must itself clear the threshold on a two-sided book).
-    # Omitting the last three made replay trade entries live would reject.
     strict = bool(cfg.get("crypto15m_strict_threshold", True))
     two_sided = bool(yes_bid and yes_ask)
     min_dp = crypto15m._const(cfg, "min_delta_pct")
@@ -128,10 +120,6 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
     entered at the first qualifying tick's executable ask, held to settlement.
     Returns aggregate stats + per-asset breakdown + honesty caveats."""
     cfg = dict(cfg)
-    # The replayed strategy is hypothetical — the live enable/arm switches
-    # must not zero the backtest. Same for the calibration autopause:
-    # historical pause state can't be reconstructed, so applying TODAY'S
-    # pause/resume to the whole window is wrong in both directions.
     cfg["crypto15m_enabled"] = True
     cfg["crypto15m_model_autopause"] = False
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
@@ -155,9 +143,6 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
     trades: list[dict] = []
     n_windows = 0
     for ticker, ticks in by_window.items():
-        # Honor the per-asset Trade toggles: live entries are filtered by
-        # asset_enabled in run_tick, so a "My current settings" replay must
-        # skip disabled assets too (they don't count as scanned either).
         if not crypto15m.asset_enabled(cfg, str(ticks[0].get("asset") or "")):
             continue
         n_windows += 1
@@ -190,7 +175,7 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
                 "pnlUsd": round(pnl_ct * contracts, 4),
                 "at": t.get("observed_at"),
             })
-            break  # one trade per window
+            break
 
     caveats = [
         "Entries fill at the recorded ask (taker); real fills can be worse and marketable orders sometimes miss entirely.",
@@ -206,6 +191,176 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
             f"never match in replay (0 trades is expected): {', '.join(missing)}"
         ))
     return _summarize(trades, contracts, n_windows, caveats)
+
+
+def _held_bid(row: dict, side: str) -> Optional[float]:
+    """Held-side taker-sell price (bid) from a tick, 0..1. Up sells YES at
+    yes_bid; down sells NO at no_bid = 1 - yes_ask (single complementary book).
+    None when the quote needed isn't recorded, so the caller skips that tick
+    instead of marking to a fabricated price."""
+    if side == "up":
+        b = row.get("yes_bid")
+        return float(b) if b and 0.0 < float(b) < 1.0 else None
+    ya = row.get("yes_ask")
+    if ya and 0.0 < float(ya) < 1.0:
+        return round(1.0 - float(ya), 4)
+    return None
+
+
+def _simulate_capturetrail(ticks: list[dict], entry_i: int, side: str,
+                           cost: float, params: ct.CTParams,
+                           contracts: int) -> Optional[dict]:
+    """Walk the ticks AFTER entry, marking the held side to its bid, and let
+    CaptureTrail decide the exit. Returns the exit leg {price, at, reason} or
+    None if it never fired (caller then holds to settlement).
+
+    entry_mark is the ask we PAID (cost); the mark each tick is the bid we
+    could SELL at — so the position is honestly down the spread from the first
+    tick, the trail tracks the bid, and the exit books at the bid."""
+    state = ct.CTState.open(cost)
+    for row in ticks[entry_i + 1:]:
+        bid = _held_bid(row, side)
+        if bid is None:
+            continue
+        done, reason = ct.step(state, bid, params)
+        if done:
+            return {"price": bid, "at": row.get("observed_at"), "reason": reason}
+    return None
+
+
+def replay_capturetrail(cfg: dict, *, env: str = "production",
+                        since_days: int = 60) -> dict:
+    """Head-to-head: the SAME live entries, booked two ways.
+
+    baseline    — held to settlement (what the live 15m trader does today).
+    capturetrail — CaptureTrail's trailing exit walks the window's remaining
+                   ticks; if it fires, the trade books at the held-side bid
+                   with BOTH an entry and an exit fee; if not, it falls through
+                   to settlement identically to the baseline.
+
+    Returns {baseline, capturetrail, delta, params} so the UI/CLI can show the
+    difference on the user's own recorded ticks. Same honesty caveats as
+    replay() plus the exit-sim ones."""
+    cfg = dict(cfg)
+    cfg["crypto15m_enabled"] = True
+    cfg["crypto15m_model_autopause"] = False
+    params = ct.params_from_cfg(cfg, "crypto15m")
+    contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
+
+    with dbmod.get_db() as conn:
+        rows = conn.execute(
+            """SELECT t.*, s.up_won, s.close_time AS sig_close
+               FROM crypto15m_ticks t
+               JOIN crypto15m_signals s
+                 ON s.ticker = t.ticker AND s.kalshi_env = t.kalshi_env
+               WHERE s.resolved = 1 AND s.up_won IS NOT NULL
+                 AND t.kalshi_env = ?
+                 AND t.observed_at >= datetime('now', ?)
+               ORDER BY t.ticker, t.observed_at""",
+            (env, f"-{int(since_days)} days"),
+        ).fetchall()
+
+    by_window: dict[str, list[dict]] = {}
+    for r in rows:
+        by_window.setdefault(r["ticker"], []).append(dict(r))
+
+    base_trades: list[dict] = []
+    ct_trades: list[dict] = []
+    n_windows = 0
+    n_ct_exits = 0
+    reasons: dict[str, int] = {}
+    for ticker, ticks in by_window.items():
+        if not crypto15m.asset_enabled(cfg, str(ticks[0].get("asset") or "")):
+            continue
+        n_windows += 1
+        up_won = int(ticks[0].get("up_won") or 0)
+        close_iso = str(ticks[0].get("sig_close") or "")
+        for i, t in enumerate(ticks):
+            asset = tick_to_asset(t, cfg, close_iso)
+            try:
+                ok, _why = crypto15m_trader.should_enter(
+                    asset, cfg, has_open=False, open_count=0,
+                )
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            side = crypto15m_trader._bought_side(asset, cfg)
+            if side not in ("up", "down"):
+                break
+            cost = asset["upAsk"] if side == "up" else asset["downAsk"]
+            if not cost or not (0.0 < float(cost) < 1.0):
+                break
+            cost = float(cost)
+            fee_in = bt.kalshi_fee_per_contract(cost, contracts=contracts)
+            won = up_won if side == "up" else (1 - up_won)
+
+            base_pnl = (1.0 - cost - fee_in) if won else (-cost - fee_in)
+            base_trades.append({
+                "ticker": ticker, "asset": asset["asset"], "side": side,
+                "costCents": round(cost * 100, 1), "minsLeft": asset["minsLeft"],
+                "won": bool(won), "pnlUsd": round(base_pnl * contracts, 4),
+                "at": t.get("observed_at"),
+            })
+
+            exit_leg = _simulate_capturetrail(ticks, i, side, cost, params, contracts)
+            if exit_leg is not None:
+                px = float(exit_leg["price"])
+                fee_out = bt.kalshi_fee_per_contract(px, contracts=contracts)
+                ct_pnl = px - cost - fee_in - fee_out
+                n_ct_exits += 1
+                reasons[exit_leg["reason"]] = reasons.get(exit_leg["reason"], 0) + 1
+                ct_trades.append({
+                    "ticker": ticker, "asset": asset["asset"], "side": side,
+                    "costCents": round(cost * 100, 1), "minsLeft": asset["minsLeft"],
+                    "won": ct_pnl > 0, "pnlUsd": round(ct_pnl * contracts, 4),
+                    "at": t.get("observed_at"), "reason": exit_leg["reason"],
+                    "exitCents": round(px * 100, 1),
+                })
+            else:
+                ct_trades.append({**base_trades[-1], "reason": "settled"})
+            break
+
+    base_caveats = [
+        "Baseline holds every position to settlement (the live 15m default).",
+        f"Ticks are 4-25s apart over {since_days} days of app uptime only.",
+        "In-sample: any threshold tuned against this panel is fit to the past.",
+    ]
+    ct_caveats = [
+        "CaptureTrail marks to the held-side BID (yes_bid / 1-yes_ask) — the "
+        "position is down the spread from tick 1, and exits book at the bid.",
+        "The trail only sees recorded ticks (4-25s apart); a real reversal "
+        "between ticks would fill worse. Both legs pay Kalshi's per-order fee.",
+        f"CaptureTrail exited {n_ct_exits} of {len(ct_trades)} trades early; "
+        f"reasons: {reasons or 'none'}. The rest settled identically to baseline.",
+    ] + base_caveats
+    if not params.active():
+        ct_caveats.insert(0, (
+            "CaptureTrail is OFF or has no active trigger in this config — the "
+            "two columns are identical. Set crypto15m_ct_enabled + a reversal_pct."
+        ))
+
+    base = _summarize(base_trades, contracts, n_windows, base_caveats)
+    capt = _summarize(ct_trades, contracts, n_windows, ct_caveats)
+    return {
+        "baseline": base,
+        "capturetrail": capt,
+        "delta": {
+            "totalPnlUsd": round(capt["totalPnlUsd"] - base["totalPnlUsd"], 2),
+            "netEvCentsPerContract": round(
+                capt["netEvCentsPerContract"] - base["netEvCentsPerContract"], 2),
+            "winRate": round(capt["winRate"] - base["winRate"], 4),
+            "maxDrawdownUsd": round(capt["maxDrawdownUsd"] - base["maxDrawdownUsd"], 2),
+            "earlyExits": n_ct_exits,
+            "exitReasons": reasons,
+        },
+        "params": {
+            "enabled": params.enabled, "minArmPct": params.min_arm_pct,
+            "unarmedStopPct": params.unarmed_stop_pct,
+            "reversalPct": params.reversal_pct, "noisePct": params.noise_pct,
+            "override": params.override,
+        },
+    }
 
 
 def _bucketize(trades: list[dict]) -> dict:
@@ -244,11 +399,6 @@ def _summarize(trades: list[dict], contracts: int, n_windows: int,
     n = len(trades)
     wins = sum(1 for t in trades if t["won"])
     total = sum(t["pnlUsd"] for t in trades)
-    # Per-contract EV must divide by the contracts each trade ACTUALLY sized
-    # (replay_main sizes n_ct = fixed_usd/cost per signal, ~2x the flat
-    # default at mid prices — the hardcoded denominator inflated the FE
-    # "Edge / contract" stat accordingly). Trades without a size fall back
-    # to the flat `contracts` (the crypto15m path, which sizes uniformly).
     denom = sum(int(t.get("contracts", contracts) or contracts) for t in trades)
     ev_ct = (total / denom * 100.0) if denom else 0.0
     by_asset: dict[str, dict] = {}

@@ -60,9 +60,6 @@ export function PositionsPage() {
     return { open, pending, won, lost, errors, all: positions.length };
   }, [positions]);
 
-  // The tab badges count every row shown (all environments, external imports
-  // included). The engine's max-open cap only counts bot-managed positions in
-  // the active env, so call out how many open/pending rows are outside it.
   const nonBotOpen = useMemo(
     () => positions.filter(
       (p) => !p.resolved
@@ -87,8 +84,6 @@ export function PositionsPage() {
   const refreshNow = async (): Promise<void> => {
     setBusy('refresh');
     try {
-      // Sync the local book with Kalshi: poll working orders for fresh fills,
-      // then reconcile open/external positions, before pulling the rows in.
       await window.krypt.backend.runOnce('pollOrders');
       await window.krypt.backend.runOnce('reconcilePositions');
       await Promise.all([refresh.positions(), refresh.account()]);
@@ -205,8 +200,6 @@ function Tabs<T extends string>({
 }
 
 function PositionRow({ p }: { p: BotPosition }) {
-  // Resolved rows show realized P&L; open filled rows show live (unrealized)
-  // mark-to-market P&L at the current price.
   const realized = p.resolved;
   const pnl = realized ? p.pnlUsd : p.livePnlUsd;
   return (

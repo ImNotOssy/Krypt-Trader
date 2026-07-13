@@ -139,15 +139,6 @@ export function AboutPage() {
               until you trust your config.
             </p>
             <p>
-              <span className="text-white">Anonymous usage data.</span> To power the
-              community leaderboard and improve the tool, Krypt Trader sends
-              <span className="text-white"> anonymous</span> usage data — your P&amp;L
-              statistics and strategy settings. It never sends your API keys,
-              credentials, account info, or any personal or per-install identifier.
-              Turn it off any time by setting{' '}
-              <span className="font-mono text-white">KRYPT_LEADERBOARD=0</span>.
-            </p>
-            <p>
               <span className="text-white">Affiliate &amp; affiliation.</span> Kalshi
               links here are referral links — if you sign up through one, Kalshi may
               credit both you and the authors. Krypt Trader is independent and is{' '}

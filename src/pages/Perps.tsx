@@ -5,8 +5,6 @@ import { Card, Page, Switch, useOptimisticValue } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
 
-// Must mirror PERPS_RULE_FIELDS in python/perps_strategy.py (the sanitizer
-// drops anything the engine doesn't compute).
 const PERPS_RULE_FIELDS: { v: string; label: string }[] = [
   { v: 'price', label: 'Price (USD)' },
   { v: 'spreadBps', label: 'Spread (bps)' },
@@ -29,12 +27,6 @@ const PERPS_RULE_FIELDS: { v: string; label: string }[] = [
 const RULE_OPS = ['>=', '<=', '>', '<'] as const;
 const PERP_SYMBOLS = ['KXBTCPERP', 'KXETHPERP', 'KXSOLPERP', 'KXXRPPERP', 'KXDOGEPERP'];
 
-// Strategy TEMPLATES — one-click starting points (like the 15m presets). These
-// are NOT proven winners: a wide sweep of the recorded data found no profitable
-// perps configuration (the ~5bps round-trip fee beats every signal). They exist
-// so you can pick a coherent, understandable strategy, backtest it on YOUR data,
-// and paper-trade — not to be armed blindly. Each sets direction + entry rules +
-// TP/SL + a cheap maker entry; Market / size / leverage stay as you set them.
 const PERPS_STRATS: { id: string; name: string; blurb: string; patch: Partial<TraderConfig> }[] = [
   { id: 'custom', name: 'My custom rules', blurb: 'Build your own from the fields below.', patch: {} },
   {
@@ -73,9 +65,6 @@ const PERPS_STRATS: { id: string; name: string; blurb: string; patch: Partial<Tr
       perpsStratTpBps: 30, perpsStratSlBps: 20, perpsStratMaxHoldMin: 30, perpsStratExitOnRulesFail: false,
     },
   },
-  // ── regime-gated variants: only fire in a specific market state. Run a pair
-  //    (e.g. Trend rider + Chop fader) in two paper shells for a crude
-  //    "switch strategy by regime" behavior the single engine can't do alone. ──
   {
     id: 'trend-hivol', name: 'Trend rider (high-vol)',
     blurb: 'Long a sustained 15-min up-move, but only when volatility is high enough to clear fees.',

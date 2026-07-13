@@ -69,7 +69,6 @@ def _capture_ticks(snap: dict, env: str) -> int:
                 "edge_net_cents": a.get("edgeNetCents"),
                 "settle_prints": a.get("settlePrints"),
                 "no_ask": a.get("downAsk"),
-                # snapshot-level: one spot chain per fetch, not per asset
                 "spot_source": snap.get("spotSource"),
                 "kalshi_env": env,
             })

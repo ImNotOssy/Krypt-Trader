@@ -35,7 +35,7 @@ def evaluate_rules(values: dict, rules: list) -> tuple[bool, str]:
         field = c.get("field")
         fn = RULE_OPS.get(c.get("op"))
         if not field or fn is None:
-            continue  # skip a malformed condition rather than fail the whole set
+            continue
         av = values.get(field)
         if av is None:
             return False, f"{field} unavailable"

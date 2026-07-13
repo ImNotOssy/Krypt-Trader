@@ -80,7 +80,6 @@ def test_run_maintenance_compacts_when_forced(fresh_db):
         assert c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
 
 
-# ───────── Tier 4: unresolved-signal + events pruning, pnl series ───────────
 
 
 def test_unresolved_alerts_and_whales_age_out(fresh_db):
@@ -98,7 +97,6 @@ def test_unresolved_alerts_and_whales_age_out(fresh_db):
                VALUES ('OLD-W', 'OLD-W-T', 't', 'yes', 100, 0.5, 5000, 70, 0,
                        datetime('now', '-60 days'))"""
         )
-        # Fresh unresolved rows must survive.
         conn.execute(
             """INSERT INTO alerts (ticker, title, signal_type, direction, price,
                                    confidence, resolved)
@@ -141,25 +139,18 @@ def test_pnl_snapshots_query_downsamples(fresh_db):
     with db.get_db() as conn:
         rows = db.get_pnl_snapshots(conn, since_hours=24, env="demo", max_points=100)
     assert 0 < len(rows) <= 101
-    # Newest point is always kept exact (the chart's live tip).
     assert rows[-1]["total_usd"] == pytest.approx(599.0)
-    # Old rows outside the window are excluded via the indexable predicate.
     with db.get_db() as conn:
         rows_1h = db.get_pnl_snapshots(conn, since_hours=1, env="demo", max_points=0)
-    assert 55 <= len(rows_1h) <= 62  # ~one per minute for the last hour
+    assert 55 <= len(rows_1h) <= 62
 
 
 def test_pnl_prune_keeps_alltime_anchor_snapshot(fresh_db):
-    # The 45-day pnl_snapshots prune used to delete the first-ever snapshot,
-    # so earliest_pnl_total (the "all-time" P&L/ROI baseline) silently rotated
-    # into a trailing-45-day window. One anchor row per env — the first
-    # POSITIVE-total snapshot — must survive every prune ($0 cold-cache rows
-    # must not be anchored).
     with db.get_db() as c:
         for total, at in [
-            (0.0, "-100 days"),    # cold-cache row: prunable, never an anchor
-            (200.0, "-99 days"),   # first positive row: THE anchor
-            (180.0, "-98 days"),   # stale mid-history row: prunable
+            (0.0, "-100 days"),
+            (200.0, "-99 days"),
+            (180.0, "-98 days"),
         ]:
             c.execute(
                 "INSERT INTO pnl_snapshots (at, kalshi_env, cash_usd, "
@@ -179,5 +170,5 @@ def test_pnl_prune_keeps_alltime_anchor_snapshot(fresh_db):
             for r in c.execute("SELECT total_usd FROM pnl_snapshots ORDER BY id")
         ]
         earliest = db.earliest_pnl_total(c, "demo")
-    assert totals == [200.0, 120.0]          # anchor + recent survive
-    assert earliest == pytest.approx(200.0)  # all-time baseline is stable
+    assert totals == [200.0, 120.0]
+    assert earliest == pytest.approx(200.0)

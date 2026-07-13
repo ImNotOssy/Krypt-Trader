@@ -118,12 +118,6 @@ def test_execute_skips_when_daily_cap_hit(fresh_db, env_demo, cfg):
 
 
 def test_daily_cap_counts_only_real_positions(fresh_db, env_demo):
-    # Regression: the daily new-positions cap must count ONLY rows that became or
-    # are still working toward a real position (submitted/partial/filled).
-    # Terminal non-position rows (canceled/error/gone/expired/dry_run) previously
-    # counted too, so a run of unfilled maker auto-cancels or Kalshi order
-    # rejections silently saturated max_daily_new_positions while zero contracts
-    # were held — halting all new entries until the day boundary.
     for st in ("submitted", "partial", "filled"):
         seed_position(status=st)
     for st in ("canceled", "error", "gone", "expired", "dry_run"):
@@ -134,20 +128,14 @@ def test_daily_cap_counts_only_real_positions(fresh_db, env_demo):
 
 
 def test_daily_cap_excludes_external_and_prior_days(fresh_db, env_demo):
-    # Only today's own-engine positions count: externals (incl. 15m fills) and
-    # positions created on a prior day must be excluded.
-    seed_position(status="filled")                                   # counts
-    seed_position(status="filled", signal_source="external")         # external
-    seed_position(status="filled", created_at_offset_sec=-90000)     # ~yesterday
+    seed_position(status="filled")
+    seed_position(status="filled", signal_source="external")
+    seed_position(status="filled", created_at_offset_sec=-90000)
     with db.get_db() as conn:
         assert db.count_new_positions_today(conn, "demo") == 1
 
 
 def test_daily_cap_not_saturated_by_dead_rows(fresh_db, env_demo, cfg):
-    # End-to-end guard on the gate: with a cap of 2, five dead (canceled/error/
-    # gone) rows from today must NOT block a fresh signal on the daily-cap path.
-    # (It still gets skipped here for lack of a real order fill, but NOT with the
-    # MAX_DAILY_NEW_POSITIONS reason — asserted via the surviving daily count.)
     cfg["max_open_positions"] = 100
     cfg["unlimited_daily_new_positions"] = False
     cfg["max_daily_new_positions"] = 2
@@ -301,11 +289,6 @@ def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_demo, cfg, mo
 
 
 def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo, cfg, monkeypatch):
-    # Kalshi cancels an order that had a PARTIAL fill: the unfilled remainder's
-    # cash is released, so exposure must count only the filled notional. Before
-    # the fix, target_contracts stayed at 5 and current_total_exposure_usd valued
-    # the dead remainder (5 × 50c = $2.50) as committed capital, over-counting and
-    # needlessly blocking new entries until resolution.
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-CP",
                         target_contracts=5, limit_price_cents=50)
@@ -316,7 +299,7 @@ def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo,
     async def _canceled_partial(_oid):
         return {"order": {
             "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
-            "taker_fill_cost": 100, "maker_fill_cost": 0,   # 2 @ 50c = 100c = $1.00
+            "taker_fill_cost": 100, "maker_fill_cost": 0,
             "place_count": 5, "remaining_count": 3,
         }}
 
@@ -327,16 +310,13 @@ def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo,
     row = fetch(pid)
     assert row["status"] == "partial"
     assert row["filled_contracts"] == 2
-    assert row["target_contracts"] == 2          # collapsed to the filled qty
+    assert row["target_contracts"] == 2
     with db.get_db() as conn:
         exposure = db.current_total_exposure_usd(conn, "demo")
-    assert exposure == pytest.approx(1.0)        # filled notional only, not $2.50
+    assert exposure == pytest.approx(1.0)
 
 
 def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, cfg, monkeypatch):
-    # A still-RESTING partial's remainder IS held by Kalshi, so exposure must keep
-    # counting the full committed notional (target × limit) — the collapse must
-    # NOT fire here (that would under-count exposure and let the bot over-deploy).
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-RP",
                         target_contracts=5, limit_price_cents=50)
@@ -357,10 +337,10 @@ def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, 
     run_async(trader.poll_open_orders(cfg))
     row = fetch(pid)
     assert row["status"] == "partial"
-    assert row["target_contracts"] == 5          # remainder still live → unchanged
+    assert row["target_contracts"] == 5
     with db.get_db() as conn:
         exposure = db.current_total_exposure_usd(conn, "demo")
-    assert exposure == pytest.approx(2.5)        # full committed notional counted
+    assert exposure == pytest.approx(2.5)
 
 
 def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_demo, cfg, monkeypatch):
@@ -474,15 +454,9 @@ def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_demo, cfg, monkeypa
 
 
 
-# ───────── swarm-audit regressions: order lifecycle races ─────────
 
 
 def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, cfg, monkeypatch):
-    # The transport layer retries a timed-out POST with the SAME
-    # client_order_id; Kalshi rejects the retry as a duplicate (4xx). That
-    # means attempt 1 WAS delivered — the order is live. Booking 'error'
-    # (the old blanket-4xx path) hid a live resting order from the
-    # exposure/open-count/dup-market caps.
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -508,8 +482,6 @@ def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, 
 
 
 def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo, cfg, monkeypatch):
-    # Same rejection shape but the coid lookup CONFIRMS no such order exists
-    # -> 'error' is correct (and the row stays out of the caps).
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -532,11 +504,6 @@ def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo
 
 
 def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, monkeypatch):
-    # An env switch lands while the POST is in flight -> synthesized 409
-    # env_changed. The coid lookup would now sign for the OTHER account, where
-    # the order can never appear — a miss there is NOT a confirmed miss. The
-    # row must book 'submitted'/UNCONFIRMED (poll resolves it when its env is
-    # active again), not 'error' (which hides a possibly-live order).
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -544,7 +511,7 @@ def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, m
     monkeypatch.setattr(trader, "get_env", lambda: env_now["v"])
 
     async def _place(**_kw):
-        env_now["v"] = "prod"  # flip lands mid-POST
+        env_now["v"] = "prod"
         raise KalshiAPIError(409, {"error": {
             "code": "env_changed",
             "message": "environment switched mid-request; aborted",
@@ -563,14 +530,10 @@ def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, m
     assert row["kalshi_order_id"] is None
     assert "UNCONFIRMED" in (row["error"] or "")
     with db.get_db() as conn:
-        # The row still occupies a cap slot in ITS env.
         assert db.count_open_bot_positions(conn, "demo") == 1
 
 
 def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
-    # Cancel-all used to write 'canceled' blind — a fill that raced the cancel
-    # left held contracts outside the open-count/exposure caps, and the
-    # resolution pass could flat-resolve the 0-fill row (unrecoverable).
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA1",
                         target_contracts=5, limit_price_cents=50)
 
@@ -580,7 +543,7 @@ def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
     async def _order(_oid):
         return {"order": {
             "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
-            "taker_fill_cost": 100, "maker_fill_cost": 0,   # 2 @ 50c
+            "taker_fill_cost": 100, "maker_fill_cost": 0,
             "place_count": 5, "remaining_count": 0,
         }}
 
@@ -590,12 +553,12 @@ def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
     n = run_async(trader.cancel_all_open())
     assert n == 1
     row = fetch(pid)
-    assert row["status"] == "partial"            # fills kept, not 'canceled'
+    assert row["status"] == "partial"
     assert row["filled_contracts"] == 2
-    assert row["target_contracts"] == 2          # dead remainder collapsed
+    assert row["target_contracts"] == 2
     assert row["cost_usd"] == pytest.approx(1.0)
     with db.get_db() as conn:
-        assert db.count_open_bot_positions(conn, "demo") == 1  # still in the cap
+        assert db.count_open_bot_positions(conn, "demo") == 1
 
 
 def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monkeypatch):
@@ -621,8 +584,6 @@ def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monke
 
 
 def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, monkeypatch):
-    # Post-cancel fill read fails -> DON'T guess: leave 'submitted' so the
-    # poll loop books the truth next cycle.
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA3",
                         target_contracts=5)
 
@@ -636,13 +597,11 @@ def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, mon
     monkeypatch.setattr(trader, "get_order", _order)
 
     n = run_async(trader.cancel_all_open())
-    assert n == 1                                # the cancel itself succeeded
-    assert fetch(pid)["status"] == "submitted"   # row untouched
+    assert n == 1
+    assert fetch(pid)["status"] == "submitted"
 
 
 def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_demo, cfg, monkeypatch):
-    # UI Refresh's runOnce('pollOrders') races the loop's poll; the second
-    # entrant must no-op instead of double-cancelling the same expired order.
     def _boom(conn, env=None):
         raise AssertionError("a second poll ran while one was active")
 
@@ -655,10 +614,6 @@ def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_demo, cfg, mon
 
 
 def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monkeypatch):
-    # cancel 404s (another poll's cancel won, or a fill consumed the order) —
-    # the fill state must be re-read before booking a terminal status. Here a
-    # raced FILL exists: the row must stay 'submitted' for the next poll, not
-    # be killed as 'gone' at 0 fills.
     trader._poll_failures.clear()
     cfg["order_expiration_sec"] = 90
     pid = seed_position(status="submitted", kalshi_order_id="OID-R404",
@@ -671,13 +626,13 @@ def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monk
 
     async def _order(_oid):
         calls["n"] += 1
-        if calls["n"] == 1:  # pre-cancel read: still resting, 0 fills
+        if calls["n"] == 1:
             return {"order": {
                 "status": "resting", "taker_fill_count": 0, "maker_fill_count": 0,
                 "taker_fill_cost": 0, "maker_fill_cost": 0,
                 "place_count": 5, "remaining_count": 5,
             }}
-        return {"order": {  # post-404 re-read: the fill that raced the cancel
+        return {"order": {
             "status": "executed", "taker_fill_count": 5, "maker_fill_count": 0,
             "taker_fill_cost": 300, "maker_fill_cost": 0,
             "place_count": 5, "remaining_count": 0,
@@ -691,7 +646,7 @@ def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monk
     monkeypatch.setattr(trader, "cancel_order", _cancel_404)
 
     run_async(trader.poll_open_orders(cfg))
-    assert fetch(pid)["status"] == "submitted"   # left for the next poll
+    assert fetch(pid)["status"] == "submitted"
 
 
 def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo, cfg, monkeypatch):
@@ -727,9 +682,6 @@ def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo,
 
 
 def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cfg, monkeypatch):
-    # ~3 minutes of connectivity loss used to 'gone' rows whose orders were
-    # resting live: every failed coid lookup / order read bumped the shared
-    # give-up counter. Failures are not misses.
     trader._poll_failures.clear()
     pid_nokid = seed_position(status="submitted", kalshi_order_id=None,
                               target_contracts=5)
@@ -743,7 +695,7 @@ def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cf
     monkeypatch.setattr(trader, "find_order_by_client_id", _net_down)
     monkeypatch.setattr(trader, "get_order", _net_down)
 
-    for _ in range(8):  # well past _POLL_FAILURE_THRESHOLD
+    for _ in range(8):
         run_async(trader.poll_open_orders(cfg))
 
     assert fetch(pid_nokid)["status"] == "submitted"
@@ -751,8 +703,6 @@ def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cf
 
 
 def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkeypatch):
-    # A lookup that SUCCEEDS and finds nothing IS evidence — after the
-    # threshold the missing-kid row still retires to 'gone'.
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id=None,
                         target_contracts=5)
@@ -772,32 +722,27 @@ def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkey
 
 
 def test_resolve_defers_fresh_gone_rows_to_poll_window(fresh_db, env_demo, cfg):
-    # 'gone' is a give-up, not a confirmed state: the resolution pass must
-    # not flat-resolve it while the 24h re-poll retention can still recover a
-    # live order (resolving also blocks the reconcile import for 24h more).
     pid = seed_position(status="gone", filled_contracts=0, cost_usd=0.0)
 
     run_async(trader.mark_resolved_positions(cfg))
-    assert fetch(pid)["resolved"] == 0           # left inside the window
+    assert fetch(pid)["resolved"] == 0
 
     with db.get_db() as conn:
         conn.execute(
             "UPDATE bot_positions SET created_at=datetime('now','-25 hours') WHERE id=?",
             (pid,))
     run_async(trader.mark_resolved_positions(cfg))
-    assert fetch(pid)["resolved"] == 1           # retention elapsed -> closed
+    assert fetch(pid)["resolved"] == 1
 
 
 def test_pending_query_is_env_scoped(fresh_db):
-    # Cross-env leak: the poll signs for the CURRENT env; feeding it the
-    # other env's rows 404-killed live orders on every env switch.
     seed_position(status="submitted", kalshi_order_id="OID-D1", kalshi_env="demo")
     seed_position(status="submitted", kalshi_order_id="OID-P1", kalshi_env="production")
     with db.get_db() as conn:
         demo = db.get_pending_bot_positions(conn, "demo")
         both = db.get_pending_bot_positions(conn)
     assert [r["kalshi_order_id"] for r in demo] == ["OID-D1"]
-    assert len(both) == 2                        # no-env call keeps old shape
+    assert len(both) == 2
 
 
 def test_refresh_balance_is_per_env(monkeypatch):

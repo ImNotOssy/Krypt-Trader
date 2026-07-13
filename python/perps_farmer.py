@@ -51,27 +51,13 @@ from kalshi_api import KalshiAPIError
 
 logger = logging.getLogger("perps_farmer")
 
-TICK_MICRO = 100                    # $0.0001 tick in micro-dollars
-# Stand down only if we haven't RECEIVED a top-of-book for the symbol in this
-# long (local receipt time, not Kalshi's wire ts_ms). Kalshi's perps ticker is
-# coalesced and thin/new markets update their book slowly — 30-120s between
-# changes is normal on a healthy stream — so a tight window here (the old 10s,
-# borrowed from the high-frequency 15m/spot feeds) made the farmer read "quote
-# stale" on nearly every tick and never quote. A slow book is safe to join:
-# post_only quotes can never cross, a dead stream is already caught by
-# is_connected(), and adverse selection is measured + auto-halted downstream.
+TICK_MICRO = 100
 _QUOTE_FRESH_MS = 180_000
 _RECONCILE_SEC = 60.0
 _BALANCE_CACHE_SEC = 60.0
-# Fee gate: farming's net cost ≈ the maker fee, so we let the user cap the fee
-# they'll farm at. The fee we're charged is measured from real fills; before any
-# fills exist we assume Kalshi's Tier-0 maker fee (the highest), so an unknown
-# fee keeps the gate CLOSED rather than trading blind.
 _DEFAULT_MAKER_FEE_BPS = 5.0
 _FEE_REFRESH_SEC = 300.0
-_MIN_COST_SAMPLE_USD = 500.0        # measured-cost halt needs ≥ this much volume
-# Thursday maintenance 3-5 AM ET. July = EDT (UTC-4) → 07:00-09:00 UTC,
-# padded. Winter shifts an hour; the pad + Kalshi's own order rejects cover it.
+_MIN_COST_SAMPLE_USD = 500.0
 _MAINT_START_UTC = (6, 50)
 _MAINT_END_UTC = (9, 10)
 
@@ -83,13 +69,12 @@ def _utc_day(ts: float | None = None) -> str:
 
 def in_maintenance_window(dt: datetime | None = None) -> bool:
     dt = dt or datetime.now(timezone.utc)
-    if dt.weekday() != 3:  # Thursday
+    if dt.weekday() != 3:
         return False
     hm = (dt.hour, dt.minute)
     return _MAINT_START_UTC <= hm < _MAINT_END_UTC
 
 
-# ───────── pure decision helpers (unit-tested directly) ─────────────────────
 
 def desired_quotes(
     quote: dict, inventory_cc: int, cfg: dict,
@@ -102,13 +87,13 @@ def desired_quotes(
         return {}
     min_spread = int(cfg.get("perps_farm_min_spread_ticks", 2)) * TICK_MICRO
     if ask - bid < min_spread:
-        return {}  # too tight: joining both sides guarantees negative capture
+        return {}
     max_inv = int(cfg.get("perps_farm_max_inventory_contracts", 3)) * 100
     out: dict[str, int] = {}
     if inventory_cc < max_inv:
-        out["bid"] = bid   # join best bid
+        out["bid"] = bid
     if inventory_cc > -max_inv:
-        out["ask"] = ask   # join best ask
+        out["ask"] = ask
     return out
 
 
@@ -124,38 +109,35 @@ def apply_fill(inv_cc: int, avg_micro: float, side: str, count_cc: int,
     signed = count_cc if side == "bid" else -count_cc
     realized = 0.0
     if inv_cc == 0 or (inv_cc > 0) == (signed > 0):
-        # extending (or opening) — new weighted average
         total = abs(inv_cc) + abs(signed)
         avg_micro = (avg_micro * abs(inv_cc) + price_micro * abs(signed)) / total
         inv_cc += signed
     else:
-        # reducing / flipping
         reduce_cc = min(abs(inv_cc), abs(signed))
-        direction = 1 if inv_cc > 0 else -1   # +1: we were long, selling out
+        direction = 1 if inv_cc > 0 else -1
         realized = direction * (price_micro - avg_micro) * reduce_cc / 100.0
         inv_cc += signed
         if (inv_cc > 0) != (direction > 0) and inv_cc != 0:
-            avg_micro = float(price_micro)   # flipped: remainder opened here
+            avg_micro = float(price_micro)
         elif inv_cc == 0:
             avg_micro = 0.0
     return inv_cc, avg_micro, int(round(realized))
 
 
-# ───────── engine ────────────────────────────────────────────────────────────
 
 class _Farmer:
     def __init__(self) -> None:
         self.env: str = "production"
         self.running: bool = False
-        self.halted_day: str = ""      # UTC day the halt applies to
+        self.halted_day: str = ""
         self.halt_reason: str = ""
         self.inventory_cc: int = 0
         self.avg_entry_micro: float = 0.0
-        self.live: dict[str, dict] = {}       # side -> {order_id, price_micro, count_cc, client_order_id}
-        self.last_fill_ts: int = 0            # unix seconds, fills poll cursor
+        self.live: dict[str, dict] = {}
+        self.last_fill_ts: int = 0
         self._last_reconcile: float = 0.0
         self._last_balance_t: float = 0.0
-        self._maker_fee_bps: float | None = None   # measured from fills; None = unknown
+        self._maker_fee_bps: float | None = None
         self._last_fee_calc: float = 0.0
         self._balance_ok: bool = False
         self._margin_enabled: bool | None = None
@@ -164,7 +146,6 @@ class _Farmer:
         self._stats_dirty: bool = True
         self._stats_day: str = ""
 
-    # ── lifecycle ────────────────────────────────────────────────────
 
     def _wire_ticker(self, cfg: dict) -> str:
         sym = str(cfg.get("perps_farm_symbol") or "KXBTCPERP").upper().rstrip("1")
@@ -184,7 +165,6 @@ class _Farmer:
         if cancel_orders:
             await self._cancel_all()
 
-    # ── order plumbing ───────────────────────────────────────────────
 
     async def _cancel_all(self) -> None:
         for side in list(self.live):
@@ -211,12 +191,8 @@ class _Farmer:
                     "count_cc": count_cc, "client_order_id": coid,
                 }
         except KalshiAPIError as e:
-            # Clean rejection (post_only would cross, banding, margin…) —
-            # the order is definitively NOT live; requote next tick.
             logger.debug(f"perps_farmer: place {side} rejected: {e}")
         except Exception as e:
-            # Lost response — the order may be live. Recover by client id
-            # before assuming it isn't (the codebase's order-lifecycle rule).
             try:
                 o = await papi.find_perps_order_by_client_id(coid, ticker=ticker)
             except Exception:
@@ -229,7 +205,6 @@ class _Farmer:
             else:
                 logger.debug(f"perps_farmer: place {side} failed: {e}")
 
-    # ── fills & accounting ───────────────────────────────────────────
 
     async def _poll_fills(self, ticker: str, cfg: dict) -> None:
         min_ts = self.last_fill_ts - 5 if self.last_fill_ts else int(time.time()) - 3600
@@ -243,12 +218,6 @@ class _Farmer:
             tkr = f.get("market_ticker") or f.get("ticker") or ""
             if tkr != ticker:
                 continue
-            # /margin/fills identifies a fill as `fill_id` (the public trade
-            # tape uses `trade_id`; the fills endpoint does NOT). Reading the
-            # wrong key left trade_id empty and skipped EVERY fill — inventory
-            # reconciled off the positions endpoint while volume/fees/P&L (and
-            # therefore the cost + daily-loss halts) stayed at zero. Keep
-            # trade_id as a fallback in case the schema ever converges.
             trade_id = str(f.get("fill_id") or f.get("trade_id") or "")
             if not trade_id:
                 continue
@@ -272,9 +241,6 @@ class _Farmer:
                 "side": str(f.get("side") or ""),
                 "count_cc": count,
                 "price_usd_micro": price,
-                # /margin/fills reports fees as `fees` (dollars). `fee_cost` is
-                # the event-order field name and is absent here — reading it
-                # booked every fill at zero fee, understating farming cost.
                 "fee_usd_micro": papi.usd_micro(
                     f.get("fees") if f.get("fees") is not None
                     else f.get("fee_cost")) or 0,
@@ -299,8 +265,6 @@ class _Farmer:
                 self._stats_dirty = True
                 if r["ts_ms"]:
                     self.last_fill_ts = max(self.last_fill_ts, int(r["ts_ms"] // 1000))
-                # A filled resting order is gone (partial fills re-quote next
-                # tick at the fresh touch — simpler than tracking remainders).
                 for side, o in list(self.live.items()):
                     if o.get("order_id") == r["order_id"]:
                         self.live.pop(side, None)
@@ -370,7 +334,6 @@ class _Farmer:
         if target > 0 and vol_usd >= target:
             self._halt(f"daily volume target ${target:,.0f} reached")
 
-    # ── reconcile ────────────────────────────────────────────────────
 
     async def _reconcile(self, ticker: str) -> None:
         try:
@@ -419,7 +382,6 @@ class _Farmer:
                 self.last_error = f"balance check failed: {e}"
         return self._balance_ok
 
-    # ── main tick ────────────────────────────────────────────────────
 
     async def farm_tick(self, cfg: dict) -> None:
         """Awaited from the service loop every ≥2.5s while enabled. Never raises."""
@@ -434,7 +396,6 @@ class _Farmer:
         ticker = self._wire_ticker(cfg)
         self.running = True
 
-        # Fills first — accounting stays true even while standing down.
         await self._poll_fills(ticker, cfg)
         self._check_economics(cfg)
         self._refresh_maker_fee()
@@ -448,10 +409,6 @@ class _Farmer:
             return
         q = pws.quote(ticker)
         now_ms = int(time.time() * 1000)
-        # Freshness is judged by when we last RECEIVED a frame for this symbol
-        # (recv_ms, local clock — skew-immune), NOT Kalshi's wire ts_ms, which
-        # tracks market-event time and lags real time on slow perps books. Fall
-        # back to ts_ms only for legacy quotes without recv_ms.
         age_ref = q.get("recv_ms") or q.get("ts_ms") if q else None
         if not q or (age_ref and now_ms - int(age_ref) > _QUOTE_FRESH_MS):
             self.last_error = "quote stale"
@@ -478,7 +435,6 @@ class _Farmer:
         )
         clip_cc = max(1, int(cfg.get("perps_farm_clip_contracts", 1))) * 100
 
-        # Drop sides we no longer want.
         for side in list(self.live):
             if side not in want:
                 o = self.live.pop(side)
@@ -488,8 +444,6 @@ class _Farmer:
                     pass
 
         for side, target in want.items():
-            # Cross-guard: our two resting orders must never be able to match
-            # each other (venue STP is the backstop, this is the primary).
             other = self.live.get("ask" if side == "bid" else "bid")
             if other:
                 if side == "bid" and target >= other["price_micro"]:
@@ -540,7 +494,7 @@ class _Farmer:
 
     def status(self, cfg: dict) -> dict:
         day = self._refresh_day_stats()
-        self._refresh_maker_fee()   # keep the displayed fee current even while off
+        self._refresh_maker_fee()
         vol = day.get("volume_usd_micro", 0) / 1e6 if day else 0.0
         fees = day.get("fees_usd_micro", 0) / 1e6 if day else 0.0
         realized = day.get("realized_usd_micro", 0) / 1e6 if day else 0.0

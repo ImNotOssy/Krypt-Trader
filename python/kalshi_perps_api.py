@@ -41,28 +41,22 @@ _PERPS_BASES = {
     "demo": "https://external-api.demo.kalshi.co",
     "production": "https://external-api.kalshi.com",
 }
-PUBLIC_BASE = _PERPS_BASES["production"]  # public reads ALWAYS prod (see docstring)
+PUBLIC_BASE = _PERPS_BASES["production"]
 
 PATH_PREFIX = "/trade-api/v2"
 REQUEST_TIMEOUT = 25.0
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.5
-# Same hot-path budget rationale as kalshi_api: order place/cancel and
-# orderbook reads must fail in seconds, not ride out 3 × 25s.
 HOT_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=6.0, pool=6.0)
 KEEPALIVE_SEC = 60.0
-# 1m candles per request window. The event API caps pages at 5000; the perps
-# spec documents NO cap — chunk defensively and detect truncation instead of
-# trusting one call.
 CANDLE_CHUNK = 3000
-PERIOD_MIN_VALID = (1, 60, 1440)  # Kalshi perps have NO 15m granularity
+PERIOD_MIN_VALID = (1, 60, 1440)
 
 _pub_client: Optional[httpx.AsyncClient] = None
 _signed_client: Optional[httpx.AsyncClient] = None
 _signed_env: str = ""
 
 
-# ───────── fixed-point money/count helpers (Decimal, never float) ───────────
 
 _MICRO = Decimal("1000000")
 _CC = Decimal("100")
@@ -137,7 +131,6 @@ def env_ticker(symbol: str, env: str) -> str:
     return s
 
 
-# ───────── HTTP plumbing ─────────────────────────────────────────────────────
 
 async def _get_pub_client() -> httpx.AsyncClient:
     global _pub_client
@@ -305,7 +298,6 @@ async def _signed_request(
     raise RuntimeError("exhausted retries without response")
 
 
-# ───────── public market data (always prod, soft-fail) ──────────────────────
 
 async def fetch_perps_markets(status: str = "") -> list[dict]:
     """All perps markets with live bid/ask/price, reference/settlement/
@@ -393,8 +385,6 @@ async def fetch_perps_candlesticks_range(
             if ets:
                 out[ets] = c
                 max_end = max(max_end, ets)
-        # Truncated page (ended early with data) → resume after the last
-        # candle; complete page → next window.
         cursor = (max_end + period_s) if 0 < max_end < window_end else (window_end + period_s)
         if cursor > end_ts:
             break
@@ -472,7 +462,6 @@ async def fetch_perps_risk_parameters() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-# ───────── signed account/portfolio (follows the active env) ────────────────
 
 async def get_perps_enabled() -> bool:
     try:
@@ -484,8 +473,6 @@ async def get_perps_enabled() -> bool:
 
 async def get_perps_balance(*, compute_available_balance: bool = True,
                             pin_env: str | None = None) -> dict:
-    # available_balance is 0 unless compute_available_balance is passed —
-    # never read the cheap call's 0 as "broke" (balance-flash-zero bug class).
     params = {"compute_available_balance": "true"} if compute_available_balance else None
     return await _signed_request(
         "GET", "/margin/balance", params=params, pin_env=pin_env,
@@ -567,16 +554,13 @@ async def get_perps_notional_risk_limit() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-# ───────── signed orders ────────────────────────────────────────────────────
-# NOT wired into any strategy yet — present so demo lifecycle rehearsal and
-# the eventual perps trader share one audited order path from day one.
 
 async def place_perps_limit_order(
     *,
     ticker: str,
-    side: str,                  # "bid" (buy/long) | "ask" (sell/short)
-    count_cc: int,              # centi-contracts (100 = 1 contract)
-    price_usd_micro: int,       # micro-dollars (tick = 100 micro = $0.0001)
+    side: str,
+    count_cc: int,
+    price_usd_micro: int,
     time_in_force: str = "good_till_canceled",
     post_only: bool = False,
     reduce_only: bool = False,
@@ -592,7 +576,6 @@ async def place_perps_limit_order(
     if price_usd_micro <= 0:
         raise ValueError(f"price_usd_micro must be positive, got {price_usd_micro}")
     if reduce_only and time_in_force == "good_till_canceled":
-        # The API rejects reduce_only GTC outright — fail fast with a clear message.
         raise ValueError("reduce_only requires immediate_or_cancel or fill_or_kill")
 
     body: dict = {
@@ -608,8 +591,6 @@ async def place_perps_limit_order(
         body["post_only"] = True
     if reduce_only:
         body["reduce_only"] = True
-    # Same env-flip serialization as kalshi_api.place_limit_order: read the env
-    # under ENV_LOCK, pin every attempt to it; a switch mid-flight aborts.
     async with ENV_LOCK:
         env0 = get_env()
     return await _signed_request(

@@ -4,7 +4,6 @@ import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import spriteUrl from '../assets/mossy.png';
 
-// 4:5 portrait — "slightly bigger than square", Instagram-friendly.
 const W = 1080;
 const H = 1350;
 const FRAMES = 8;
@@ -38,7 +37,6 @@ function drawStat(ctx: CanvasRenderingContext2D, x: number, label: string, value
 }
 
 function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame: number, s: Stats) {
-  // ── background ──
   ctx.fillStyle = '#0A0A0F';
   ctx.fillRect(0, 0, W, H);
   let g = ctx.createRadialGradient(W / 2, H * 0.30, 60, W / 2, H * 0.30, W * 0.85);
@@ -50,14 +48,12 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
   g.addColorStop(1, 'rgba(10,10,15,0)');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
 
-  // glowing frame
   ctx.save();
   ctx.shadowColor = 'rgba(34,197,94,0.5)'; ctx.shadowBlur = 30;
   ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(52,211,153,0.5)';
   roundRect(ctx, 26, 26, W - 52, H - 52, 40); ctx.stroke();
   ctx.restore();
 
-  // ── header ──
   ctx.textAlign = 'center';
   ctx.fillStyle = 'rgba(255,255,255,0.95)';
   ctx.font = '34px "Press Start 2P", monospace';
@@ -66,7 +62,6 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
   ctx.fillStyle = 'rgba(161,161,170,0.9)';
   ctx.fillText('A U T O - T R A D E R   S T A T S', W / 2, 192);
 
-  // ── sprite on a glowing platform ──
   const size = 300;
   g = ctx.createRadialGradient(W / 2, 560, 10, W / 2, 560, 230);
   g.addColorStop(0, 'rgba(34,197,94,0.32)');
@@ -76,7 +71,6 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
   ctx.drawImage(sprite, (frame % FRAMES) * FRAME_PX, 0, FRAME_PX, FRAME_PX, W / 2 - size / 2, 270, size, size);
   ctx.imageSmoothingEnabled = true;
 
-  // ── hero: P&L ──
   const pos = s.pnl >= 0;
   const col = pos ? '#22C55E' : '#EF4444';
   ctx.font = '600 34px "Chakra Petch", sans-serif';
@@ -89,13 +83,11 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
   ctx.fillText(`${pos ? '+' : '-'}$${money(Math.abs(s.pnl), 2)}`, W / 2, 815);
   ctx.restore();
 
-  // ── volume | trades ──
   drawStat(ctx, W * 0.30, 'VOLUME', `$${money(s.volume)}`);
   drawStat(ctx, W * 0.70, 'TRADES', `${money(s.trades)}`);
   ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(W / 2, 952); ctx.lineTo(W / 2, 1052); ctx.stroke();
 
-  // ── footer url ──
   ctx.save();
   ctx.shadowColor = 'rgba(34,197,94,0.6)'; ctx.shadowBlur = 18;
   ctx.font = '600 40px "Chakra Petch", sans-serif';
@@ -137,7 +129,6 @@ export function FlexStatsCard({ onClose }: { onClose: () => void }) {
       raf = requestAnimationFrame(loop);
     };
     const start = () => { if (!cancelled) raf = requestAnimationFrame(loop); };
-    // wait for the web fonts so the first frame isn't drawn in a fallback face
     if (document.fonts?.ready) document.fonts.ready.then(start).catch(start);
     else start();
     return () => { cancelled = true; cancelAnimationFrame(raf); };

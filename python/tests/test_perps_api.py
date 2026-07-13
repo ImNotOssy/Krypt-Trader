@@ -12,14 +12,11 @@ import kalshi_auth
 import kalshi_perps_api as papi
 
 
-# ───────── fixed-point helpers ───────────────────────────────────────────────
 
 def test_usd_micro_roundtrip():
     assert papi.usd_micro("6.3500") == 6_350_000
     assert papi.micro_str(6_350_000) == "6.3500"
-    # 6dp REST values are exact
     assert papi.usd_micro("5000.000000") == 5_000_000_000
-    # the float trap: Decimal path must be exact at the tick
     assert papi.usd_micro("0.0001") == 100
     assert papi.usd_micro(None) is None
     assert papi.usd_micro("garbage") is None
@@ -29,7 +26,6 @@ def test_cc_roundtrip():
     assert papi.cc("1200.00") == 120_000
     assert papi.cc("0.01") == 1
     assert papi.cc(None) is None
-    # whole contracts emit without decimals (no fractional trading live)
     assert papi.cc_str(120_000) == "1200"
     assert papi.cc_str(50) == "0.5"
 
@@ -52,7 +48,6 @@ def test_env_ticker():
     assert papi.env_ticker("KXBTCPERP1", "demo") == "KXBTCPERP1"
 
 
-# ───────── request plumbing ──────────────────────────────────────────────────
 
 class _FakeResp:
     def __init__(self, status: int, body):
@@ -118,7 +113,7 @@ def test_env_pinning_aborts_on_flip(monkeypatch):
     monkeypatch.setattr(papi, "_get_signed_client", fake_client)
     with pytest.raises(kalshi_api.KalshiAPIError) as ei:
         asyncio.run(papi._signed_request("GET", "/margin/balance"))
-    assert ei.value.status == 409  # env_changed abort, not a silent cross-env call
+    assert ei.value.status == 409
 
 
 def test_401_timestamp_self_heal(monkeypatch):
@@ -160,11 +155,9 @@ def test_pub_get_soft_fails_to_none(monkeypatch):
     monkeypatch.setattr(papi, "_get_pub_client", fake_client)
     monkeypatch.setattr(papi, "RETRY_BACKOFF", 0.0)
     assert asyncio.run(papi._pub_get("/margin/markets")) is None
-    # and the list-shaped wrappers turn that into []
     assert asyncio.run(papi.fetch_perps_markets()) == []
 
 
-# ───────── candlesticks ──────────────────────────────────────────────────────
 
 def test_period_interval_validated():
     with pytest.raises(ValueError):
@@ -183,7 +176,6 @@ def test_candles_range_chunks_and_dedupes(monkeypatch):
     async def fake_fetch(ticker, start_ts, end_ts, period):
         windows.append((start_ts, end_ts))
         if len(windows) == 1:
-            # truncated page: window asked further but data stops early
             return [_mk_candle(t) for t in range(start_ts, start_ts + 5 * 60, 60)]
         return [_mk_candle(t) for t in range(start_ts, min(end_ts, start_ts + 5 * 60), 60)]
 
@@ -195,7 +187,6 @@ def test_candles_range_chunks_and_dedupes(monkeypatch):
     ))
     ends = [c["end_period_ts"] for c in out]
     assert ends == sorted(set(ends)), "duplicated or unsorted periods"
-    # first page truncated at 240 within a 0..600 window → resume from 300
     assert windows[0] == (0, 600)
     assert windows[1][0] == 300
 
@@ -211,7 +202,6 @@ def test_candles_range_terminates_on_empty(monkeypatch):
     assert out == []
 
 
-# ───────── orders ────────────────────────────────────────────────────────────
 
 def test_place_order_validation():
     with pytest.raises(ValueError):
@@ -222,7 +212,6 @@ def test_place_order_validation():
         asyncio.run(papi.place_perps_limit_order(
             ticker="KXBTCPERP", side="bid", count_cc=0, price_usd_micro=6_350_000,
         ))
-    # reduce_only + GTC is rejected by the API — must fail fast locally
     with pytest.raises(ValueError):
         asyncio.run(papi.place_perps_limit_order(
             ticker="KXBTCPERP", side="ask", count_cc=100,
@@ -247,8 +236,8 @@ def test_place_order_body_is_fixed_point_strings(monkeypatch):
     method, path, kw = fake.calls[0]
     body = kw["json"]
     assert path == "/trade-api/v2/margin/orders"
-    assert body["price"] == "6.3501"     # decimal-dollar string, 4dp
-    assert body["count"] == "1"          # whole contracts, no decimals
-    assert body["side"] == "bid"         # bid/ask, never yes/no
+    assert body["price"] == "6.3501"
+    assert body["count"] == "1"
+    assert body["side"] == "bid"
     assert body["time_in_force"] == "immediate_or_cancel"
     assert body["client_order_id"]
