@@ -1,27 +1,62 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FlaskConical } from 'lucide-react';
-import type { Crypto15mBacktest } from '@shared/types';
+import type { Crypto15mBacktest, TraderConfig } from '@shared/types';
+import { backtestInputKey, isStaleBacktestResult } from '@shared/backtest-state';
+import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
 
 /** "Test this strategy on my data" — replays the CURRENT saved 15m config
  * through the live entry gates over the app's own recorded ticks. The number
  * users see is what the engine would actually have traded, fees included. */
 export function BacktestPanel() {
+  const { config } = useApp();
   const [busy, setBusy] = useState(false);
   const [res, setRes] = useState<Crypto15mBacktest | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const latestBacktestKeyRef = useRef('');
+  const runSeqRef = useRef(0);
+  const activeBacktestKey = backtestInputKey({
+    engine: 'crypto15m',
+    selection: 'current',
+    days: 60,
+    patch: {},
+    currentConfig: crypto15mConfigSlice(config),
+  });
+
+  useEffect(() => {
+    latestBacktestKeyRef.current = activeBacktestKey;
+    runSeqRef.current += 1;
+    setBusy(false);
+    setRes(null);
+    setErr(null);
+  }, [activeBacktestKey]);
+
+  const rejectionEntries = res?.rejectionBreakdown?.length
+    ? res.rejectionBreakdown.slice(0, 6)
+    : res?.rejections
+      ? Object.entries(res.rejections).slice(0, 6).map(([reason, count]) => ({
+          reason,
+          count,
+          pct: (res.rejectionTotal ?? 0) > 0 ? count / (res.rejectionTotal ?? 1) : 0,
+        }))
+      : [];
 
   const run = async () => {
+    const runKey = activeBacktestKey;
+    const seq = ++runSeqRef.current;
     setBusy(true);
     setErr(null);
+    setRes(null);
     try {
       const r = await window.krypt.crypto15m.backtest({ sinceDays: 60 });
+      if (seq !== runSeqRef.current || isStaleBacktestResult(runKey, latestBacktestKeyRef.current)) return;
       setRes(r);
       if (!r) setErr('Engine not running — start the app backend first.');
     } catch (e: any) {
+      if (seq !== runSeqRef.current || isStaleBacktestResult(runKey, latestBacktestKeyRef.current)) return;
       setErr(e?.message || String(e));
     } finally {
-      setBusy(false);
+      if (seq === runSeqRef.current) setBusy(false);
     }
   };
 
@@ -61,11 +96,22 @@ export function BacktestPanel() {
             />
             <Stat label="Max drawdown" value={fmtUsd(res.maxDrawdownUsd)} tone="bad" />
           </div>
+          {res.dataset && <DatasetManifestBar dataset={res.dataset} />}
           {Object.keys(res.byAsset).length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {Object.entries(res.byAsset).map(([a, st]) => (
                 <span key={a} className="rounded bg-krypt-surface2 px-1.5 py-0.5 font-mono text-[10px] text-krypt-dim">
                   {a} {st.wins}/{st.n} <span className={st.pnlUsd >= 0 ? 'text-krypt-win' : 'text-krypt-loss'}>{fmtUsd(st.pnlUsd, { sign: true })}</span>
+                </span>
+              ))}
+            </div>
+          )}
+          {rejectionEntries.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {rejectionEntries.map(({ reason, count, pct }) => (
+                <span key={reason} className="rounded bg-krypt-surface2 px-1.5 py-0.5 font-mono text-[10px] text-krypt-dim">
+                  {reason}: <span className="text-white">{count.toLocaleString()}</span>
+                  <span className="ml-1 text-krypt-muted">{(pct * 100).toFixed(1)}%</span>
                 </span>
               ))}
             </div>
@@ -77,6 +123,30 @@ export function BacktestPanel() {
           </ul>
         </div>
       )}
+    </div>
+  );
+}
+
+function crypto15mConfigSlice(config: TraderConfig | null): Partial<TraderConfig> | null {
+  if (!config) return null;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(config)) {
+    if (k.startsWith('crypto15m') && k !== 'crypto15mLive') out[k] = v;
+  }
+  return out as Partial<TraderConfig>;
+}
+
+function DatasetManifestBar({ dataset }: { dataset: NonNullable<Crypto15mBacktest['dataset']> }) {
+  const rows = dataset.inSampleRowCount !== dataset.rowCount
+    ? `${dataset.rowCount.toLocaleString()} rows / ${dataset.inSampleRowCount.toLocaleString()} in sample`
+    : `${dataset.rowCount.toLocaleString()} rows`;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-krypt-border bg-krypt-surface2/40 px-2 py-1.5 text-[10px] text-krypt-dim">
+      <span className="uppercase tracking-wide text-krypt-muted">Dataset</span>
+      <code className="break-all text-white">{dataset.datasetId}</code>
+      <span>{rows}</span>
+      <span>{dataset.windows.toLocaleString()} windows</span>
+      <span title={dataset.sha256}>sha {dataset.sha256.slice(0, 12)}</span>
     </div>
   );
 }

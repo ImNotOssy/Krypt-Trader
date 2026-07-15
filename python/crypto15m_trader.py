@@ -99,6 +99,14 @@ def direction_for_favorite(favorite: str) -> str:
     return "yes" if favorite == "up" else "no"
 
 
+def strategy_mode(cfg: dict) -> str:
+    return str(cfg.get("crypto15m_strategy_mode") or "directional").lower()
+
+
+def is_btc_ma_crossover(cfg: dict) -> bool:
+    return strategy_mode(cfg) == "btc_ma_crossover"
+
+
 def evaluate_rules(asset: dict, rules: list) -> tuple[bool, str]:
     """Evaluate the crypto entry rule-set against an asset snapshot (fields are
     snapshot keys like favoritePrice / macdHist / rsi / minsLeft / arbEdgeCents).
@@ -132,6 +140,18 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
     return up if direction == "yes" else (1.0 - up)
 
 
+def side_bid_from_market(market: Optional[dict], direction: str) -> Optional[float]:
+    if not market:
+        return None
+    yes_bid = crypto15m._price_dollars(market, "yes_bid")
+    if direction == "yes":
+        return yes_bid if yes_bid and yes_bid > 0 else None
+    yes_ask = crypto15m._price_dollars(market, "yes_ask")
+    if yes_ask and 0.0 < yes_ask < 1.0:
+        return 1.0 - yes_ask
+    return None
+
+
 _WS_QUOTE_MAX_AGE_MS = 15_000.0
 
 
@@ -163,6 +183,8 @@ def _bought_side(asset: dict, cfg: dict) -> Optional[str]:
     """The side the executor would BUY for this asset — the favorite, its
     opposite in contrarian mode, or the settlement model's side in model
     (sniper) mode. None until the relevant signal exists."""
+    if is_btc_ma_crossover(cfg):
+        return btc_ma_crossover_side(asset, cfg)
     mode = (cfg.get("crypto15m_direction_mode") or "favorite").lower()
     if mode == "model":
         mp = asset.get("modelProb")
@@ -220,6 +242,118 @@ def momentum_filters_ok(asset: dict, cfg: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _asset_float(asset: dict, key: str) -> Optional[float]:
+    v = asset.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    return f
+
+
+def _entry_ask_for_side(asset: dict, side: str) -> Optional[float]:
+    ask = asset.get("upAsk") if side == "up" else asset.get("downAsk")
+    if ask is None and side == "up":
+        ask = asset.get("yesAsk")
+    if ask is None and side == "down":
+        yb = asset.get("yesBid")
+        if yb is not None:
+            try:
+                ask = 1.0 - float(yb)
+            except (TypeError, ValueError):
+                ask = None
+    try:
+        f = float(ask)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0 or f >= 1:
+        return None
+    return f
+
+
+def _seconds_left_from_asset(asset: dict) -> Optional[float]:
+    sl = asset.get("secondsLeft")
+    try:
+        if sl is not None:
+            return float(sl)
+    except (TypeError, ValueError):
+        return None
+    ce = crypto15m._parse_close_epoch(asset.get("closeTime") or "")
+    if ce is not None:
+        return ce - kalshi_auth.server_now()
+    ml = asset.get("minsLeft")
+    try:
+        return float(ml) * 60.0 if ml is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _seconds_left_from_position(pos: dict) -> Optional[float]:
+    ce = crypto15m._parse_close_epoch(pos.get("close_time") or "")
+    if ce is None:
+        return None
+    return ce - kalshi_auth.server_now()
+
+
+def _btc_ma_crossover_side_or_reason(asset: dict) -> tuple[Optional[str], str]:
+    ema = _asset_float(asset, "ema12_1m")
+    slow = _asset_float(asset, "sma20_1m")
+    trend = _asset_float(asset, "sma50_5m")
+    spot = _asset_float(asset, "spotUsd")
+    if spot is None:
+        return None, str(asset.get("spotUsdReason") or "spot unavailable")
+    if ema is None:
+        return None, str(asset.get("ema12_1m_reason") or "ema12 unavailable")
+    if slow is None:
+        return None, str(asset.get("sma20_1m_reason") or "sma20 unavailable")
+    if trend is None:
+        return None, str(asset.get("sma50_5m_reason") or "sma50 5m unavailable")
+    if ema > slow and spot > trend:
+        return "up", "ok"
+    if ema < slow and spot < trend:
+        return "down", "ok"
+    return None, "moving averages not aligned"
+
+
+def btc_ma_crossover_side(asset: dict, cfg: dict) -> Optional[str]:
+    side, _why = _btc_ma_crossover_side_or_reason(asset)
+    return side
+
+
+def should_enter_btc_ma_crossover(
+    asset: dict, cfg: dict, *, has_open: bool, open_count: int
+) -> tuple[bool, str]:
+    if str(asset.get("asset") or "").upper() != "BTC":
+        return False, "BTC only"
+    if has_open or open_count > 0:
+        return False, "position_size != 0"
+    seconds_left = _seconds_left_from_asset(asset)
+    min_left = int(cfg.get("crypto15m_min_entry_seconds_left", 120) or 120)
+    if seconds_left is None:
+        return False, "seconds_left unavailable"
+    if seconds_left <= min_left:
+        return False, f"seconds_left {seconds_left:.0f} <= {min_left}"
+    side, why = _btc_ma_crossover_side_or_reason(asset)
+    if side is None:
+        return False, why
+    ask = _entry_ask_for_side(asset, side)
+    if ask is None:
+        return False, f"{side} ask unavailable"
+    cents = int(round(ask * 100.0))
+    lo = int(cfg.get("crypto15m_min_entry_cents", 5) or 5)
+    hi = int(cfg.get("crypto15m_max_entry_cents", 59) or 59)
+    side_label = "YES" if side == "up" else "NO"
+    if cents < lo:
+        return False, f"{side_label} ask below {lo}c"
+    if cents > hi:
+        return False, f"{side_label} ask above {hi}c"
+    return True, "ok"
+
+
 _FM_MIN_PRINTS = 30
 _FM_MAX_PRINTS = 54
 _FM_MIN_PROB = 0.9985
@@ -228,6 +362,14 @@ _FM_MIN_PROB = 0.9985
 def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> tuple[bool, str]:
     if not cfg.get("crypto15m_enabled"):
         return False, "disabled"
+    if is_btc_ma_crossover(cfg):
+        if not asset.get("hasMarket"):
+            return False, "no market"
+        if not crypto15m.hours_ok(cfg, hour=asset.get("hourUtc")):
+            return False, "outside trading hours"
+        return should_enter_btc_ma_crossover(
+            asset, cfg, has_open=has_open, open_count=open_count,
+        )
     if has_open:
         return False, "already open"
     max_conc = int(cfg.get("crypto15m_max_concurrent", len(crypto15m.SERIES)))
@@ -455,9 +597,18 @@ def _pos_to_js(r: dict) -> dict:
 
 async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optional[dict]:
     mode = (cfg.get("crypto15m_direction_mode") or "favorite").lower()
+    strat_mode = strategy_mode(cfg)
     favorite = a.get("favorite")
     fav_price = float(a.get("favoritePrice") or 0.0)
-    if mode == "contrarian":
+    if strat_mode == "btc_ma_crossover":
+        side = btc_ma_crossover_side(a, cfg)
+        if side not in ("up", "down"):
+            return None
+        entry_cost = _entry_ask_for_side(a, side)
+        if entry_cost is None:
+            return None
+        conf = 100.0
+    elif mode == "contrarian":
         side = "down" if favorite == "up" else "up"
         entry_cost = max(0.01, 1.0 - fav_price)
         conf = entry_cost * 100.0
@@ -474,13 +625,14 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
         conf = fav_price * 100.0
     direction = direction_for_favorite(side)
     style = (cfg.get("crypto15m_entry_style") or "maker").lower()
-    if mode == "model":
+    if mode == "model" and strat_mode != "btc_ma_crossover":
         style = "taker"
     if style == "maker":
         limit_cents = maker_limit_cents(side, a.get("yesBid"), a.get("yesAsk"), entry_cost)
     else:
         limit_cents = entry_limit_cents(entry_cost, crypto15m._const(cfg, "entry_diff"))
     if (
+        strat_mode == "directional" and
         mode == "favorite"
         and not cfg.get("crypto15m_use_rules")
         and bool(cfg.get("crypto15m_strict_threshold", True))
@@ -527,7 +679,9 @@ async def _open_entry(a: dict, cfg: dict, env: str, balance_usd: float) -> Optio
     ticker = a.get("ticker")
     coid = f"krypt-c15-{a['asset']}-{uuid.uuid4().hex[:8]}"
     ml = a.get("minsLeft")
-    strategy = "rules" if cfg.get("crypto15m_use_rules") else mode
+    strategy = strat_mode if strat_mode == "btc_ma_crossover" else (
+        "rules" if cfg.get("crypto15m_use_rules") else mode
+    )
     if mode == "model" and ml is not None and float(ml) < 1.0:
         strategy = "model_fm"
     row = {
@@ -714,16 +868,19 @@ async def _place_exit(
     pid, ticker, direction = pos["id"], pos["ticker"], pos["direction"]
     filled = int(pos.get("filled_contracts") or 0)
     slippage = _stop_slippage(cfg) if reason == "stop_loss" else 0
-    exit_cents: Optional[int] = None
-    try:
-        book = await kalshi_api.get_orderbook(ticker)
-        bids = book.get(direction) or []
-        if bids:
-            exit_cents = max(int(b[0]) for b in bids if b and b[0] is not None)
-    except Exception:
-        exit_cents = None
+    exit_cents: Optional[int] = 1 if reason == "force_exit" else None
     if exit_cents is None:
-        sp = side_prob_from_market(market, direction) or 0.0
+        try:
+            book = await kalshi_api.get_orderbook(ticker)
+            bids = book.get(direction) or []
+            if bids:
+                exit_cents = max(int(b[0]) for b in bids if b and b[0] is not None)
+        except Exception:
+            exit_cents = None
+    if exit_cents is None:
+        sp = side_bid_from_market(market, direction)
+        if sp is None:
+            sp = side_prob_from_market(market, direction) or 0.0
         exit_cents = int(round(sp * 100)) - 2
     exit_cents = max(1, min(99, exit_cents - slippage))
 
@@ -926,7 +1083,8 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
     if cur_limit and cur_limit <= best_bid:
         return None
 
-    new_cents = max(1, min(99, best_bid - _stop_slippage(cfg)))
+    chase_slippage = _stop_slippage(cfg) if reason == "stop_loss" else 0
+    new_cents = max(1, min(99, best_bid - chase_slippage))
     kid = pos.get("exit_kalshi_order_id")
     if not kid:
         return None
@@ -1011,6 +1169,28 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
         return db.fetch_crypto15m_by_id(conn, pos["id"])
 
 
+def _is_btc_ma_position(pos: dict, cfg: dict) -> bool:
+    return (pos.get("strategy") or "") == "btc_ma_crossover" or (
+        is_btc_ma_crossover(cfg) and str(pos.get("asset") or "").upper() == "BTC"
+    )
+
+
+def btc_ma_exit_reason(pos: dict, market: Optional[dict], cfg: dict) -> Optional[str]:
+    seconds_left = _seconds_left_from_position(pos)
+    if seconds_left is None:
+        return None
+    force_left = int(cfg.get("crypto15m_force_exit_seconds_left", 5) or 5)
+    if seconds_left <= force_left:
+        return "force_exit"
+    stop_left = int(cfg.get("crypto15m_time_stop_seconds_left", 60) or 60)
+    if seconds_left <= stop_left:
+        bid = side_bid_from_market(market, pos.get("direction") or "")
+        stop_cents = int(cfg.get("crypto15m_time_stop_cents", 10) or 10)
+        if bid is not None and bid * 100.0 <= stop_cents:
+            return "time_stop"
+    return None
+
+
 async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
     status = pos.get("status")
 
@@ -1073,6 +1253,12 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
                 outcome_correct=correct, settlement_usd=settlement, pnl_usd=pnl,
             )
             return db.fetch_crypto15m_by_id(conn, pid)
+
+    if _is_btc_ma_position(pos, cfg):
+        reason = btc_ma_exit_reason(pos, market, cfg)
+        if reason:
+            return await _place_exit(pos, market, cfg, reason=reason)
+        return None
 
     side_prob = side_prob_from_market(market, direction)
     if should_take_profit(pos, side_prob, cfg):

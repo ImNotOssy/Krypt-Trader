@@ -97,6 +97,7 @@ export interface TraderConfig {
 
   crypto15mEnabled?: boolean;
   crypto15mLive?: boolean;
+  crypto15mPollSec?: number;
   crypto15mSizingMode?: 'fixed' | 'balance_pct';
   crypto15mOrderSize?: number;
   crypto15mBalancePct?: number;
@@ -104,7 +105,18 @@ export interface TraderConfig {
   crypto15mMaxTotalPct?: number;             // aggregate cap: total committed 15m cost ≤ this fraction of bankroll; 0 = off
   crypto15mMaxConcurrent?: number;
   crypto15mAssets?: string[] | null;        // which assets the executor may enter (null = all)
+  crypto15mStrategyMode?: 'directional' | 'btc_ma_crossover';
   crypto15mDirectionMode?: 'favorite' | 'contrarian' | 'model';
+  crypto15mFastEmaPeriod?: number;
+  crypto15mSlowSmaPeriod?: number;
+  crypto15mTrendSmaPeriod?: number;
+  crypto15mTrendTimeframeMin?: number;
+  crypto15mMinEntryCents?: number;
+  crypto15mMaxEntryCents?: number;
+  crypto15mMinEntrySecondsLeft?: number;
+  crypto15mTimeStopCents?: number;
+  crypto15mTimeStopSecondsLeft?: number;
+  crypto15mForceExitSecondsLeft?: number;
   crypto15mModelMinProb?: number;                // sniper: min model probability for the bought side (0.5–1)
   crypto15mModelMinEdgeCents?: number;           // sniper: min fee-adjusted edge vs the ask (¢)
   crypto15mModelFinalMinute?: boolean;           // sniper: allow final-60s entries with ≥30 settlement prints + 3σ certainty
@@ -425,7 +437,18 @@ export interface Crypto15mConstants {
   entryMax: number;
   minDeltaPct?: number;
   entryDiff: number;
-  directionMode?: 'favorite' | 'contrarian';
+  strategyMode?: 'directional' | 'btc_ma_crossover';
+  directionMode?: 'favorite' | 'contrarian' | 'model';
+  fastEmaPeriod?: number;
+  slowSmaPeriod?: number;
+  trendSmaPeriod?: number;
+  trendTimeframeMin?: number;
+  minEntryCents?: number;
+  maxEntryCents?: number;
+  minEntrySecondsLeft?: number;
+  timeStopCents?: number;
+  timeStopSecondsLeft?: number;
+  forceExitSecondsLeft?: number;
   entryStyle?: 'maker' | 'taker';
   hoursStartUtc?: number;
   hoursEndUtc?: number;
@@ -468,6 +491,9 @@ export interface Crypto15mAsset {
   macdHist?: number | null;      // MACD histogram = macd − signal
   macdCross?: number | null;     // +1 bullish / −1 bearish / 0 no cross on this bar
   rsi?: number | null;           // Wilder RSI(14), 0..100
+  ema12_1m?: number | null;      // EMA(12) from 1-minute closes
+  sma20_1m?: number | null;      // SMA(20) from 1-minute closes
+  sma50_5m?: number | null;      // SMA(50) from 5-minute closes
   strikeUsd?: number | null;       // Kalshi strike (fallback: tracked window open)
   deltaSignedPct?: number | null;  // (spot − strike)/strike; + = above strike
   sigma1m?: number | null;         // realized 1-min return vol (fraction/√min)
@@ -539,6 +565,81 @@ export interface Crypto15mSizing {
   note: string;
 }
 
+export interface Crypto15mBacktestGroup {
+  n: number;
+  wins: number;
+  winRate: number;
+  pnlUsd: number;
+  avgPnlUsd: number;
+  edgeCentsPerContract: number;
+  maxDrawdownUsd: number;
+}
+
+export interface Crypto15mBacktestBucket extends Crypto15mBacktestGroup {
+  label: string;
+}
+
+export interface Crypto15mBacktestTrade {
+  ticker: string;
+  asset: string;
+  side: string;
+  entrySide?: 'YES' | 'NO';
+  signalType?: 'bullish' | 'bearish';
+  secondsLeft?: number | null;
+  yesAskCents?: number | null;
+  noAskCents?: number | null;
+  costCents: number;
+  entryPriceCents?: number | null;
+  contracts?: number;
+  spotUsd?: number | null;
+  ema12_1m?: number | null;
+  sma20_1m?: number | null;
+  sma50_5m?: number | null;
+  emaSpreadPct?: number | null;
+  trendDistancePct?: number | null;
+  exitReason?: string;
+  exitPriceCents?: number | null;
+  entryFeeUsd?: number | null;
+  exitFeeUsd?: number | null;
+  feesUsd?: number | null;
+  minsLeft: number | null;
+  won: boolean;
+  upWon?: boolean;
+  pnlUsd: number;
+  at: string;
+  timeline?: string[];
+}
+
+export interface Crypto15mBacktestStats {
+  longestWinningStreak: number;
+  longestLosingStreak: number;
+  averageWinUsd: number;
+  averageLossUsd: number;
+  profitFactor: number | null;
+  medianTradeUsd: number;
+  largestWinUsd: number;
+  largestLossUsd: number;
+  recoveryFactor: number | null;
+}
+
+export interface Crypto15mDatasetManifest {
+  schemaVersion: number;
+  datasetId: string;
+  source: string;
+  env: KalshiEnv;
+  sinceDays: number;
+  firstTimestamp: string | null;
+  lastTimestamp: string | null;
+  rowCount: number;
+  inSampleRowCount: number;
+  windows: number;
+  assets: string[];
+  replayMode: string;
+  sha256: string;
+  digestColumns?: string[];
+  validation?: Record<string, unknown>;
+}
+
 export interface Crypto15mBacktest {
   n: number;
   wins: number;
@@ -549,11 +650,246 @@ export interface Crypto15mBacktest {
   contracts: number;
   windowsScanned: number;
   byAsset: Record<string, { n: number; wins: number; pnlUsd: number }>;
+  rejections?: Record<string, number> | Record<string, unknown>[];
+  rejectionTotal?: number;
+  rejectionBreakdown?: { reason: string; count: number; pct: number }[];
+  bySide?: Record<'YES' | 'NO', Crypto15mBacktestGroup>;
+  entryPriceBuckets?: Crypto15mBacktestBucket[];
+  timeLeftBuckets?: Crypto15mBacktestBucket[];
+  tradeStats?: Crypto15mBacktestStats;
+  dataset?: Crypto15mDatasetManifest;
   equity: { at: string | null; value: number }[];
   byHourUtc: { hour: number; n: number; wins: number; pnlUsd: number }[];
   byDay: { day: string; n: number; wins: number; pnlUsd: number }[];
-  trades: { ticker: string; asset: string; side: string; costCents: number; minsLeft: number | null; won: boolean; pnlUsd: number; at: string }[];
+  trades: Crypto15mBacktestTrade[];
   caveats: string[];
+}
+
+export interface Crypto15mOptimizationMetric {
+  n: number;
+  wins: number;
+  winRate: number;
+  pnlUsd: number;
+  avgPnlUsd: number;
+  netEvCentsPerContract: number;
+  maxDrawdownUsd: number;
+  profitFactor: number | null;
+}
+
+export interface Crypto15mOptimizationCandidate {
+  candidateId: string;
+  params: Record<string, number | string | boolean | null>;
+  eligible: boolean;
+  score: number;
+  reason?: string;
+  splits: {
+    train: Crypto15mOptimizationMetric;
+    validation: Crypto15mOptimizationMetric;
+    test: Crypto15mOptimizationMetric;
+  };
+  bootstrap: {
+    samples: number;
+    meanNetEvCentsPerContract: number;
+    ciLow: number;
+    ciHigh: number;
+    probabilityPositive: number;
+  };
+  tradeCount: number;
+  backtest?: { n: number; windowsScanned?: number; signalsScanned?: number; rejectionTotal: number };
+}
+
+export interface Crypto15mOptimizationHeatmap {
+  xParam: string;
+  yParam: string;
+  cells: {
+    x: number | string | boolean | null;
+    y: number | string | boolean | null;
+    score: number;
+    n: number;
+    eligible: boolean;
+  }[];
+}
+
+export type Crypto15mResearchValue = number | string | boolean | null;
+
+export interface Crypto15mResearchFeatureValue {
+  value: Crypto15mResearchValue;
+  candidates: number;
+  validationEdgeCents: number;
+  testEdgeCents: number;
+  bootstrapPositive: number;
+  score: number;
+}
+
+export interface Crypto15mResearchFeatureAttribution {
+  feature: string;
+  label: string;
+  bestValue: Crypto15mResearchValue;
+  worstValue: Crypto15mResearchValue;
+  liftCents: number;
+  bestValidationEdgeCents: number;
+  worstValidationEdgeCents: number;
+  bestTestEdgeCents: number;
+  worstTestEdgeCents: number;
+  values: Crypto15mResearchFeatureValue[];
+  confidence: string;
+  takeaway: string;
+}
+
+export interface Crypto15mResearchComparison {
+  winnerId: string;
+  loserId: string;
+  metricDeltas: {
+    trainEdgeCents: number;
+    validationEdgeCents: number;
+    testEdgeCents: number;
+    testPnlUsd: number;
+    bootstrapPositive: number;
+  };
+  parameterDeltas: Record<string, {
+    winner: Crypto15mResearchValue;
+    loser: Crypto15mResearchValue;
+    change: string;
+  }>;
+  explanation: string;
+}
+
+export interface Crypto15mResearchExperiment {
+  id: string;
+  title: string;
+  priority: 'high' | 'medium' | 'low' | string;
+  rationale: string;
+  paramGrid: Record<string, Crypto15mResearchValue[]>;
+  minTrades: number;
+  bootstrapSamples: number;
+  requiresHumanApproval: boolean;
+}
+
+export interface Crypto15mResearchCandidateProfile {
+  id: string;
+  name: string;
+  kind: 'crypto15m' | 'main';
+  sourceCandidateId: string;
+  description: string;
+  patch: Partial<TraderConfig>;
+  pythonConfigPatch: Record<string, Crypto15mResearchValue>;
+  exportProfile: {
+    kryptTraderProfile: 1;
+    profile: {
+      id: string;
+      name: string;
+      description?: string;
+      kind: 'crypto15m' | 'main';
+      baseProfileId?: string;
+      baseProfileName?: string;
+      generatedBy?: 'optimizer' | string;
+      optimizerRunId?: string;
+      candidateId?: string;
+      configMode?: 'full' | 'patch' | string;
+      createdAt: string;
+      updatedAt: string;
+      config: Partial<TraderConfig>;
+    };
+  };
+  configMode: 'full' | 'patch' | string;
+  baseProfileId?: string;
+  baseProfileName?: string;
+  changedConfig: {
+    key: string;
+    label: string;
+    from: Crypto15mResearchValue;
+    to: Crypto15mResearchValue;
+  }[];
+  preservedSummary: string[];
+  metrics: {
+    trainEdgeCents: number;
+    validationEdgeCents: number;
+    testEdgeCents: number;
+    bootstrapPositive: number;
+    tradeCount: number;
+  };
+  approval: {
+    required: boolean;
+    status: 'pending' | 'approved' | 'rejected' | string;
+    reason: string;
+  };
+  deployment: {
+    liveAllowed: boolean;
+    blockedUntil: string;
+    notes: string[];
+  };
+}
+
+export interface Crypto15mResearchPackage {
+  packageVersion: number;
+  analysisMode: 'local_research_ai' | string;
+  generatedAt: string;
+  status: string;
+  researchWinner: string | null;
+  summary: string;
+  researchReport?: {
+    format: 'markdown' | string;
+    title: string;
+    body: string;
+  };
+  featureAttribution: Crypto15mResearchFeatureAttribution[];
+  winnerLoserComparisons: Crypto15mResearchComparison[];
+  suggestedExperiments: Crypto15mResearchExperiment[];
+  candidateProfiles: Crypto15mResearchCandidateProfile[];
+  eligibilityRules?: {
+    minTradesPerSplit: number;
+    requiresPositiveValidation: boolean;
+    requiresPositiveTest: boolean;
+    requiresPositiveWalkForward: boolean;
+  };
+  outOfSampleRejections?: {
+    candidateId: string;
+    reason: string;
+    reasons?: string[];
+    validationEdgeCents: number;
+    testEdgeCents: number;
+    walkForwardEdgeCents: number;
+    splitCounts: { train: number; validation: number; test: number };
+  }[];
+  deploymentPolicy: {
+    requiresHumanApproval: boolean;
+    liveDeploymentAllowed: boolean;
+    blockedActions: string[];
+  };
+  caveats: string[];
+}
+
+export interface Crypto15mOptimizationResult {
+  engine: 'crypto15m' | 'main';
+  env: string;
+  sourceMode?: 'whale' | 'momentum' | 'combined' | string;
+  sinceDays: number;
+  gridSize: number;
+  minTrades: number;
+  baseProfileId?: string;
+  baseProfileName?: string;
+  baseConfig?: Record<string, unknown>;
+  optimizerRunId?: string;
+  paramGrid: Record<string, unknown[]>;
+  fixedRiskUsd?: number;
+  slippageCents?: number;
+  executionModel?: string;
+  dataset?: Crypto15mDatasetManifest;
+  ranked: Crypto15mOptimizationCandidate[];
+  candidates: Crypto15mOptimizationCandidate[];
+  heatmap: Crypto15mOptimizationHeatmap;
+  walkForward: {
+    folds: {
+      fold: number;
+      selectedCandidateId: string | null;
+      params?: Record<string, unknown>;
+      train?: Crypto15mOptimizationMetric;
+      metrics: Crypto15mOptimizationMetric;
+    }[];
+    summary: Crypto15mOptimizationMetric;
+  };
+  caveats: string[];
+  research?: Crypto15mResearchPackage;
 }
 
 export interface CollectionStats {
@@ -568,8 +904,74 @@ export interface CollectionStats {
     topCategories: { category: string; n: number }[];
     recent: { ticker: string; category: string; taker_side: string; price: number; dollar_value: number; outcome_correct: number | null; resolved: number; created_at: string }[];
   };
+  coinbase: {
+    candles: number; firstAt: string | null; lastAt: string | null;
+    byAsset: { asset: string; timeframe_sec: number; candles: number; firstAt: string | null; lastAt: string | null }[];
+  };
   perps: PerpsCounts;
   collecting: { c15: boolean; main: boolean; perps: boolean };
+}
+
+export interface HistoricalCoinbaseDownloadArgs {
+  productId?: string;
+  asset?: string;
+  days?: number;
+  granularitySec?: number;
+}
+
+export interface HistoricalKalshiDownloadArgs {
+  ticker: string;
+  seriesTicker?: string;
+  asset?: string;
+  env?: KalshiEnv | string;
+  days?: number;
+  periodInterval?: number;
+  historical?: boolean;
+}
+
+export interface HistoricalDownloadResult {
+  source: string;
+  productId?: string;
+  ticker?: string;
+  seriesTicker?: string;
+  asset?: string;
+  env?: string;
+  historical?: boolean;
+  days?: number;
+  granularitySec?: number;
+  periodInterval?: number;
+  chunks?: number;
+  signalsUpserted?: number;
+  candlesImported: number;
+  candlesSkipped?: number;
+  firstAt: string | null;
+  lastAt: string | null;
+}
+
+export interface HistoricalValidationReport {
+  env: string;
+  sinceDays: number;
+  crypto15m: {
+    ticks: number;
+    windows: number;
+    resolvedWindows: number;
+    unresolvedWindows: number;
+    firstAt: string | null;
+    lastAt: string | null;
+    missingFields: Record<string, number>;
+    badTimestamps: number;
+    gapCount: number;
+    largestGaps: { [key: string]: string | number | null }[];
+  };
+  coinbase: {
+    assets: Record<string, {
+      candles: number;
+      firstAt: string | null;
+      lastAt: string | null;
+      gapCount: number;
+      largestGaps: { [key: string]: string | number | null }[];
+    }>;
+  };
 }
 
 export interface PerpsCounts {
@@ -776,6 +1178,11 @@ export interface KryptApi {
     exportData: () => Promise<{ dir: string; files: string[] } | null>;
     flatten: () => Promise<ActionResult<{ closed: number }>>;
   };
+  historical: {
+    downloadCoinbase: (args?: HistoricalCoinbaseDownloadArgs) => Promise<HistoricalDownloadResult | null>;
+    downloadKalshi: (args: HistoricalKalshiDownloadArgs) => Promise<HistoricalDownloadResult | null>;
+    validate: (args?: { env?: string; sinceDays?: number; maxGapSeconds?: number }) => Promise<HistoricalValidationReport | null>;
+  };
   data: {
     account: () => Promise<AccountSnapshot>;
     pnlSeries: (sinceHours?: number) => Promise<PnlPoint[]>;
@@ -791,7 +1198,10 @@ export interface KryptApi {
     snapshot: () => Promise<Crypto15mSnapshot>;
     status: () => Promise<Crypto15mStatus>;
     backtest: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
+    optimize: (args?: { sinceDays?: number; config?: Partial<TraderConfig>; minTrades?: number; topN?: number; bootstrapSamples?: number; baseProfileId?: string; baseProfileName?: string }) => Promise<Crypto15mOptimizationResult | null>;
     backtestMain: (args?: { sinceDays?: number; config?: Partial<TraderConfig> }) => Promise<Crypto15mBacktest | null>;
+    optimizeMain: (args?: { sinceDays?: number; config?: Partial<TraderConfig>; minTrades?: number; topN?: number; bootstrapSamples?: number; sourceMode?: string; fixedRiskUsd?: number; slippageCents?: number; executionModel?: string }) => Promise<Crypto15mOptimizationResult | null>;
+    exportExperiment: (args?: { optimization?: Partial<Crypto15mOptimizationResult> }) => Promise<ActionResult<{ path: string }> | null>;
     history: (args?: { limit?: number }) => Promise<{ rows: Crypto15mPosition[] } | null>;
   };
   perps: {

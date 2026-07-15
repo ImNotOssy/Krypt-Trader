@@ -300,6 +300,9 @@ CREATE TABLE IF NOT EXISTS crypto15m_signals (
     macd_hist REAL,                    -- MACD histogram = macd - signal
     macd_cross INTEGER,                -- +1 bullish / -1 bearish / 0 no cross
     rsi REAL,                          -- Wilder RSI(14) of the underlying
+    ema12_1m REAL,                     -- EMA(12) from 1-minute underlying closes
+    sma20_1m REAL,                     -- SMA(20) from 1-minute underlying closes
+    sma50_5m REAL,                     -- SMA(50) from 5-minute underlying closes
     resolved INTEGER DEFAULT 0,
     up_won INTEGER DEFAULT NULL,       -- 1 if the up/yes side settled true
     settled_at TEXT DEFAULT NULL,
@@ -331,6 +334,9 @@ CREATE TABLE IF NOT EXISTS crypto15m_ticks (
     macd_hist REAL,                    -- MACD histogram = macd - signal
     macd_cross INTEGER,                -- +1 bullish / -1 bearish / 0 no cross
     rsi REAL,                          -- Wilder RSI(14) of the underlying
+    ema12_1m REAL,                     -- EMA(12) from 1-minute underlying closes
+    sma20_1m REAL,                     -- SMA(20) from 1-minute underlying closes
+    sma50_5m REAL,                     -- SMA(50) from 5-minute underlying closes
     kalshi_env TEXT DEFAULT 'demo'
 );
 CREATE INDEX IF NOT EXISTS idx_c15tick_ticker ON crypto15m_ticks(ticker, observed_at);
@@ -360,6 +366,27 @@ CREATE TABLE IF NOT EXISTS crypto15m_ticks_hf (
 );
 CREATE INDEX IF NOT EXISTS idx_c15hf_ticker ON crypto15m_ticks_hf(ticker, recv_ms);
 CREATE INDEX IF NOT EXISTS idx_c15hf_time ON crypto15m_ticks_hf(recv_ms);
+
+-- Coinbase spot candles imported from historical files. These are UTC
+-- normalized and kept separate from Kalshi market ticks so replay can use
+-- them as indicator warm-up without pretending they include tradable Kalshi
+-- book state.
+CREATE TABLE IF NOT EXISTS coinbase_candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    timeframe_sec INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL NOT NULL,
+    volume REAL,
+    source TEXT DEFAULT 'coinbase',
+    imported_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(asset, timeframe_sec, ts, source)
+);
+CREATE INDEX IF NOT EXISTS idx_coinbase_candles_lookup
+    ON coinbase_candles(asset, timeframe_sec, ts);
 
 -- Kalshi perpetual futures (margin API) market data. Prices are INTEGER
 -- micro-dollars (1 = $0.000001; perp tick is $0.0001, wire allows 6dp) and
@@ -579,6 +606,12 @@ def init_db() -> None:
             "ALTER TABLE crypto15m_ticks ADD COLUMN macd_hist REAL",
             "ALTER TABLE crypto15m_ticks ADD COLUMN macd_cross INTEGER",
             "ALTER TABLE crypto15m_ticks ADD COLUMN rsi REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN ema12_1m REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN sma20_1m REAL",
+            "ALTER TABLE crypto15m_signals ADD COLUMN sma50_5m REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN ema12_1m REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN sma20_1m REAL",
+            "ALTER TABLE crypto15m_ticks ADD COLUMN sma50_5m REAL",
             "ALTER TABLE crypto15m_positions ADD COLUMN fees_usd REAL DEFAULT 0",
             "ALTER TABLE crypto15m_positions ADD COLUMN exit_fees_usd REAL DEFAULT 0",
             "ALTER TABLE crypto15m_ticks ADD COLUMN strike REAL",
@@ -613,6 +646,7 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
         "crypto15m_positions",
         "crypto15m_signals",
         "crypto15m_ticks",
+        "coinbase_candles",
         "perp_ticks",
         "perp_trades",
         "perp_candles",
@@ -644,6 +678,7 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
                 "('bot_positions','bot_runs','pnl_snapshots',"
                 "'daily_stats','order_events','alerts','whale_trades',"
                 "'crypto15m_positions','crypto15m_signals','crypto15m_ticks',"
+                "'coinbase_candles',"
                 "'perp_ticks','perp_trades','perp_candles','perp_funding',"
                 "'perp_farm_fills','perp_positions',"
                 "'markets','events','trades','market_snapshots')",
@@ -1628,8 +1663,9 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
               ticker, asset, series, close_time, mins_left, favorite,
               favorite_price, entry_cost, up_prob, delta_pct, open_spot,
               obs_spot, macd, macd_signal, macd_hist, macd_cross, rsi,
-              strike, model_prob, edge_net_cents, kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              ema12_1m, sma20_1m, sma50_5m, strike, model_prob,
+              edge_net_cents, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("series", ""),
             row.get("close_time", ""), row.get("mins_left"),
@@ -1638,6 +1674,7 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
             row.get("open_spot"), row.get("obs_spot"),
             row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
             row.get("macd_cross"), row.get("rsi"),
+            row.get("ema12_1m"), row.get("sma20_1m"), row.get("sma50_5m"),
             row.get("strike"), row.get("model_prob"), row.get("edge_net_cents"),
             row.get("kalshi_env", "demo"),
         ),
@@ -1698,16 +1735,17 @@ def insert_crypto15m_tick(conn, row: dict) -> None:
         """INSERT INTO crypto15m_ticks (
               ticker, asset, mins_left, yes_bid, yes_ask, up_prob,
               spot, open_spot, delta_pct, macd, macd_signal, macd_hist,
-              macd_cross, rsi, strike, delta_signed_pct, sigma1m,
-              model_prob, edge_net_cents, settle_prints, no_ask, spot_source,
-              kalshi_env
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              macd_cross, rsi, ema12_1m, sma20_1m, sma50_5m, strike,
+              delta_signed_pct, sigma1m, model_prob, edge_net_cents,
+              settle_prints, no_ask, spot_source, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ticker"], row["asset"], row.get("mins_left"),
             row.get("yes_bid"), row.get("yes_ask"), row.get("up_prob"),
             row.get("spot"), row.get("open_spot"), row.get("delta_pct"),
             row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
             row.get("macd_cross"), row.get("rsi"),
+            row.get("ema12_1m"), row.get("sma20_1m"), row.get("sma50_5m"),
             row.get("strike"), row.get("delta_signed_pct"), row.get("sigma1m"),
             row.get("model_prob"), row.get("edge_net_cents"),
             row.get("settle_prints"), row.get("no_ask"), row.get("spot_source"),
@@ -1776,6 +1814,43 @@ def recent_crypto15m_resolved(conn, env: str, limit: int = 200) -> list[dict]:
 
 def crypto15m_tick_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0])
+
+
+_COINBASE_CANDLE_COLS = (
+    "asset", "timeframe_sec", "ts", "open", "high", "low", "close",
+    "volume", "source",
+)
+
+
+def upsert_coinbase_candles(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    update_cols = [c for c in _COINBASE_CANDLE_COLS if c not in ("asset", "timeframe_sec", "ts", "source")]
+    sql = (
+        f"INSERT INTO coinbase_candles ({','.join(_COINBASE_CANDLE_COLS)}) "
+        f"VALUES ({','.join('?' * len(_COINBASE_CANDLE_COLS))}) "
+        "ON CONFLICT(asset, timeframe_sec, ts, source) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in update_cols)
+        + ", imported_at=datetime('now')"
+    )
+    conn.executemany(sql, [
+        tuple(r.get(c) for c in _COINBASE_CANDLE_COLS) for r in rows
+    ])
+    return len(rows)
+
+
+def load_coinbase_candle_closes(
+    conn, asset: str, *, start: str, end: str,
+    timeframe_sec: int = 60, source: str = "coinbase",
+) -> list[dict]:
+    rows = conn.execute(
+        """SELECT ts, close FROM coinbase_candles
+           WHERE asset=? AND timeframe_sec=? AND source=?
+             AND ts >= ? AND ts < ?
+           ORDER BY ts""",
+        (str(asset or "").upper(), int(timeframe_sec), source, start, end),
+    ).fetchall()
+    return [{"ts": r["ts"], "close": r["close"]} for r in rows]
 
 
 

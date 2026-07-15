@@ -228,15 +228,17 @@ _INDICATOR_CACHE_TTL = 60.0
 _indicator_cache: dict[str, dict] = {}
 
 
-async def _fetch_closes(asset: str, client: httpx.AsyncClient, lookback_min: int) -> list[float]:
-    """The last `lookback_min` one-minute closes for `asset` from Hyperliquid,
+async def _fetch_closes(
+    asset: str, client: httpx.AsyncClient, lookback_min: int, interval: str = "1m"
+) -> list[float]:
+    """The last `lookback_min` closes for `asset` from Hyperliquid,
     oldest→newest. Empty list on any error (caller degrades to None fields)."""
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     body = {
         "type": "candleSnapshot",
         "req": {
             "coin": asset,
-            "interval": "1m",
+            "interval": interval,
             "startTime": now_ms - int(lookback_min) * 60_000,
             "endTime": now_ms,
         },
@@ -257,24 +259,53 @@ async def _fetch_closes(asset: str, client: httpx.AsyncClient, lookback_min: int
     return out
 
 
-async def asset_indicators(asset: str) -> dict:
+def _ma_params(cfg: Optional[dict]) -> tuple[int, int, int, int]:
+    cfg = cfg or {}
+
+    def _i(k: str, default: int) -> int:
+        try:
+            return int(cfg.get(k, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return (
+        max(1, _i("crypto15m_fast_ema_period", 12)),
+        max(1, _i("crypto15m_slow_sma_period", 20)),
+        max(1, _i("crypto15m_trend_sma_period", 50)),
+        max(1, _i("crypto15m_trend_timeframe_min", 5)),
+    )
+
+
+async def asset_indicators(asset: str, cfg: Optional[dict] = None) -> dict:
     """MACD/RSI bundle for one asset's underlying, cached ~60s and shared by
     the monitor poll, executor tick and recorder. All-None on any failure or
     until there's enough candle history."""
     loop = asyncio.get_event_loop()
     now = loop.time()
-    cached = _indicator_cache.get(asset)
+    fast_ema, slow_sma, trend_sma, trend_tf = _ma_params(cfg)
+    cache_key = f"{asset}:{fast_ema}:{slow_sma}:{trend_sma}:{trend_tf}"
+    cached = _indicator_cache.get(cache_key)
     if cached and (now - cached["at"]) < cached.get("ttl", _INDICATOR_CACHE_TTL):
         return cached["data"]
     try:
-        closes = await _fetch_closes(asset, _get_spot_client(), _INDICATOR_LOOKBACK_MIN)
+        client = _get_spot_client()
+        lookback_1m = max(_INDICATOR_LOOKBACK_MIN, fast_ema, slow_sma) + 5
+        closes = await _fetch_closes(asset, client, lookback_1m, "1m")
         data = indicators.compute(closes)
-        _indicator_cache[asset] = {"at": now, "data": data, "ttl": _INDICATOR_CACHE_TTL}
+        data["ema12_1m"] = indicators.ema_latest(closes, fast_ema)
+        data["sma20_1m"] = indicators.sma(closes, slow_sma)
+        trend_lookback = max(trend_sma * trend_tf + trend_tf * 5, trend_sma * trend_tf)
+        trend_closes = await _fetch_closes(asset, client, trend_lookback, f"{trend_tf}m")
+        data["sma50_5m"] = indicators.sma(trend_closes, trend_sma)
+        _indicator_cache[cache_key] = {"at": now, "data": data, "ttl": _INDICATOR_CACHE_TTL}
         return data
     except Exception as e:
         logger.debug(f"crypto15m indicators {asset} failed: {e}")
         data = cached["data"] if cached else indicators.compute([])
-        _indicator_cache[asset] = {"at": now, "data": data, "ttl": 10.0}
+        data.setdefault("ema12_1m", None)
+        data.setdefault("sma20_1m", None)
+        data.setdefault("sma50_5m", None)
+        _indicator_cache[cache_key] = {"at": now, "data": data, "ttl": 10.0}
         return data
 
 
@@ -290,6 +321,7 @@ def _blank_asset(entry: dict, spot: Optional[float], error: Optional[str] = None
         "upAsk": None, "downAsk": None, "arbEdgeCents": None, "arbSignal": None,
         "macd": None, "macdSignal": None, "macdHist": None,
         "macdCross": None, "rsi": None,
+        "ema12_1m": None, "sma20_1m": None, "sma50_5m": None,
         "strikeUsd": None, "deltaSignedPct": None, "sigma1m": None,
         "modelProb": None, "edgeNetCents": None,
         "settlePrints": 0,
@@ -567,7 +599,11 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
 
     if cfg.get("crypto15m_indicator_detect", True):
         try:
-            ind = await asyncio.wait_for(asset_indicators(asset), 4.0)
+            try:
+                ind_coro = asset_indicators(asset, cfg)
+            except TypeError:
+                ind_coro = asset_indicators(asset)
+            ind = await asyncio.wait_for(ind_coro, 4.0)
         except Exception:
             ind = {}
         out["macd"] = ind.get("macd")
@@ -575,6 +611,9 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         out["macdHist"] = ind.get("macdHist")
         out["macdCross"] = ind.get("macdCross")
         out["rsi"] = ind.get("rsi")
+        out["ema12_1m"] = ind.get("ema12_1m")
+        out["sma20_1m"] = ind.get("sma20_1m")
+        out["sma50_5m"] = ind.get("sma50_5m")
         out["sigma1m"] = ind.get("sigma1m")
         psum, pcount = cf_ws.settle_partial(asset, close_epoch)
         if pcount == 0:
@@ -696,7 +735,18 @@ async def snapshot(cfg: dict) -> dict:
             "minDeltaPct": _const(cfg, "min_delta_pct"),
             "entryDiff": _const(cfg, "entry_diff"),
             "strictThreshold": bool(cfg.get("crypto15m_strict_threshold", True)),
+            "strategyMode": str(cfg.get("crypto15m_strategy_mode", "directional")),
             "directionMode": str(cfg.get("crypto15m_direction_mode", "favorite")),
+            "fastEmaPeriod": int(cfg.get("crypto15m_fast_ema_period", 12) or 12),
+            "slowSmaPeriod": int(cfg.get("crypto15m_slow_sma_period", 20) or 20),
+            "trendSmaPeriod": int(cfg.get("crypto15m_trend_sma_period", 50) or 50),
+            "trendTimeframeMin": int(cfg.get("crypto15m_trend_timeframe_min", 5) or 5),
+            "minEntryCents": int(cfg.get("crypto15m_min_entry_cents", 5) or 5),
+            "maxEntryCents": int(cfg.get("crypto15m_max_entry_cents", 59) or 59),
+            "minEntrySecondsLeft": int(cfg.get("crypto15m_min_entry_seconds_left", 120) or 120),
+            "timeStopCents": int(cfg.get("crypto15m_time_stop_cents", 10) or 10),
+            "timeStopSecondsLeft": int(cfg.get("crypto15m_time_stop_seconds_left", 60) or 60),
+            "forceExitSecondsLeft": int(cfg.get("crypto15m_force_exit_seconds_left", 5) or 5),
             "entryStyle": str(cfg.get("crypto15m_entry_style", "maker")),
             "hoursStartUtc": int(cfg.get("crypto15m_hours_start_utc", 0) or 0),
             "hoursEndUtc": int(cfg.get("crypto15m_hours_end_utc", 24) or 24),

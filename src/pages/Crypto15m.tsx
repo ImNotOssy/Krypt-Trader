@@ -4,6 +4,7 @@ import type {
   Crypto15mAsset, Crypto15mPosition,
   Crypto15mSizing, Crypto15mSnapshot, Crypto15mStatus, RuleCondition, TraderConfig,
 } from '@shared/types';
+import { CRYPTO15M_PRESETS as C15_PRESETS } from '@shared/crypto15m-presets';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Empty, NameDialog, Page, Switch, useOptimisticValue } from '../components/common';
@@ -402,7 +403,18 @@ function KV({ label, value, accent }: { label: string; value: string; accent?: '
 
 
 const C15_DEFAULTS = {
-  directionMode: 'favorite' as 'favorite' | 'contrarian',
+  strategyMode: 'directional' as 'directional' | 'btc_ma_crossover',
+  directionMode: 'favorite' as 'favorite' | 'contrarian' | 'model',
+  fastEmaPeriod: 12,
+  slowSmaPeriod: 20,
+  trendSmaPeriod: 50,
+  trendTimeframeMin: 5,
+  minEntryCents: 5,
+  maxEntryCents: 59,
+  minEntrySecondsLeft: 120,
+  timeStopCents: 10,
+  timeStopSecondsLeft: 60,
+  forceExitSecondsLeft: 5,
   timeDelayMin: 8,
   entryThreshold: 0.70,
   entryMax: 0.98,
@@ -425,57 +437,6 @@ const C15_DEFAULTS = {
   maxConcurrent: 3,
 };
 
-const C15_PRESETS: { id: string; name: string; hint: string; patch: Partial<TraderConfig> }[] = [
-  {
-    id: 'favorite', name: 'Deep Favorite',
-    hint: 'Only the deepest favorites (95–98¢) — the one band that didn\'t lose in collected data (small sample).',
-    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.95, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
-  },
-  {
-    id: 'contrarian', name: 'Contrarian Fade',
-    hint: 'Fade extreme favorites — buy the cheap side, hold to settle. Measured ≈ break-even.',
-    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'contrarian', crypto15mEntryThreshold: 0.9, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
-  },
-  {
-    id: 'momentum', name: 'Momentum (Δ-confirmed)',
-    hint: 'Buy the favorite only once the underlying has already moved ≥0.2% this window — a momentum filter on the 15-min open.',
-    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.80, crypto15mEntryMax: 0.98, crypto15mMinDeltaPct: 0.002, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
-  },
-  {
-    id: 'fav-90-95', name: 'Favorite 90–95¢',
-    hint: 'Favorites in the 90–95¢ pocket. Caveat: priced off the mid — unconfirmed on real fills near close.',
-    patch: { crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mDirectionMode: 'favorite', crypto15mEntryThreshold: 0.90, crypto15mEntryMax: 0.95, crypto15mMinDeltaPct: 0, crypto15mExitThreshold: 0.4, crypto15mEntryStyle: 'maker', crypto15mUseRules: false },
-  },
-  {
-    id: 'sniper', name: 'Settlement Sniper',
-    hint: 'Model mode: buys whichever side the live settlement model favors when YOUR certainty and edge thresholds are met. Ships with neutral (zero) thresholds on purpose — set "Model certainty" and "Min net edge" below to build your own strategy, and validate it on the Backtest page before going live.',
-    patch: {
-      crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false, crypto15mUseRules: false,
-      crypto15mDirectionMode: 'model',
-      crypto15mModelMinProb: 0.5, crypto15mModelMinEdgeCents: 0,
-      crypto15mIndicatorDetect: true, crypto15mSpotWs: true,
-    },
-  },
-  {
-    id: 'macd-trend', name: 'MACD Trend (rules)',
-    hint: 'Experimental: enter Up when Up is favored and the 1-min underlying MACD is bullish, in the last 6 min. Uses the rule builder + MACD field — recorded, not yet backtested.',
-    patch: {
-      crypto15mDirectionalEnabled: true, crypto15mPairsEnabled: false,
-      crypto15mDirectionMode: 'favorite', crypto15mEntryStyle: 'maker', crypto15mExitThreshold: 0.4,
-      crypto15mMinDeltaPct: 0, crypto15mIndicatorDetect: true, crypto15mUseRules: true,
-      crypto15mRules: [
-        { field: 'upProb', op: '>=', value: 0.55 },
-        { field: 'macdHist', op: '>', value: 0 },
-        { field: 'minsLeft', op: '<=', value: 6 },
-      ],
-    },
-  },
-  // NOTE: the Pairs preset was removed after live testing settled at −$11.69:
-  // Kalshi runs ONE complementary book per market, so "accumulating both
-  // sides" is just a taker-taker scalp in disguise and stranded first legs
-  // lose nearly always. The engine keeps the code hard-disabled for research.
-];
-
 const C15_RULE_FIELDS: { v: string; label: string }[] = [
   { v: 'favoritePrice', label: 'Favorite price (0–1)' },
   { v: 'entryCost', label: 'Entry cost (0–1)' },
@@ -495,6 +456,9 @@ const C15_RULE_FIELDS: { v: string; label: string }[] = [
   { v: 'macdHist', label: 'MACD histogram' },
   { v: 'macdCross', label: 'MACD cross (+1/0/−1)' },
   { v: 'rsi', label: 'RSI (0–100)' },
+  { v: 'ema12_1m', label: 'EMA 12 (1m)' },
+  { v: 'sma20_1m', label: 'SMA 20 (1m)' },
+  { v: 'sma50_5m', label: 'SMA 50 (5m)' },
   { v: 'sigma1m', label: '1-min volatility (fraction)' },
   { v: 'modelProb', label: 'Model P(up) (0–1)' },
   { v: 'edgeNetCents', label: 'Model edge net of fees (¢)' },
@@ -528,6 +492,7 @@ function StrategySettings({
     const v = config?.[k] as number | undefined;
     return typeof v === 'number' && !Number.isNaN(v) ? v : d;
   };
+  const strategyMode = config?.crypto15mStrategyMode ?? C15_DEFAULTS.strategyMode;
   const dir = (config?.crypto15mDirectionMode ?? C15_DEFAULTS.directionMode);
   const entryStyle = (config?.crypto15mEntryStyle ?? C15_DEFAULTS.entryStyle);
   const dimCls = '';
@@ -539,6 +504,7 @@ function StrategySettings({
   };
 
   const resetDefaults = () => void update({
+    crypto15mStrategyMode: C15_DEFAULTS.strategyMode,
     crypto15mDirectionMode: C15_DEFAULTS.directionMode,
     crypto15mDirectionalEnabled: true,
     crypto15mPairsEnabled: false,
@@ -559,6 +525,16 @@ function StrategySettings({
     crypto15mMakerCancelMin: C15_DEFAULTS.makerCancelMin,
     crypto15mHoursStartUtc: C15_DEFAULTS.hoursStartUtc,
     crypto15mHoursEndUtc: C15_DEFAULTS.hoursEndUtc,
+    crypto15mFastEmaPeriod: C15_DEFAULTS.fastEmaPeriod,
+    crypto15mSlowSmaPeriod: C15_DEFAULTS.slowSmaPeriod,
+    crypto15mTrendSmaPeriod: C15_DEFAULTS.trendSmaPeriod,
+    crypto15mTrendTimeframeMin: C15_DEFAULTS.trendTimeframeMin,
+    crypto15mMinEntryCents: C15_DEFAULTS.minEntryCents,
+    crypto15mMaxEntryCents: C15_DEFAULTS.maxEntryCents,
+    crypto15mMinEntrySecondsLeft: C15_DEFAULTS.minEntrySecondsLeft,
+    crypto15mTimeStopCents: C15_DEFAULTS.timeStopCents,
+    crypto15mTimeStopSecondsLeft: C15_DEFAULTS.timeStopSecondsLeft,
+    crypto15mForceExitSecondsLeft: C15_DEFAULTS.forceExitSecondsLeft,
   });
 
   return (
@@ -616,6 +592,30 @@ function StrategySettings({
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
         <SelectField
+          label="Strategy" value={strategyMode}
+          options={[['directional', 'Directional'], ['btc_ma_crossover', 'BTC MA Crossover']]}
+          hint="Directional uses the favorite/contrarian/model engines. BTC MA Crossover uses separate bullish and bearish MA branches."
+          onCommit={(v) => void update({
+            crypto15mStrategyMode: v as 'directional' | 'btc_ma_crossover',
+            ...(v === 'btc_ma_crossover' ? {
+              crypto15mAssets: ['BTC'],
+              crypto15mIndicatorDetect: true,
+              crypto15mMaxConcurrent: 1,
+              crypto15mOrderSize: 5,
+              crypto15mTimeDelayMin: 15,
+              crypto15mDirectionMode: 'favorite',
+              crypto15mEntryThreshold: 0.05,
+              crypto15mStrictThreshold: false,
+              crypto15mEntryMax: 0.59,
+              crypto15mMinDeltaPct: 0,
+              crypto15mMaxLossPct: 0.05,
+              crypto15mMaxTotalPct: 0.05,
+              crypto15mSessionTakeProfitUsd: 0,
+              crypto15mMakerCancelMin: 2,
+            } : {}),
+          })}
+        />
+        <SelectField
           label="Direction" value={dir}
           options={[['model', 'Model — settlement sniper'], ['favorite', 'Favorite-follow'], ['contrarian', 'Contrarian fade']]}
           hint="Model buys whichever side the settlement model calls near-certain (the sniper); Favorite buys the market's favorite; Contrarian fades it."
@@ -646,6 +646,58 @@ function StrategySettings({
               options={[['on', 'On (recommended)'], ['off', 'Off']]}
               hint="Trade inside the last 60s once ≥30 of the 60 settlement prints are locked and certainty passes 3σ — the settlement average is being realized in real time while stale quotes linger."
               onCommit={(v) => void update({ crypto15mModelFinalMinute: v === 'on' })}
+            />
+          </>
+        )}
+        {strategyMode === 'btc_ma_crossover' && (
+          <>
+            <NumField
+              label="Fast EMA" suffix="1m" min={1} max={200} step={1}
+              value={num('crypto15mFastEmaPeriod', C15_DEFAULTS.fastEmaPeriod)}
+              hint="Fast EMA period on one-minute BTC candles."
+              onCommit={(v) => void update({ crypto15mFastEmaPeriod: Math.round(v), crypto15mIndicatorDetect: true })}
+            />
+            <NumField
+              label="Slow SMA" suffix="1m" min={1} max={200} step={1}
+              value={num('crypto15mSlowSmaPeriod', C15_DEFAULTS.slowSmaPeriod)}
+              hint="Slow SMA period on one-minute BTC candles."
+              onCommit={(v) => void update({ crypto15mSlowSmaPeriod: Math.round(v), crypto15mIndicatorDetect: true })}
+            />
+            <NumField
+              label="Trend SMA" suffix="5m" min={1} max={300} step={1}
+              value={num('crypto15mTrendSmaPeriod', C15_DEFAULTS.trendSmaPeriod)}
+              hint="Trend SMA period on five-minute BTC candles."
+              onCommit={(v) => void update({ crypto15mTrendSmaPeriod: Math.round(v), crypto15mTrendTimeframeMin: 5, crypto15mIndicatorDetect: true })}
+            />
+            <NumField
+              label="Entry floor" suffix="¢" min={1} max={99} step={1}
+              value={num('crypto15mMinEntryCents', C15_DEFAULTS.minEntryCents)}
+              hint="Minimum ask price for either branch."
+              onCommit={(v) => void update({ crypto15mMinEntryCents: Math.round(v) })}
+            />
+            <NumField
+              label="Entry cap" suffix="¢" min={1} max={99} step={1}
+              value={num('crypto15mMaxEntryCents', C15_DEFAULTS.maxEntryCents)}
+              hint="Maximum ask price for either branch."
+              onCommit={(v) => void update({ crypto15mMaxEntryCents: Math.round(v) })}
+            />
+            <NumField
+              label="No entry after" suffix="sec left" min={0} max={900} step={5}
+              value={num('crypto15mMinEntrySecondsLeft', C15_DEFAULTS.minEntrySecondsLeft)}
+              hint="The MA strategy requires more than this many seconds left before entering."
+              onCommit={(v) => void update({ crypto15mMinEntrySecondsLeft: Math.round(v) })}
+            />
+            <NumField
+              label="Time stop" suffix="¢" min={1} max={99} step={1}
+              value={num('crypto15mTimeStopCents', C15_DEFAULTS.timeStopCents)}
+              hint="Inside the final minute, sell when the held-side bid is at or below this price."
+              onCommit={(v) => void update({ crypto15mTimeStopCents: Math.round(v) })}
+            />
+            <NumField
+              label="Force exit" suffix="sec left" min={1} max={60} step={1}
+              value={num('crypto15mForceExitSecondsLeft', C15_DEFAULTS.forceExitSecondsLeft)}
+              hint="Submit a marketable sell-all limit this many seconds before settlement."
+              onCommit={(v) => void update({ crypto15mForceExitSecondsLeft: Math.round(v) })}
             />
           </>
         )}
@@ -1198,9 +1250,42 @@ function Foot({ label, value }: { label: string; value: string }) {
 function IndicatorStrip({ a }: { a: Crypto15mAsset }) {
   const hasInd = a.macdHist != null || a.rsi != null;
   const hasModel = a.modelProb != null;
-  if (!hasInd && !hasModel) return null;
+  const hasMa = a.ema12_1m != null || a.sma20_1m != null || a.sma50_5m != null;
+  const maBranch =
+    a.ema12_1m != null && a.sma20_1m != null && a.sma50_5m != null && a.spotUsd != null
+      ? a.ema12_1m > a.sma20_1m && a.spotUsd > a.sma50_5m
+        ? 'UP'
+        : a.ema12_1m < a.sma20_1m && a.spotUsd < a.sma50_5m
+          ? 'DOWN'
+          : null
+      : null;
+  if (!hasInd && !hasModel && !hasMa) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+      {hasMa && (
+        <span
+          className="rounded bg-krypt-surface2 px-1.5 py-0.5 text-krypt-dim"
+          title="BTC MA Crossover fields: EMA12 and SMA20 from 1-minute closes, plus SMA50 from 5-minute closes."
+        >
+          MA{' '}
+          <span className={cls('font-mono', (a.ema12_1m ?? 0) >= (a.sma20_1m ?? 0) ? 'text-krypt-win' : 'text-krypt-loss')}>
+            {a.ema12_1m != null ? a.ema12_1m.toFixed(a.ema12_1m >= 100 ? 1 : 4) : '—'}
+          </span>
+          <span className="mx-0.5 text-krypt-dim">/</span>
+          <span className="font-mono text-white">
+            {a.sma20_1m != null ? a.sma20_1m.toFixed(a.sma20_1m >= 100 ? 1 : 4) : '—'}
+          </span>
+          <span className="mx-0.5 text-krypt-dim">/</span>
+          <span className="font-mono text-krypt-purple">
+            {a.sma50_5m != null ? a.sma50_5m.toFixed(a.sma50_5m >= 100 ? 1 : 4) : '—'}
+          </span>
+          {maBranch && (
+            <span className={cls('ml-1 font-semibold', maBranch === 'UP' ? 'text-krypt-win' : 'text-krypt-loss')}>
+              {maBranch}
+            </span>
+          )}
+        </span>
+      )}
       {a.rsi != null && (
         <span className="rounded bg-krypt-surface2 px-1.5 py-0.5 text-krypt-dim">
           RSI{' '}
@@ -1291,7 +1376,12 @@ function PositionRow({ p }: { p: Crypto15mPosition }) {
         )}
       </td>
       <td className="text-xs text-krypt-muted">
-        {p.status}{p.exitReason === 'stop_loss' ? ' · stop' : p.exitReason === 'take_profit' ? ' · profit' : ''}
+        {p.status}
+        {p.exitReason === 'stop_loss' ? ' · stop'
+          : p.exitReason === 'take_profit' ? ' · profit'
+            : p.exitReason === 'time_stop' ? ' · time'
+              : p.exitReason === 'force_exit' ? ' · force'
+                : ''}
       </td>
       <td className="font-mono text-xs">{p.filledContracts}/{p.targetContracts}</td>
       <td className="font-mono text-xs">{entryC ? `${Math.round(entryC)}¢` : '—'}</td>

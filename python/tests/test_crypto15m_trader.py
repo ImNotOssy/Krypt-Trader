@@ -69,6 +69,60 @@ def signal_asset(asset="BTC", favorite="up", entry_cost=0.86, signal=True, ticke
     }
 
 
+def ma_asset(
+    *,
+    asset="BTC",
+    ticker="KXBTC15M-MA",
+    mins_left=5.0,
+    up_ask=0.34,
+    down_ask=0.42,
+    ema12=101.0,
+    sma20=100.0,
+    sma50=99.0,
+    spot=102.0,
+):
+    a = signal_asset(asset=asset, favorite="up", entry_cost=up_ask, signal=False, ticker=ticker)
+    close = (datetime.now(timezone.utc) + timedelta(seconds=int(mins_left * 60))).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    a.update({
+        "spotUsd": spot,
+        "closeTime": close,
+        "minsLeft": mins_left,
+        "upAsk": up_ask,
+        "downAsk": down_ask,
+        "yesAsk": up_ask,
+        "yesBid": round(1.0 - down_ask, 4),
+        "entryCost": up_ask,
+        "ema12_1m": ema12,
+        "sma20_1m": sma20,
+        "sma50_5m": sma50,
+        "inWindow": False,
+        "signal": False,
+    })
+    return a
+
+
+def _btc_ma_cfg(cfg):
+    cfg.update({
+        "crypto15m_strategy_mode": "btc_ma_crossover",
+        "crypto15m_assets": ["BTC"],
+        "crypto15m_order_size": 5,
+        "crypto15m_max_concurrent": 1,
+        "crypto15m_entry_style": "taker",
+        "crypto15m_entry_diff": 0.0,
+        "crypto15m_min_entry_cents": 5,
+        "crypto15m_max_entry_cents": 59,
+        "crypto15m_time_stop_cents": 10,
+        "crypto15m_time_stop_seconds_left": 60,
+        "crypto15m_force_exit_seconds_left": 5,
+        "crypto15m_exit_threshold": 0.0,
+        "crypto15m_take_profit_cents": 0,
+        "crypto15m_stop_loss_pct": 0.0,
+    })
+    return cfg
+
+
 def _stub_snapshot(assets):
     async def _snap(_cfg):
         return {"assets": assets, "constants": {}, "fetchedAt": "",
@@ -105,6 +159,58 @@ def test_should_enter_gate_matrix(cfg):
     off = dict(cfg)
     off["crypto15m_enabled"] = False
     assert ct.should_enter(a, off, has_open=False, open_count=0) == (False, "disabled")
+
+
+def test_btc_ma_crossover_entry_gate_branches_and_position_size(cfg):
+    _btc_ma_cfg(cfg)
+
+    bull = ma_asset(ema12=101.0, sma20=100.0, spot=102.0, sma50=99.0, up_ask=0.34)
+    assert ct.should_enter(bull, cfg, has_open=False, open_count=0) == (True, "ok")
+    assert ct.btc_ma_crossover_side(bull, cfg) == "up"
+
+    bear = ma_asset(ema12=99.0, sma20=100.0, spot=98.0, sma50=99.0, down_ask=0.43)
+    assert ct.should_enter(bear, cfg, has_open=False, open_count=0) == (True, "ok")
+    assert ct.btc_ma_crossover_side(bear, cfg) == "down"
+
+    ok, why = ct.should_enter(bull, cfg, has_open=False, open_count=1)
+    assert ok is False and "position_size" in why
+
+    ok, why = ct.should_enter(ma_asset(asset="ETH", ticker="KXETH15M-MA"), cfg, has_open=False, open_count=0)
+    assert ok is False and "BTC only" in why
+
+    no_cross = ma_asset(ema12=100.0, sma20=100.0, spot=102.0, sma50=99.0)
+    ok, why = ct.should_enter(no_cross, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "moving averages not aligned"
+
+
+def test_btc_ma_crossover_rejects_missing_indicator_with_specific_reason(cfg):
+    _btc_ma_cfg(cfg)
+
+    missing_trend = ma_asset(sma50=None)
+    ok, why = ct.should_enter(missing_trend, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "sma50 5m unavailable"
+
+    missing_spot = ma_asset(spot=None, ema12=None, sma20=None, sma50=None)
+    ok, why = ct.should_enter(missing_spot, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "spot unavailable"
+
+
+def test_btc_ma_crossover_rejects_prices_outside_5_to_59_cents(cfg):
+    _btc_ma_cfg(cfg)
+
+    too_cheap = ma_asset(up_ask=0.04)
+    ok, why = ct.should_enter(too_cheap, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "YES ask below 5c"
+
+    too_expensive = ma_asset(up_ask=0.60)
+    ok, why = ct.should_enter(too_expensive, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "YES ask above 59c"
+
+    no_too_expensive = ma_asset(
+        ema12=99.0, sma20=100.0, spot=98.0, sma50=99.0, down_ask=0.60,
+    )
+    ok, why = ct.should_enter(no_too_expensive, cfg, has_open=False, open_count=0)
+    assert ok is False and why == "NO ask above 59c"
 
 
 def test_should_stop_loss(cfg):
@@ -233,6 +339,52 @@ def test_contrarian_mode_buys_the_underdog(fresh_db, env_prod, cfg, monkeypatch)
     assert r["entry_limit_cents"] == 16
 
 
+
+
+def test_btc_ma_crossover_bullish_branch_buys_yes(fresh_db, env_prod, cfg, monkeypatch):
+    _live_cfg(_btc_ma_cfg(cfg))
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([
+        ma_asset(up_ask=0.34, ema12=101.0, sma20=100.0, spot=102.0, sma50=99.0),
+        ma_asset(asset="ETH", ticker="KXETH15M-MA", up_ask=0.20),
+    ]))
+    calls = _capture_orders(monkeypatch)
+
+    run_async(ct.run_tick(cfg, authed=True))
+
+    assert len(calls) == 1
+    assert calls[0]["side"] == "yes"
+    assert calls[0]["action"] == "buy"
+    assert calls[0]["count"] == 5
+    assert calls[0]["price_cents"] == 34
+    with db.get_db() as conn:
+        r = db.get_open_crypto15m(conn, "production")[0]
+    assert r["strategy"] == "btc_ma_crossover"
+    assert r["side"] == "up"
+    assert r["direction"] == "yes"
+
+
+def test_btc_ma_crossover_bearish_branch_buys_no(fresh_db, env_prod, cfg, monkeypatch):
+    _live_cfg(_btc_ma_cfg(cfg))
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([
+        ma_asset(
+            ema12=99.0, sma20=100.0, spot=98.0, sma50=99.0,
+            up_ask=0.56, down_ask=0.43,
+        ),
+    ]))
+    calls = _capture_orders(monkeypatch)
+
+    run_async(ct.run_tick(cfg, authed=True))
+
+    assert len(calls) == 1
+    assert calls[0]["side"] == "no"
+    assert calls[0]["action"] == "buy"
+    assert calls[0]["count"] == 5
+    assert calls[0]["price_cents"] == 43
+    with db.get_db() as conn:
+        r = db.get_open_crypto15m(conn, "production")[0]
+    assert r["strategy"] == "btc_ma_crossover"
+    assert r["side"] == "down"
+    assert r["direction"] == "no"
 
 
 def _capture_orders(monkeypatch):
@@ -453,6 +605,7 @@ def _seed_c15(**over) -> dict:
         "status": over.get("status", "submitted"),
         "exit_reason": over.get("exit_reason"),
         "close_time": over.get("close_time", ""),
+        "strategy": over.get("strategy", ""),
         "kalshi_env": over.get("kalshi_env", "demo"),
         "dry_run": over.get("dry_run", False),
     }
@@ -812,6 +965,81 @@ def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_demo
     assert row["exit_reason"] == "take_profit"
 
 
+
+
+def test_btc_ma_time_stop_waits_for_last_minute_and_10c_bid(fresh_db, env_demo, cfg, monkeypatch):
+    _btc_ma_cfg(cfg)
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ct.kalshi_auth, "server_now", lambda: now.timestamp())
+
+    async def _book(_t):
+        return {"yes": [[10, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    calls = _capture_orders(monkeypatch)
+
+    pos = _seed_c15(
+        status="filled", strategy="btc_ma_crossover", direction="yes",
+        target_contracts=5, filled_contracts=5, cost_usd=1.70,
+        close_time=(now + timedelta(seconds=61)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+    async def _cheap(_t):
+        return {"yes_bid_dollars": 0.10, "yes_ask_dollars": 0.12, "status": "open", "result": ""}
+    monkeypatch.setattr(kalshi_api, "fetch_market", _cheap)
+    assert run_async(ct._manage_position(pos, cfg, "demo")) is None
+    assert calls == []
+
+    with db.get_db() as conn:
+        db.update_crypto15m_position(
+            conn, pos["id"],
+            close_time=(now + timedelta(seconds=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        pos = db.fetch_crypto15m_by_id(conn, pos["id"])
+
+    async def _not_cheap(_t):
+        return {"yes_bid_dollars": 0.11, "yes_ask_dollars": 0.13, "status": "open", "result": ""}
+    monkeypatch.setattr(kalshi_api, "fetch_market", _not_cheap)
+    assert run_async(ct._manage_position(pos, cfg, "demo")) is None
+    assert calls == []
+
+    monkeypatch.setattr(kalshi_api, "fetch_market", _cheap)
+    row = run_async(ct._manage_position(pos, cfg, "demo"))
+
+    assert len(calls) == 1
+    assert calls[0]["action"] == "sell"
+    assert calls[0]["price_cents"] == 10
+    assert row["status"] == "exiting"
+    assert row["exit_reason"] == "time_stop"
+
+
+def test_btc_ma_force_exit_sells_all_five_seconds_before_settlement(
+    fresh_db, env_demo, cfg, monkeypatch
+):
+    _btc_ma_cfg(cfg)
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ct.kalshi_auth, "server_now", lambda: now.timestamp())
+    pos = _seed_c15(
+        status="filled", strategy="btc_ma_crossover", direction="yes",
+        target_contracts=5, filled_contracts=5, cost_usd=1.70,
+        close_time=(now + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+    async def _rich(_t):
+        return {"yes_bid_dollars": 0.72, "yes_ask_dollars": 0.75, "status": "open", "result": ""}
+    async def _book(_t):
+        return {"yes": [[72, 100]], "no": []}
+    monkeypatch.setattr(kalshi_api, "fetch_market", _rich)
+    monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
+    calls = _capture_orders(monkeypatch)
+
+    row = run_async(ct._manage_position(pos, cfg, "demo"))
+
+    assert len(calls) == 1
+    assert calls[0]["action"] == "sell"
+    assert calls[0]["count"] == 5
+    assert calls[0]["price_cents"] == 1
+    assert row["status"] == "exiting"
+    assert row["exit_reason"] == "force_exit"
 
 
 def _seed_resolved_pnl(pnl_usd: float, *, ago_sql: str = "now", env: str = "production",
@@ -1236,6 +1464,35 @@ def test_snapshot_strict_requires_two_sided_book(cfg, monkeypatch):
 
 
 
+def test_snapshot_exposes_btc_ma_crossover_fields(cfg, monkeypatch):
+    async def _markets(**kw):
+        return [_snapshot_market(
+            floor_strike=100.0,
+            yes_bid_dollars=0.30,
+            yes_ask_dollars=0.34,
+            no_ask_dollars=0.65,
+        )], ""
+
+    async def _ind(*_args):
+        return {
+            "macd": None, "macdSignal": None, "macdHist": None, "macdCross": None,
+            "rsi": None, "sigma1m": 0.001,
+            "ema12_1m": 101.0, "sma20_1m": 100.0, "sma50_5m": 99.0,
+        }
+
+    monkeypatch.setattr(kalshi_api, "fetch_markets", _markets)
+    monkeypatch.setattr(crypto15m, "asset_indicators", _ind)
+    cfg["crypto15m_indicator_detect"] = True
+    entry = {"asset": "BTC", "series": "KXBTC15M", "cg": "bitcoin"}
+    now = datetime.now(timezone.utc).timestamp()
+
+    out = run_async(crypto15m._asset_snapshot(entry, 102.0, cfg, now))
+
+    assert out["ema12_1m"] == pytest.approx(101.0)
+    assert out["sma20_1m"] == pytest.approx(100.0)
+    assert out["sma50_5m"] == pytest.approx(99.0)
+
+
 def test_main_engine_should_trade_skips_crypto15m_series(cfg):
     cfg["trade_whales"] = True
     sig = {"ticker": "KXBTC15M-26JUL011500", "confidence": 90, "price": 0.80}
@@ -1333,6 +1590,15 @@ def test_sigma1m_measures_return_vol():
     assert indicators.sigma1m([100.0] * 10) is None
 
 
+def test_indicator_helpers_compute_ema_and_sma():
+    import indicators
+    vals = [float(i) for i in range(1, 61)]
+    assert indicators.sma(vals, 20) == pytest.approx(50.5)
+    assert indicators.sma(vals, 100) is None
+    assert indicators.ema_latest(vals, 12) is not None
+    assert indicators.ema_latest(vals[:5], 12) is None
+
+
 def test_model_up_prob_shape():
     p = crypto15m.model_up_prob(100.0, 100.0, 0.001, 5.0)
     assert p == pytest.approx(0.5, abs=1e-6)
@@ -1411,6 +1677,34 @@ def _sniper_cfg(cfg):
     cfg["crypto15m_time_delay_min"] = 5.0
     cfg["crypto15m_entry_max"] = 0.97
     return cfg
+
+
+def _insert_resolved_replay_tick(
+    conn,
+    *,
+    ticker: str = "KXBTC15M-DATA",
+    observed_at: str = "2026-07-03 12:00:00",
+) -> None:
+    conn.execute(
+        """INSERT INTO crypto15m_signals (ticker, asset, series, favorite,
+           favorite_price, entry_cost, resolved, up_won, close_time, kalshi_env)
+           VALUES (?,'BTC','KXBTC15M','up',0.93,0.93,1,1,
+                   '2026-07-03T12:04:00Z','production')""",
+        (ticker,),
+    )
+    conn.execute(
+        """INSERT INTO crypto15m_ticks (
+              ticker, asset, observed_at, mins_left, yes_bid, yes_ask,
+              up_prob, spot, open_spot, delta_pct, no_ask, strike,
+              delta_signed_pct, sigma1m, model_prob, edge_net_cents,
+              settle_prints, kalshi_env
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            ticker, "BTC", observed_at, 4.0, 0.92, 0.93,
+            0.93, 61000.0, 60900.0, 0.16, 0.08, 60950.0,
+            0.08, 0.001, 0.985, 4.0, 0, "production",
+        ),
+    )
 
 
 def test_model_mode_config_validates():
@@ -1700,6 +1994,29 @@ def test_rules_mode_respects_safety_rails(cfg):
     assert ok is True
 
 
+def test_replay_tick_to_asset_carries_btc_ma_fields(cfg):
+    import replay
+    tick = {
+        "ticker": "KXBTC15M-MA", "asset": "BTC", "mins_left": 4.0,
+        "yes_bid": 0.30, "yes_ask": 0.34, "up_prob": 0.32, "no_ask": 0.65,
+        "spot": 102.0, "open_spot": 100.0, "delta_pct": 0.02,
+        "macd": None, "macd_signal": None, "macd_hist": None, "macd_cross": None,
+        "rsi": None, "strike": 100.0, "delta_signed_pct": 0.02,
+        "sigma1m": 0.001, "model_prob": None, "edge_net_cents": None,
+        "settle_prints": 0, "ema12_1m": 101.0, "sma20_1m": 100.0,
+        "sma50_5m": 99.0, "observed_at": "2026-07-03 12:00:00",
+    }
+
+    close_iso = (datetime.now(timezone.utc) + timedelta(minutes=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    a = replay.tick_to_asset(tick, cfg, close_iso)
+
+    assert a["ema12_1m"] == pytest.approx(101.0)
+    assert a["sma20_1m"] == pytest.approx(100.0)
+    assert a["sma50_5m"] == pytest.approx(99.0)
+    _btc_ma_cfg(cfg)
+    assert ct.should_enter(a, cfg, has_open=False, open_count=0) == (True, "ok")
+
+
 def test_replay_parity_and_gate_integration(fresh_db, env_prod, cfg):
     import replay
     tick = {
@@ -1731,6 +2048,217 @@ def test_replay_parity_and_gate_integration(fresh_db, env_prod, cfg):
     assert out["n"] == 1 and out["wins"] == 1
     assert out["trades"][0]["side"] == "up"
     assert out["netEvCentsPerContract"] > 0
+
+
+def test_replay_result_includes_dataset_manifest(fresh_db, env_prod, cfg):
+    import replay
+    _sniper_cfg(cfg)
+    with db.get_db() as conn:
+        _insert_resolved_replay_tick(conn)
+
+    out = replay.replay(cfg, env="production", since_days=3650)
+
+    manifest = out["dataset"]
+    assert out["n"] == 1
+    assert manifest["datasetId"].startswith("crypto15m-production-20260703-20260703-")
+    assert manifest["source"] == "crypto15m_ticks"
+    assert manifest["env"] == "production"
+    assert manifest["sinceDays"] == 3650
+    assert manifest["firstTimestamp"] == "2026-07-03 12:00:00"
+    assert manifest["lastTimestamp"] == "2026-07-03 12:00:00"
+    assert manifest["rowCount"] == 1
+    assert manifest["inSampleRowCount"] == 1
+    assert manifest["windows"] == 1
+    assert manifest["assets"] == ["BTC"]
+    assert manifest["replayMode"] == "directional"
+    assert len(manifest["sha256"]) == 64
+    int(manifest["sha256"], 16)
+
+
+def test_replay_dataset_manifest_is_stable_and_changes_when_rows_change(
+    fresh_db, env_prod, cfg
+):
+    import replay
+    _sniper_cfg(cfg)
+    with db.get_db() as conn:
+        _insert_resolved_replay_tick(conn)
+
+    first = replay.replay(cfg, env="production", since_days=3650)["dataset"]
+    second = replay.replay(cfg, env="production", since_days=3650)["dataset"]
+
+    assert second["datasetId"] == first["datasetId"]
+    assert second["sha256"] == first["sha256"]
+
+    with db.get_db() as conn:
+        conn.execute(
+            """INSERT INTO crypto15m_ticks (
+                  ticker, asset, observed_at, mins_left, yes_bid, yes_ask,
+                  up_prob, spot, open_spot, delta_pct, no_ask, strike,
+                  delta_signed_pct, sigma1m, model_prob, edge_net_cents,
+                  settle_prints, kalshi_env
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "KXBTC15M-DATA", "BTC", "2026-07-03 12:00:10", 3.8,
+                0.91, 0.94, 0.94, 61010.0, 60900.0, 0.18, 0.09,
+                60950.0, 0.08, 0.001, 0.986, 4.2, 0, "production",
+            ),
+        )
+
+    changed = replay.replay(cfg, env="production", since_days=3650)["dataset"]
+    assert changed["rowCount"] == 2
+    assert changed["datasetId"] != first["datasetId"]
+    assert changed["sha256"] != first["sha256"]
+
+
+def test_replay_reports_ma_rejection_counts(fresh_db, env_prod, cfg):
+    _btc_ma_cfg(cfg)
+    cfg["crypto15m_min_entry_seconds_left"] = 120
+    with db.get_db() as conn:
+        conn.execute(
+            """INSERT INTO crypto15m_signals (ticker, asset, series, favorite,
+               favorite_price, entry_cost, resolved, up_won, close_time, kalshi_env)
+               VALUES ('KXBTC15M-R','BTC','KXBTC15M','up',0.50,0.50,1,1,
+                       '2026-07-03T12:04:00Z','production')"""
+        )
+        base = {
+            "ticker": "KXBTC15M-R", "asset": "BTC", "mins_left": 4.0,
+            "yes_bid": 0.49, "yes_ask": 0.50, "up_prob": 0.50, "no_ask": 0.50,
+            "spot": 61000.0, "open_spot": 60900.0, "delta_pct": 0.16,
+            "macd": None, "macd_signal": None, "macd_hist": None,
+            "macd_cross": None, "rsi": None, "strike": 60950.0,
+            "delta_signed_pct": 0.08, "sigma1m": 0.001, "model_prob": None,
+            "edge_net_cents": None, "settle_prints": 0,
+            "kalshi_env": "production",
+        }
+        db.insert_crypto15m_tick(conn, {
+            **base,
+            "observed_at": "2026-07-03 12:00:00",
+            "ema12_1m": 61010.0,
+            "sma20_1m": 61000.0,
+            "sma50_5m": None,
+        })
+        db.insert_crypto15m_tick(conn, {
+            **base,
+            "observed_at": "2026-07-03 12:00:10",
+            "ema12_1m": 61010.0,
+            "sma20_1m": 61000.0,
+            "sma50_5m": 60900.0,
+            "spot": 60800.0,
+        })
+
+    import replay
+    out = replay.replay(cfg, env="production", since_days=3650)
+
+    assert out["n"] == 0
+    assert out["rejections"]["insufficient 5m candles"] == 1
+    assert out["rejections"]["moving averages not aligned"] == 1
+
+
+def test_replay_reconstructs_btc_ma_from_continuous_warmup_ticks(fresh_db, env_prod, cfg):
+    _btc_ma_cfg(cfg)
+    cfg["crypto15m_time_delay_min"] = 15
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    test_start = now - timedelta(days=1) + timedelta(minutes=10)
+    warmup_start = test_start - timedelta(minutes=310)
+
+    def fmt(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def insert_tick(conn, ticker: str, at: datetime, spot: float, *,
+                    mins_left: float = 10.0, yes_ask: float = 0.34,
+                    yes_bid: float = 0.30) -> None:
+        conn.execute(
+            """INSERT INTO crypto15m_ticks (
+                  ticker, asset, observed_at, mins_left, yes_bid, yes_ask,
+                  up_prob, spot, open_spot, delta_pct, no_ask, kalshi_env
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                ticker, "BTC", fmt(at), mins_left, yes_bid, yes_ask,
+                0.50, spot, spot - 10.0, 0.001, 1.0 - yes_bid,
+                "production",
+            ),
+        )
+
+    with db.get_db() as conn:
+        for i in range(310):
+            at = warmup_start + timedelta(minutes=i)
+            insert_tick(conn, f"KXBTC15M-WARM-{i:03d}", at, 50000.0 + i)
+        trade_at = test_start + timedelta(minutes=5)
+        conn.execute(
+            """INSERT INTO crypto15m_signals (ticker, asset, series, favorite,
+               favorite_price, entry_cost, resolved, up_won, close_time, kalshi_env)
+               VALUES ('KXBTC15M-RECON','BTC','KXBTC15M','up',0.50,0.34,1,1,
+                       ?,'production')""",
+            ((trade_at + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        )
+        insert_tick(conn, "KXBTC15M-RECON", trade_at, 50350.0, mins_left=10.0)
+
+    import replay
+    out = replay.replay(cfg, env="production", since_days=1)
+
+    assert out["n"] == 1
+    assert out["windowsScanned"] == 1
+    trade = out["trades"][0]
+    assert trade["ticker"] == "KXBTC15M-RECON"
+    assert trade["side"] == "up"
+    assert trade["entrySide"] == "YES"
+    assert trade["signalType"] == "bullish"
+    assert trade["secondsLeft"] == pytest.approx(600.0)
+    assert trade["yesAskCents"] == pytest.approx(34.0)
+    assert trade["noAskCents"] == pytest.approx(70.0)
+    assert trade["entryPriceCents"] == pytest.approx(34.0)
+    assert trade["contracts"] == 5
+    assert trade["spotUsd"] == pytest.approx(50350.0)
+    assert trade["ema12_1m"] is not None
+    assert trade["sma20_1m"] is not None
+    assert trade["sma50_5m"] is not None
+    assert trade["emaSpreadPct"] > 0
+    assert trade["trendDistancePct"] > 0
+    assert trade["exitReason"] == "settlement"
+    assert trade["exitPriceCents"] == pytest.approx(100.0)
+    assert trade["feesUsd"] > 0
+    assert trade["upWon"] is True
+    assert "ema12 unavailable" not in out["rejections"]
+    assert "insufficient 1m candles" not in out["rejections"]
+    assert "insufficient 5m candles" not in out["rejections"]
+
+
+def test_backtest_summary_trade_details_and_buckets(cfg):
+    import replay
+    trades = [
+        {
+            "asset": "BTC", "ticker": "KXBTC15M-A", "side": "up",
+            "entrySide": "YES", "signalType": "bullish",
+            "costCents": 34.0, "entryPriceCents": 34.0, "minsLeft": 10.0,
+            "secondsLeft": 600.0, "won": True, "pnlUsd": 3.10,
+            "contracts": 5, "at": "2026-07-02 03:15:00",
+        },
+        {
+            "asset": "BTC", "ticker": "KXBTC15M-B", "side": "down",
+            "entrySide": "NO", "signalType": "bearish",
+            "costCents": 56.0, "entryPriceCents": 56.0, "minsLeft": 3.5,
+            "secondsLeft": 210.0, "won": False, "pnlUsd": -2.90,
+            "contracts": 5, "at": "2026-07-02 03:45:00",
+        },
+    ]
+
+    out = replay._summarize(trades, 5, 2, [], rejections={"NO ask above 59c": 3})
+
+    assert out["bySide"]["YES"]["n"] == 1
+    assert out["bySide"]["NO"]["pnlUsd"] == pytest.approx(-2.9)
+    assert out["entryPriceBuckets"][2]["label"] == "25-34c"
+    assert out["entryPriceBuckets"][2]["n"] == 1
+    assert out["entryPriceBuckets"][5]["label"] == "51-59c"
+    assert out["entryPriceBuckets"][5]["n"] == 1
+    assert out["timeLeftBuckets"][1]["label"] == "9-12m"
+    assert out["timeLeftBuckets"][1]["n"] == 1
+    assert out["timeLeftBuckets"][4]["label"] == "2-4m"
+    assert out["timeLeftBuckets"][4]["n"] == 1
+    assert out["tradeStats"]["averageWinUsd"] == pytest.approx(3.10)
+    assert out["tradeStats"]["averageLossUsd"] == pytest.approx(-2.90)
+    assert out["tradeStats"]["profitFactor"] == pytest.approx(3.10 / 2.90)
+    assert out["tradeStats"]["recoveryFactor"] == pytest.approx(0.2 / 2.9)
+    assert out["rejectionTotal"] == 3
 
 
 def test_replay_buckets_and_main_engine(fresh_db, env_prod, cfg):

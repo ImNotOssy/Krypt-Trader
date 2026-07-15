@@ -1,7 +1,7 @@
-import { Children, useRef, useState } from 'react';
+import { Children, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
-  Bitcoin, Check, Copy, Download, FolderOpen, FolderPlus, Pencil, Trash2, Upload,
+  Bitcoin, Check, ClipboardPaste, Copy, Download, FolderOpen, FolderPlus, Pencil, Trash2, Upload,
 } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
@@ -14,6 +14,8 @@ export function ProfilesPage() {
   const toast = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteBusy, setPasteBusy] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Profile | null>(null);
 
   const profiles = state?.customProfiles ?? [];
@@ -86,24 +88,47 @@ export function ProfilesPage() {
 
   const importClick = (): void => fileInputRef.current?.click();
 
+  const importProfileText = async (text: string): Promise<boolean> => {
+    const r = await window.krypt.profiles.import(text);
+    if (r.ok && r.data) {
+      const applied = await window.krypt.profiles.apply(r.data.id);
+      toast.success(applied?.ok ? `Imported & applied "${r.data.name}"` : (r.message || 'Imported'));
+      await refresh.state();
+      return true;
+    }
+    if (r.ok) {
+      toast.success(r.message || 'Imported');
+      await refresh.state();
+      return true;
+    }
+    toast.error(r.message || 'Import failed');
+    return false;
+  };
+
   const importHandler = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
       const text = await file.text();
-      const r = await window.krypt.profiles.import(text);
-      if (r.ok && r.data) {
-        const applied = await window.krypt.profiles.apply(r.data.id);
-        toast.success(applied?.ok ? `Imported & applied "${r.data.name}"` : (r.message || 'Imported'));
-        await refresh.state();
-      } else if (r.ok) {
-        toast.success(r.message || 'Imported');
-        await refresh.state();
-      } else toast.error(r.message || 'Import failed');
+      await importProfileText(text);
     } catch (err: any) {
       toast.error(err?.message || 'Read failed');
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const importPasted = async (text: string): Promise<boolean> => {
+    setPasteBusy(true);
+    try {
+      const ok = await importProfileText(text);
+      if (ok) setPasteOpen(false);
+      return ok;
+    } catch (err: any) {
+      toast.error(err?.message || 'Import failed');
+      return false;
+    } finally {
+      setPasteBusy(false);
     }
   };
 
@@ -116,10 +141,13 @@ export function ProfilesPage() {
           <input
             ref={fileInputRef}
             type="file"
-            accept="application/json,.json"
+            accept="application/json,.json,.yaml,.yml,.txt,text/plain"
             className="hidden"
             onChange={(e) => void importHandler(e)}
           />
+          <button onClick={() => setPasteOpen(true)} className="krypt-btn-default">
+            <ClipboardPaste className="h-4 w-4" /> Paste strategy
+          </button>
           <button onClick={importClick} className="krypt-btn-default">
             <Upload className="h-4 w-4" /> Import
           </button>
@@ -179,6 +207,12 @@ export function ProfilesPage() {
         onSubmit={(name) => void create(name)}
         onClose={() => setCreateOpen(false)}
       />
+      <StrategyPasteDialog
+        open={pasteOpen}
+        busy={pasteBusy}
+        onSubmit={(text) => void importPasted(text)}
+        onClose={() => setPasteOpen(false)}
+      />
       <NameDialog
         open={renameTarget !== null}
         title="Rename profile"
@@ -188,6 +222,81 @@ export function ProfilesPage() {
         onClose={() => setRenameTarget(null)}
       />
     </Page>
+  );
+}
+
+function StrategyPasteDialog({
+  open, busy, onSubmit, onClose,
+}: {
+  open: boolean;
+  busy: boolean;
+  onSubmit: (text: string) => void;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setValue('');
+    const t = setTimeout(() => textareaRef.current?.focus(), 30);
+    return () => clearTimeout(t);
+  }, [open]);
+
+  if (!open) return null;
+
+  const submit = (): void => {
+    const text = value.trim();
+    if (!text || busy) return;
+    onSubmit(text);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4"
+      onMouseDown={() => { if (!busy) onClose(); }}
+    >
+      <div
+        className="w-full max-w-2xl rounded-xl border border-krypt-border bg-krypt-surface p-5 shadow-krypt-soft"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-3">
+          <div className="grid h-10 w-10 place-items-center rounded-lg bg-krypt-surface2 text-krypt-purple">
+            <ClipboardPaste className="h-4 w-4" />
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-white">Paste strategy profile</h3>
+            <p className="mt-1 text-xs leading-relaxed text-krypt-muted">
+              Paste a Kalshi BTC 15m strategy profile. It will be translated into a 15m crypto profile and applied.
+            </p>
+          </div>
+        </div>
+        <textarea
+          ref={textareaRef}
+          value={value}
+          disabled={busy}
+          spellCheck={false}
+          placeholder="version: 1&#10;platform: kalshi&#10;strategy: custom&#10;..."
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape' && !busy) { e.preventDefault(); onClose(); }
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
+          }}
+          className="krypt-input mt-4 min-h-[320px] resize-y font-mono text-xs leading-relaxed"
+        />
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[11px] text-krypt-dim">
+            Importing does not turn live trading on; it only changes the saved 15m strategy settings when applied.
+          </p>
+          <div className="flex items-center gap-2">
+            <button disabled={busy} onClick={onClose} className="krypt-btn-default">Cancel</button>
+            <button disabled={busy || !value.trim()} onClick={submit} className="krypt-btn-primary">
+              {busy ? 'Importing...' : 'Translate & import'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

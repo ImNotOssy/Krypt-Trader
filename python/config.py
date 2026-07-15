@@ -108,7 +108,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "crypto15m_max_concurrent": 3,
     "crypto15m_assets": None,
     "crypto15m_poll_sec": 4,
+    "crypto15m_strategy_mode": "directional",
     "crypto15m_direction_mode": "favorite",
+    "crypto15m_fast_ema_period": 12,
+    "crypto15m_slow_sma_period": 20,
+    "crypto15m_trend_sma_period": 50,
+    "crypto15m_trend_timeframe_min": 5,
+    "crypto15m_min_entry_cents": 5,
+    "crypto15m_max_entry_cents": 59,
+    "crypto15m_min_entry_seconds_left": 120,
+    "crypto15m_time_stop_cents": 10,
+    "crypto15m_time_stop_seconds_left": 60,
+    "crypto15m_force_exit_seconds_left": 5,
     "crypto15m_model_min_prob": 0.97,
     "crypto15m_model_min_edge_cents": 2.0,
     "crypto15m_model_final_minute": True,
@@ -501,6 +512,56 @@ CRYPTO15M_PRESETS: list[dict[str, Any]] = [
         },
     },
     {
+        "id": "c15-btc-ma-crossover",
+        "name": "BTC MA Crossover",
+        "tagline": "BTC-only EMA12/SMA20/SMA50 trend branches.",
+        "description": (
+            "Exact BTC 15-minute strategy: bullish branch buys YES when "
+            "EMA12(1m) > SMA20(1m) and spot > SMA50(5m); bearish branch buys "
+            "NO on the mirror condition. Entries are 5-59c, five contracts, "
+            "one open position, no new entries in the last two minutes, a "
+            "10c final-minute time stop, and a forced sell five seconds "
+            "before settlement. Paper-trade first."
+        ),
+        "config": {
+            "crypto15m_strategy_mode": "btc_ma_crossover",
+            "crypto15m_assets": ["BTC"],
+            "crypto15m_order_size": 5,
+            "crypto15m_max_concurrent": 1,
+            "crypto15m_poll_sec": 10,
+            "crypto15m_time_delay_min": 15.0,
+            "crypto15m_direction_mode": "favorite",
+            "crypto15m_directional_enabled": True,
+            "crypto15m_pairs_enabled": False,
+            "crypto15m_use_rules": False,
+            "crypto15m_entry_threshold": 0.05,
+            "crypto15m_strict_threshold": False,
+            "crypto15m_entry_max": 0.59,
+            "crypto15m_min_delta_pct": 0.0,
+            "crypto15m_max_loss_pct": 0.05,
+            "crypto15m_max_total_pct": 0.05,
+            "crypto15m_session_take_profit_usd": 0.0,
+            "crypto15m_indicator_detect": True,
+            "crypto15m_spot_ws": True,
+            "crypto15m_entry_style": "maker",
+            "crypto15m_maker_cancel_min": 2,
+            "crypto15m_entry_diff": 0.0,
+            "crypto15m_exit_threshold": 0.0,
+            "crypto15m_take_profit_cents": 0,
+            "crypto15m_stop_loss_pct": 0.0,
+            "crypto15m_fast_ema_period": 12,
+            "crypto15m_slow_sma_period": 20,
+            "crypto15m_trend_sma_period": 50,
+            "crypto15m_trend_timeframe_min": 5,
+            "crypto15m_min_entry_cents": 5,
+            "crypto15m_max_entry_cents": 59,
+            "crypto15m_min_entry_seconds_left": 120,
+            "crypto15m_time_stop_cents": 10,
+            "crypto15m_time_stop_seconds_left": 60,
+            "crypto15m_force_exit_seconds_left": 5,
+        },
+    },
+    {
         "id": "c15-macd-trend",
         "name": "MACD Trend (rules)",
         "tagline": "Enter Up when Up is favored and the underlying MACD is bullish.",
@@ -577,6 +638,7 @@ _CRYPTO15M_RULE_FIELDS = [
     "favoritePrice", "entryCost", "upProb", "downProb", "deltaPct",
     "deltaSignedPct", "minsLeft", "hourUtc", "peersAgree", "marketBias",
     "arbEdgeCents", "macd", "macdSignal", "macdHist", "macdCross", "rsi",
+    "ema12_1m", "sma20_1m", "sma50_5m",
     "settlePrints", "upAsk", "downAsk",
     "sigma1m", "modelProb", "edgeNetCents",
 ]
@@ -634,8 +696,28 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["crypto15m_max_loss_pct"] = _clampf(cfg.get("crypto15m_max_loss_pct"), 0.0, 1.0, d["crypto15m_max_loss_pct"])
     cfg["crypto15m_max_total_pct"] = _clampf(cfg.get("crypto15m_max_total_pct"), 0.0, 1.0, d["crypto15m_max_total_pct"])
     cfg["crypto15m_time_delay_min"] = _clampf(cfg.get("crypto15m_time_delay_min"), 0.0, 15.0, d["crypto15m_time_delay_min"])
+    if cfg.get("crypto15m_strategy_mode") not in ("directional", "btc_ma_crossover"):
+        cfg["crypto15m_strategy_mode"] = d["crypto15m_strategy_mode"]
     if cfg.get("crypto15m_direction_mode") not in ("favorite", "contrarian", "model"):
         cfg["crypto15m_direction_mode"] = d["crypto15m_direction_mode"]
+    cfg["crypto15m_fast_ema_period"] = _clampi(cfg.get("crypto15m_fast_ema_period"), 1, 200, d["crypto15m_fast_ema_period"])
+    cfg["crypto15m_slow_sma_period"] = _clampi(cfg.get("crypto15m_slow_sma_period"), 1, 200, d["crypto15m_slow_sma_period"])
+    cfg["crypto15m_trend_sma_period"] = _clampi(cfg.get("crypto15m_trend_sma_period"), 1, 300, d["crypto15m_trend_sma_period"])
+    cfg["crypto15m_trend_timeframe_min"] = _clampi(cfg.get("crypto15m_trend_timeframe_min"), 1, 15, d["crypto15m_trend_timeframe_min"])
+    if cfg["crypto15m_trend_timeframe_min"] not in (1, 5, 15):
+        cfg["crypto15m_trend_timeframe_min"] = d["crypto15m_trend_timeframe_min"]
+    cfg["crypto15m_min_entry_cents"] = _clampi(cfg.get("crypto15m_min_entry_cents"), 1, 99, d["crypto15m_min_entry_cents"])
+    cfg["crypto15m_max_entry_cents"] = _clampi(cfg.get("crypto15m_max_entry_cents"), 1, 99, d["crypto15m_max_entry_cents"])
+    if cfg["crypto15m_min_entry_cents"] > cfg["crypto15m_max_entry_cents"]:
+        cfg["crypto15m_min_entry_cents"], cfg["crypto15m_max_entry_cents"] = (
+            cfg["crypto15m_max_entry_cents"], cfg["crypto15m_min_entry_cents"],
+        )
+    cfg["crypto15m_min_entry_seconds_left"] = _clampi(cfg.get("crypto15m_min_entry_seconds_left"), 0, 900, d["crypto15m_min_entry_seconds_left"])
+    cfg["crypto15m_time_stop_cents"] = _clampi(cfg.get("crypto15m_time_stop_cents"), 1, 99, d["crypto15m_time_stop_cents"])
+    cfg["crypto15m_time_stop_seconds_left"] = _clampi(cfg.get("crypto15m_time_stop_seconds_left"), 1, 300, d["crypto15m_time_stop_seconds_left"])
+    cfg["crypto15m_force_exit_seconds_left"] = _clampi(cfg.get("crypto15m_force_exit_seconds_left"), 1, 60, d["crypto15m_force_exit_seconds_left"])
+    if cfg["crypto15m_strategy_mode"] == "btc_ma_crossover":
+        cfg["crypto15m_indicator_detect"] = True
     cfg["crypto15m_model_min_prob"] = _clampf(cfg.get("crypto15m_model_min_prob"), 0.50, 1.0, d["crypto15m_model_min_prob"])
     cfg["crypto15m_model_min_edge_cents"] = _clampf(cfg.get("crypto15m_model_min_edge_cents"), 0.0, 50.0, d["crypto15m_model_min_edge_cents"])
     cfg["crypto15m_model_final_minute"] = bool(cfg.get("crypto15m_model_final_minute", d["crypto15m_model_final_minute"]))

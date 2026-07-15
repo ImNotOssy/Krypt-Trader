@@ -26,6 +26,8 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 RSI_PERIOD = 14
+MA_FAST_EMA = 12
+MA_SLOW_SMA = 20
 
 
 def _floats(values) -> list[float]:
@@ -56,6 +58,23 @@ def ema_series(values: list[float], period: int) -> list[float]:
         prev = v * k + prev * (1.0 - k)
         out.append(prev)
     return out
+
+
+def ema_latest(values, period: int) -> Optional[float]:
+    vals = _floats(values)
+    series = ema_series(vals, int(period))
+    return round(series[-1], 6) if series else None
+
+
+def sma(values, period: int) -> Optional[float]:
+    vals = _floats(values)
+    try:
+        n = int(period)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or len(vals) < n:
+        return None
+    return round(sum(vals[-n:]) / n, 6)
 
 
 def macd(
@@ -162,4 +181,6 @@ def compute(closes) -> dict:
         "macdCross": m["cross"] if m else None,
         "rsi": rsi(vals),
         "sigma1m": sigma1m(vals),
+        "ema12_1m": ema_latest(vals, MA_FAST_EMA),
+        "sma20_1m": sma(vals, MA_SLOW_SMA),
     }

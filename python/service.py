@@ -1551,11 +1551,10 @@ async def _h_c15_backtest(p: dict) -> dict:
     return await asyncio.to_thread(replay.replay, cfg, env=env, since_days=since)
 
 
-
-async def _h_main_backtest(p: dict) -> dict:
-    """Replay recorded whale/momentum signals through the live should_trade
-    gates with follower economics."""
-    import replay
+async def _h_c15_optimize(p: dict) -> dict:
+    """Grid-search 15m parameters over recorded ticks with split/robustness
+    diagnostics. Read-heavy — run off the event loop."""
+    import optimizer
     from config import merge_with_defaults as _merge
     cfg = dict(STATE.cfg or {})
     patch = (p or {}).get("config") or {}
@@ -1563,7 +1562,174 @@ async def _h_main_backtest(p: dict) -> dict:
         cfg.update(patch)
     cfg = _merge(cfg)
     since = int((p or {}).get("sinceDays") or 60)
-    return await asyncio.to_thread(replay.replay_main, cfg, since_days=since)
+    env = str((p or {}).get("env") or "production")
+    grid = (p or {}).get("paramGrid")
+    if not isinstance(grid, dict):
+        grid = None
+    min_trades = int((p or {}).get("minTrades") or 30)
+    top_n = int((p or {}).get("topN") or 20)
+    boot = int((p or {}).get("bootstrapSamples") or 200)
+    base_profile_id = str((p or {}).get("baseProfileId") or "")
+    base_profile_name = str((p or {}).get("baseProfileName") or "")
+    return await asyncio.to_thread(
+        optimizer.optimize_crypto15m,
+        cfg,
+        env=env,
+        since_days=since,
+        param_grid=grid,
+        min_trades=min_trades,
+        top_n=top_n,
+        bootstrap_samples=boot,
+        base_profile_id=base_profile_id,
+        base_profile_name=base_profile_name,
+    )
+
+
+async def _h_main_optimize(p: dict) -> dict:
+    """Grid-search main-engine gates over recorded whale/momentum signals."""
+    import optimizer
+    from config import merge_with_defaults as _merge
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = _merge(cfg)
+    since = int((p or {}).get("sinceDays") or 60)
+    env = str((p or {}).get("env") or "production")
+    grid = (p or {}).get("paramGrid")
+    if not isinstance(grid, dict):
+        grid = None
+    min_trades = int((p or {}).get("minTrades") or 30)
+    top_n = int((p or {}).get("topN") or 20)
+    boot = int((p or {}).get("bootstrapSamples") or 200)
+    source_mode = str((p or {}).get("sourceMode") or "whale")
+    fixed_risk = float((p or {}).get("fixedRiskUsd") or 1.0)
+    slip = float((p or {}).get("slippageCents") or 1.0)
+    exec_model = str((p or {}).get("executionModel") or "recorded_ask")
+    train_pct = float((p or {}).get("trainPct") or 0.6)
+    validation_pct = float((p or {}).get("validationPct") or 0.2)
+    walk_folds = int((p or {}).get("walkForwardFolds") or 4)
+    base_profile_id = str((p or {}).get("baseProfileId") or "")
+    base_profile_name = str((p or {}).get("baseProfileName") or "")
+    categories = (p or {}).get("categories")
+    common = dict(
+        env=env,
+        since_days=since,
+        min_trades=min_trades,
+        top_n=top_n,
+        bootstrap_samples=boot,
+        fixed_risk_usd=fixed_risk,
+        slippage_cents=slip,
+        execution_model=exec_model,
+        train_pct=train_pct,
+        validation_pct=validation_pct,
+        walk_forward_folds=walk_folds,
+        base_profile_id=base_profile_id,
+        base_profile_name=base_profile_name,
+    )
+    if source_mode in {"category", "category_filter", "categories"}:
+        cats = [str(c) for c in categories] if isinstance(categories, list) else None
+        return await asyncio.to_thread(
+            optimizer.optimize_main_category_filters,
+            cfg,
+            categories=cats,
+            param_grid=grid,
+            **common,
+        )
+    if source_mode == "whale":
+        return await asyncio.to_thread(
+            optimizer.optimize_main_whales,
+            cfg,
+            param_grid=grid,
+            **common,
+        )
+    if source_mode == "momentum":
+        return await asyncio.to_thread(
+            optimizer.optimize_main_momentum,
+            cfg,
+            param_grid=grid,
+            **common,
+        )
+    return await asyncio.to_thread(
+        optimizer.optimize_main_engine,
+        cfg,
+        env=env,
+        since_days=since,
+        param_grid=grid,
+        source_mode=source_mode,
+        min_trades=min_trades,
+        top_n=top_n,
+        bootstrap_samples=boot,
+        fixed_risk_usd=fixed_risk,
+        slippage_cents=slip,
+        execution_model=exec_model,
+        train_pct=train_pct,
+        validation_pct=validation_pct,
+        walk_forward_folds=walk_folds,
+        base_profile_id=base_profile_id,
+        base_profile_name=base_profile_name,
+    )
+
+
+
+async def _h_main_backtest(p: dict) -> dict:
+    """Replay recorded whale/momentum signals through the live should_trade
+    gates with full analytics: rejection funnel, category/source breakdown,
+    calibration, entry-price/resolution/liquidity buckets, event concentration,
+    sizing comparison, execution models, and time analysis."""
+    import main_replay
+    from config import merge_with_defaults as _merge
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = _merge(cfg)
+    since = int((p or {}).get("sinceDays") or 60)
+    slip = float((p or {}).get("slippageCents") or 1.0)
+    fixed_risk = (p or {}).get("fixedRiskUsd")
+    if fixed_risk is not None:
+        fixed_risk = float(fixed_risk)
+    exec_model = str((p or {}).get("executionModel") or "recorded_ask")
+    return await asyncio.to_thread(
+        main_replay.replay_main_engine, cfg,
+        since_days=since, slippage_cents=slip,
+        fixed_risk_usd=fixed_risk, execution_model=exec_model,
+    )
+
+
+async def _h_main_export_research(p: dict) -> dict:
+    """Export main-engine research data as a ZIP file."""
+    import main_replay
+    import main_export
+    from config import merge_with_defaults as _merge
+    cfg = dict(STATE.cfg or {})
+    patch = (p or {}).get("config") or {}
+    if isinstance(patch, dict):
+        cfg.update(patch)
+    cfg = _merge(cfg)
+    since = int((p or {}).get("sinceDays") or 60)
+    result = await asyncio.to_thread(
+        main_replay.replay_main_engine, cfg, since_days=since,
+    )
+    out_dir = str(db._data_dir() / "exports")
+    zip_path = main_export.export_zip(result, cfg, out_dir)
+    return {"ok": True, "path": zip_path}
+
+
+async def _h_ai_experiment_export(p: dict) -> dict:
+    """Export an optimizer result and AI research layer as a ZIP file."""
+    import ai_research
+    opt = (p or {}).get("optimization") or {}
+    if not isinstance(opt, dict) or not opt:
+        return {"ok": False, "message": "missing optimization result", "error": "missing optimization result"}
+    out_dir = str(db._data_dir() / "exports")
+    zip_path = await asyncio.to_thread(ai_research.export_experiment_zip, opt, out_dir)
+    return {
+        "ok": True,
+        "message": "Exported AI experiment ZIP",
+        "path": zip_path,
+        "data": {"path": zip_path},
+    }
 
 
 
@@ -1604,6 +1770,18 @@ async def _h_collection_stats(p: dict) -> dict:
                           outcome_correct, resolved, created_at
                    FROM whale_trades ORDER BY id DESC LIMIT 12"""
             ).fetchall()
+            coinbase = conn.execute(
+                """SELECT COUNT(*) n, MIN(ts) a, MAX(ts) b
+                   FROM coinbase_candles"""
+            ).fetchone()
+            coinbase_assets = conn.execute(
+                """SELECT asset, timeframe_sec, COUNT(*) candles,
+                          MIN(ts) firstAt, MAX(ts) lastAt
+                   FROM coinbase_candles
+                   GROUP BY asset, timeframe_sec
+                   ORDER BY candles DESC, asset, timeframe_sec
+                   LIMIT 12"""
+            ).fetchall()
             perps = db.perp_collection_counts(conn)
         return {
             "c15": {
@@ -1620,6 +1798,12 @@ async def _h_collection_stats(p: dict) -> dict:
                 "topCategories": [dict(r) for r in cats],
                 "recent": [dict(r) for r in recent_main],
             },
+            "coinbase": {
+                "candles": int(coinbase["n"] or 0),
+                "firstAt": coinbase["a"],
+                "lastAt": coinbase["b"],
+                "byAsset": [dict(r) for r in coinbase_assets],
+            },
             "perps": perps,
             "collecting": {
                 "c15": bool((STATE.cfg or {}).get("crypto15m_record_signals", True)),
@@ -1627,6 +1811,49 @@ async def _h_collection_stats(p: dict) -> dict:
                 "perps": bool((STATE.cfg or {}).get("perps_record_signals", False)),
             },
         }
+    return await asyncio.to_thread(_q)
+
+
+async def _h_historical_download_coinbase(p: dict) -> dict:
+    import historical_data
+    return await asyncio.to_thread(
+        historical_data.download_coinbase_candles,
+        product_id=str((p or {}).get("productId") or "BTC-USD"),
+        asset=str((p or {}).get("asset") or "BTC"),
+        days=int((p or {}).get("days") or 7),
+        granularity_sec=int((p or {}).get("granularitySec") or 60),
+    )
+
+
+async def _h_historical_download_kalshi(p: dict) -> dict:
+    import historical_data
+    env = str((p or {}).get("env") or (STATE.cfg or {}).get("kalshi_env") or "production")
+    return await asyncio.to_thread(
+        historical_data.download_kalshi_market_candles,
+        ticker=str((p or {}).get("ticker") or ""),
+        series_ticker=str((p or {}).get("seriesTicker") or ""),
+        asset=str((p or {}).get("asset") or "BTC"),
+        env=env,
+        days=int((p or {}).get("days") or 7),
+        period_interval=int((p or {}).get("periodInterval") or 1),
+        historical=bool((p or {}).get("historical")),
+    )
+
+
+async def _h_historical_validate(p: dict) -> dict:
+    import historical_data
+    env = str((p or {}).get("env") or "production")
+    since_days = int((p or {}).get("sinceDays") or 3650)
+    max_gap = int((p or {}).get("maxGapSeconds") or 90)
+    def _q() -> dict:
+        db.init_db()
+        with db.get_db() as conn:
+            return historical_data.validate_dataset(
+                conn,
+                env=env,
+                since_days=since_days,
+                max_gap_seconds=max_gap,
+            )
     return await asyncio.to_thread(_q)
 
 
@@ -1650,8 +1877,8 @@ async def _h_export_research(p: dict) -> dict:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         out_dir = os.path.join(os.path.dirname(str(db.db_path())), "exports", stamp)
         os.makedirs(out_dir, exist_ok=True)
-        tables = ["crypto15m_signals", "crypto15m_ticks", "crypto15m_positions",
-                  "whale_trades", "alerts"]
+        tables = ["crypto15m_signals", "crypto15m_ticks", "coinbase_candles",
+                  "crypto15m_positions", "whale_trades", "alerts"]
         files = []
         with db.get_db() as conn:
             for t in tables:
@@ -1729,8 +1956,15 @@ _HANDLERS = {
     "crypto15mStatus": _h_crypto15mStatus,
     "tradingStatus": _h_trading_status,
     "c15Backtest": _h_c15_backtest,
+    "c15Optimize": _h_c15_optimize,
     "mainBacktest": _h_main_backtest,
+    "mainOptimize": _h_main_optimize,
+    "mainExportResearch": _h_main_export_research,
+    "aiExperimentExport": _h_ai_experiment_export,
     "collectionStats": _h_collection_stats,
+    "historicalDownloadCoinbase": _h_historical_download_coinbase,
+    "historicalDownloadKalshi": _h_historical_download_kalshi,
+    "historicalValidate": _h_historical_validate,
     "perpsStatus": _h_perps_status,
     "perpsBackfill": _h_perps_backfill,
     "perpsFarmFlatten": _h_perps_farm_flatten,

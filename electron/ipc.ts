@@ -19,7 +19,10 @@ import { setStartWithWindows } from './system/autostart';
 import { pythonBackend } from './system/python-backend';
 import * as store from './system/settings-store';
 import { findStrategy, listStrategies } from './system/strategies';
+import { translateExternalStrategyProfile } from '../shared/profile-importer';
 
+
+const OPTIMIZER_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 
 const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
   ok: true,
@@ -390,7 +393,29 @@ export function registerIpc(): void {
       broadcastState(next);
       return ok(dup, `Imported "${dup.name}"`);
     } catch (e: any) {
-      return err(`Invalid profile JSON: ${e?.message || e}`);
+      const raw = String(json || '');
+      const translated = translateExternalStrategyProfile(raw);
+      if (!translated.ok) {
+        const trimmed = raw.trim();
+        const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[');
+        return err(looksJson
+          ? `Invalid profile JSON: ${e?.message || e}`
+          : `Invalid profile import: ${translated.message}`);
+      }
+      const cur = store.get();
+      const now = new Date().toISOString();
+      const dup: Profile = {
+        id: genId(),
+        name: translated.data.name,
+        description: translated.data.description,
+        kind: translated.data.kind,
+        createdAt: now,
+        updatedAt: now,
+        config: { ...store.DEFAULT_CONFIG, ...sanitizeImportedConfig(translated.data.config) },
+      };
+      const next = store.save({ ...cur, customProfiles: [...cur.customProfiles, dup] });
+      broadcastState(next);
+      return ok(dup, `Imported strategy "${dup.name}"`);
     }
   });
 
@@ -600,13 +625,31 @@ export function registerIpc(): void {
     }
     return await pythonBackend.request('crypto15mStatus', {});
   });
-  ipcMain.handle('crypto15m:backtest', async (_e, args?: { sinceDays?: number }) => {
+  ipcMain.handle('crypto15m:backtest', async (_e, args?: { sinceDays?: number; config?: Record<string, unknown> }) => {
     if (!pythonBackend.isRunning()) return null;
     return await pythonBackend.request('c15Backtest', args || {});
+  });
+  ipcMain.handle('crypto15m:optimize', async (_e, args?: {
+    sinceDays?: number; config?: Record<string, unknown>; minTrades?: number; topN?: number; bootstrapSamples?: number; baseProfileId?: string; baseProfileName?: string;
+  }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('c15Optimize', args || {}, OPTIMIZER_RPC_TIMEOUT_MS);
   });
   ipcMain.handle('main:backtest', async (_e, args?: { sinceDays?: number; config?: Record<string, unknown> }) => {
     if (!pythonBackend.isRunning()) return null;
     return await pythonBackend.request('mainBacktest', args || {});
+  });
+  ipcMain.handle('main:optimize', async (_e, args?: {
+    sinceDays?: number; config?: Record<string, unknown>; minTrades?: number; topN?: number; bootstrapSamples?: number; sourceMode?: string; fixedRiskUsd?: number; slippageCents?: number; executionModel?: string;
+  }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('mainOptimize', args || {}, OPTIMIZER_RPC_TIMEOUT_MS);
+  });
+  ipcMain.handle('research:exportExperiment', async (_e, args?: { optimization?: Record<string, unknown> }) => {
+    if (!pythonBackend.isRunning()) return null;
+    const r = await pythonBackend.request('aiExperimentExport', args || {}) as { path?: string } | null;
+    if (r?.path) shell.showItemInFolder(r.path);
+    return r;
   });
   ipcMain.handle('crypto15m:history', async (_e, args?: { limit?: number }) => {
     if (!pythonBackend.isRunning()) return null;
@@ -621,6 +664,25 @@ export function registerIpc(): void {
   ipcMain.handle('backtest:collection', async () => {
     if (!pythonBackend.isRunning()) return null;
     return await pythonBackend.request('collectionStats', {});
+  });
+  ipcMain.handle('historical:downloadCoinbase', async (_e, args?: {
+    productId?: string; asset?: string; days?: number; granularitySec?: number;
+  }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('historicalDownloadCoinbase', args || {});
+  });
+  ipcMain.handle('historical:downloadKalshi', async (_e, args?: {
+    ticker?: string; seriesTicker?: string; asset?: string; env?: string;
+    days?: number; periodInterval?: number; historical?: boolean;
+  }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('historicalDownloadKalshi', args || {});
+  });
+  ipcMain.handle('historical:validate', async (_e, args?: {
+    env?: string; sinceDays?: number; maxGapSeconds?: number;
+  }) => {
+    if (!pythonBackend.isRunning()) return null;
+    return await pythonBackend.request('historicalValidate', args || {});
   });
   ipcMain.handle('perps:status', async () => {
     if (!pythonBackend.isRunning()) return null;

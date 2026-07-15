@@ -28,6 +28,8 @@
     "py:test": "node scripts/test-python.mjs",
     "py:backtest": "node scripts/backtest.mjs",
     "py:backtest15m": "node scripts/backtest.mjs --c15",
+    "py:import-history": "node scripts/import-history.mjs",
+    "py:optimize": "node scripts/optimize.mjs",
     "py:dist": "node scripts/build-python.mjs",
     "dist": "npm run build && npm run py:dist && electron-builder"
   },

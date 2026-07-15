@@ -73,6 +73,11 @@ const api: KryptApi = {
     exportData: () => ipcRenderer.invoke('backtest:export'),
     flatten: () => ipcRenderer.invoke('trading:flatten'),
   },
+  historical: {
+    downloadCoinbase: (args) => ipcRenderer.invoke('historical:downloadCoinbase', args),
+    downloadKalshi: (args) => ipcRenderer.invoke('historical:downloadKalshi', args),
+    validate: (args) => ipcRenderer.invoke('historical:validate', args),
+  },
   data: {
     account: (): Promise<AccountSnapshot> => ipcRenderer.invoke('data:account'),
     pnlSeries: (sinceHours?: number): Promise<PnlPoint[]> =>
@@ -92,7 +97,10 @@ const api: KryptApi = {
     snapshot: () => ipcRenderer.invoke('crypto15m:snapshot'),
     status: () => ipcRenderer.invoke('crypto15m:status'),
     backtest: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('crypto15m:backtest', args),
+    optimize: (args?: { sinceDays?: number; config?: Record<string, unknown>; minTrades?: number; topN?: number; bootstrapSamples?: number; baseProfileId?: string; baseProfileName?: string }) => ipcRenderer.invoke('crypto15m:optimize', args),
     backtestMain: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('main:backtest', args),
+    optimizeMain: (args?: { sinceDays?: number; config?: Record<string, unknown>; minTrades?: number; topN?: number; bootstrapSamples?: number; sourceMode?: string; fixedRiskUsd?: number; slippageCents?: number; executionModel?: string }) => ipcRenderer.invoke('main:optimize', args),
+    exportExperiment: (args) => ipcRenderer.invoke('research:exportExperiment', args),
     history: (args?: { limit?: number }) => ipcRenderer.invoke('crypto15m:history', args),
   },
   perps: {

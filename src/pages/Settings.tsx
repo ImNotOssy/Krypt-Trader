@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import {
-  AlertTriangle, Banknote, Bitcoin, Cloud, Dices, Film, Globe2, RotateCcw, Save,
-  Trophy, Vote,
+  AlertTriangle, Banknote, Bitcoin, Cloud, Database, Dices, Download, FileJson,
+  Film, Globe2, RefreshCw, RotateCcw, Save, Trophy, Vote,
 } from 'lucide-react';
-import type { TraderConfig } from '@shared/types';
+import type {
+  HistoricalDownloadResult, HistoricalValidationReport, TraderConfig,
+} from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import {
@@ -23,11 +25,29 @@ const KRYPT_CATEGORIES: { id: string; label: string; Icon: typeof Trophy }[] = [
   { id: 'exotics', label: 'Exotics', Icon: Dices },
 ];
 
+type HistoryJob = 'coinbase' | 'kalshi' | 'validate' | null;
+type KalshiHistoryRoute = 'historical' | 'current';
+
 export function SettingsPage() {
   const { config, account, credentialsAll, refresh, state } = useApp();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [saveOpen, setSaveOpen] = useState(false);
+  const [histBusy, setHistBusy] = useState<HistoryJob>(null);
+  const [histMsg, setHistMsg] = useState<string | null>(null);
+  const [histErr, setHistErr] = useState<string | null>(null);
+  const [histReport, setHistReport] = useState<HistoricalValidationReport | null>(null);
+  const [coinProduct, setCoinProduct] = useState('BTC-USD');
+  const [coinAsset, setCoinAsset] = useState('BTC');
+  const [coinDays, setCoinDays] = useState(7);
+  const [coinGranularity, setCoinGranularity] = useState(60);
+  const [kalshiTicker, setKalshiTicker] = useState('');
+  const [kalshiSeries, setKalshiSeries] = useState('KXBTC15M');
+  const [kalshiAsset, setKalshiAsset] = useState('BTC');
+  const [kalshiDays, setKalshiDays] = useState(7);
+  const [kalshiPeriod, setKalshiPeriod] = useState(1);
+  const [kalshiEnv, setKalshiEnv] = useState('production');
+  const [kalshiRoute, setKalshiRoute] = useState<KalshiHistoryRoute>('historical');
 
   if (!config) return <Page title="Settings"><div className="text-krypt-muted">Loading…</div></Page>;
 
@@ -93,6 +113,107 @@ export function SettingsPage() {
       toast.success(r.message || `Saved "${name}"`);
       await refresh.state();
     } else toast.error(r.message || 'Could not save profile');
+  };
+
+  const summarizeHistoryDownload = (r: HistoricalDownloadResult): string => {
+    const range = r.firstAt && r.lastAt
+      ? ` from ${r.firstAt.slice(0, 16)} to ${r.lastAt.slice(0, 16)} UTC`
+      : '';
+    const label = r.source === 'coinbase'
+      ? `Coinbase ${r.productId ?? r.asset ?? ''}`.trim()
+      : `Kalshi ${r.ticker ?? ''}`.trim();
+    return `${label}: ${r.candlesImported.toLocaleString()} candles imported${range}.`;
+  };
+
+  const downloadCoinbaseHistory = async (): Promise<void> => {
+    setHistBusy('coinbase');
+    setHistErr(null);
+    setHistMsg(null);
+    setHistReport(null);
+    try {
+      const r = await window.krypt.historical.downloadCoinbase({
+        productId: coinProduct,
+        asset: coinAsset,
+        days: coinDays,
+        granularitySec: coinGranularity,
+      });
+      if (!r) {
+        setHistErr('Engine not running — start the app backend first.');
+        return;
+      }
+      setHistMsg(summarizeHistoryDownload(r));
+    } catch (e: any) {
+      setHistErr(e?.message || String(e));
+    } finally {
+      setHistBusy(null);
+    }
+  };
+
+  const downloadKalshiHistory = async (): Promise<void> => {
+    const ticker = kalshiTicker.trim().toUpperCase();
+    const seriesTicker = kalshiSeries.trim().toUpperCase();
+    if (!ticker) {
+      setHistErr('Kalshi market ticker is required.');
+      return;
+    }
+    if (kalshiRoute === 'current' && !seriesTicker) {
+      setHistErr('Series ticker is required for the current Kalshi route.');
+      return;
+    }
+    setHistBusy('kalshi');
+    setHistErr(null);
+    setHistMsg(null);
+    setHistReport(null);
+    try {
+      const r = await window.krypt.historical.downloadKalshi({
+        ticker,
+        seriesTicker,
+        asset: kalshiAsset,
+        env: kalshiEnv,
+        days: kalshiDays,
+        periodInterval: kalshiPeriod,
+        historical: kalshiRoute === 'historical',
+      });
+      if (!r) {
+        setHistErr('Engine not running — start the app backend first.');
+        return;
+      }
+      setHistMsg(summarizeHistoryDownload(r));
+    } catch (e: any) {
+      setHistErr(e?.message || String(e));
+    } finally {
+      setHistBusy(null);
+    }
+  };
+
+  const validateHistory = async (): Promise<void> => {
+    setHistBusy('validate');
+    setHistErr(null);
+    setHistMsg(null);
+    setHistReport(null);
+    try {
+      const report = await window.krypt.historical.validate({
+        env: kalshiEnv,
+        sinceDays: 3650,
+        maxGapSeconds: 90,
+      });
+      if (!report) {
+        setHistErr('Engine not running — start the app backend first.');
+        return;
+      }
+      setHistReport(report);
+      const coinbaseCandles = Object.values(report.coinbase.assets)
+        .reduce((sum, asset) => sum + asset.candles, 0);
+      setHistMsg(
+        `Validation: ${report.crypto15m.ticks.toLocaleString()} Kalshi ticks, ` +
+        `${report.crypto15m.windows.toLocaleString()} windows, ` +
+        `${coinbaseCandles.toLocaleString()} Coinbase candles.`,
+      );
+    } catch (e: any) {
+      setHistErr(e?.message || String(e));
+    } finally {
+      setHistBusy(null);
+    }
   };
 
   const env = config.kalshiEnv;
@@ -616,6 +737,179 @@ export function SettingsPage() {
         </Card>
       </Section>
 
+      <Section
+        title="Historical data"
+        description="Advanced import and validation tools. Backtesting does not need this panel for normal use."
+      >
+        <Card>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-krypt-muted">
+              <Database className="h-3.5 w-3.5" />
+              Historical data
+            </div>
+            <button
+              onClick={() => void validateHistory()}
+              disabled={histBusy != null}
+              className="inline-flex items-center gap-1.5 rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-[11px] text-krypt-dim transition-colors hover:text-white disabled:opacity-50"
+            >
+              <RefreshCw className={cls('h-3 w-3', histBusy === 'validate' && 'animate-spin')} />
+              Validate dataset
+            </button>
+          </div>
+          <div className="grid gap-3 xl:grid-cols-2">
+            <div className="rounded-md border border-krypt-border/60 bg-krypt-bg/30 p-3">
+              <div className="mb-2 text-[10px] uppercase tracking-wide text-krypt-dim">Coinbase candles</div>
+              <div className="grid gap-2 sm:grid-cols-4">
+                <Field label="Product">
+                  <input
+                    value={coinProduct}
+                    onChange={(e) => setCoinProduct(e.target.value.toUpperCase())}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Asset">
+                  <input
+                    value={coinAsset}
+                    onChange={(e) => setCoinAsset(e.target.value.toUpperCase())}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Days">
+                  <input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    value={coinDays}
+                    onChange={(e) => setCoinDays(Math.max(1, Number(e.target.value) || 1))}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Granularity">
+                  <select
+                    value={coinGranularity}
+                    onChange={(e) => setCoinGranularity(Number(e.target.value))}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  >
+                    <option value={60}>1m</option>
+                    <option value={300}>5m</option>
+                    <option value={900}>15m</option>
+                    <option value={3600}>1h</option>
+                  </select>
+                </Field>
+              </div>
+              <button
+                onClick={() => void downloadCoinbaseHistory()}
+                disabled={histBusy != null}
+                className="mt-3 inline-flex items-center gap-2 rounded-md border border-krypt-purple/40 bg-krypt-purple/10 px-3 py-1.5 text-xs font-semibold text-krypt-purple transition-colors hover:bg-krypt-purple/20 disabled:opacity-50"
+              >
+                <Download className={cls('h-3.5 w-3.5', histBusy === 'coinbase' && 'animate-pulse')} />
+                {histBusy === 'coinbase' ? 'Downloading…' : 'Download Coinbase'}
+              </button>
+            </div>
+            <div className="rounded-md border border-krypt-border/60 bg-krypt-bg/30 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[10px] uppercase tracking-wide text-krypt-dim">Kalshi candles</div>
+                <select
+                  value={kalshiRoute}
+                  onChange={(e) => setKalshiRoute(e.target.value as KalshiHistoryRoute)}
+                  className="rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-1 text-[10px] text-krypt-muted outline-none focus:border-krypt-purple/60"
+                >
+                  <option value="historical">Historical</option>
+                  <option value="current">Current</option>
+                </select>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <Field label="Market ticker">
+                  <input
+                    placeholder="KXBTC..."
+                    value={kalshiTicker}
+                    onChange={(e) => setKalshiTicker(e.target.value.toUpperCase())}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none placeholder:text-krypt-dim focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Series">
+                  <input
+                    value={kalshiSeries}
+                    disabled={kalshiRoute === 'historical'}
+                    onChange={(e) => setKalshiSeries(e.target.value.toUpperCase())}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none disabled:opacity-50 focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Asset">
+                  <input
+                    value={kalshiAsset}
+                    onChange={(e) => setKalshiAsset(e.target.value.toUpperCase())}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Env">
+                  <select
+                    value={kalshiEnv}
+                    onChange={(e) => setKalshiEnv(e.target.value)}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  >
+                    <option value="production">Production</option>
+                    <option value="demo">Demo</option>
+                  </select>
+                </Field>
+                <Field label="Days">
+                  <input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    value={kalshiDays}
+                    onChange={(e) => setKalshiDays(Math.max(1, Number(e.target.value) || 1))}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  />
+                </Field>
+                <Field label="Interval">
+                  <select
+                    value={kalshiPeriod}
+                    onChange={(e) => setKalshiPeriod(Number(e.target.value))}
+                    className="w-full rounded-md border border-krypt-border bg-krypt-surface2 px-2.5 py-1.5 text-xs text-white outline-none focus:border-krypt-purple/60"
+                  >
+                    <option value={1}>1m</option>
+                    <option value={60}>1h</option>
+                    <option value={1440}>1d</option>
+                  </select>
+                </Field>
+              </div>
+              <button
+                onClick={() => void downloadKalshiHistory()}
+                disabled={histBusy != null}
+                className="mt-3 inline-flex items-center gap-2 rounded-md border border-krypt-purple/40 bg-krypt-purple/10 px-3 py-1.5 text-xs font-semibold text-krypt-purple transition-colors hover:bg-krypt-purple/20 disabled:opacity-50"
+              >
+                <Download className={cls('h-3.5 w-3.5', histBusy === 'kalshi' && 'animate-pulse')} />
+                {histBusy === 'kalshi' ? 'Downloading…' : 'Download Kalshi'}
+              </button>
+              <p className="mt-2 text-[10px] leading-relaxed text-krypt-dim">
+                Kalshi candlesticks add quote history. Backtests still need resolved outcome rows to score win/loss results.
+              </p>
+            </div>
+          </div>
+          {(histMsg || histErr || histReport) && (
+            <div className="mt-3 rounded-md border border-krypt-border/60 bg-krypt-bg/30 p-2 text-[11px]">
+              {histErr && <div className="text-krypt-loss">{histErr}</div>}
+              {histMsg && <div className="text-krypt-dim">{histMsg}</div>}
+              {histReport && (
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-krypt-dim">
+                  <span>Kalshi gaps: {histReport.crypto15m.gapCount.toLocaleString()}</span>
+                  <span>Bad timestamps: {histReport.crypto15m.badTimestamps.toLocaleString()}</span>
+                  <span>Coinbase assets: {Object.keys(histReport.coinbase.assets).length.toLocaleString()}</span>
+                  <button
+                    onClick={() => downloadJson('krypt-dataset-validation.json', histReport)}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-krypt-border bg-krypt-surface2 px-2 py-1 text-[10px] text-krypt-dim transition-colors hover:text-white"
+                  >
+                    <FileJson className="h-3 w-3" />
+                    Download report
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </Card>
+      </Section>
+
       <DangerZone busy={busy} setBusy={setBusy} />
       <NameDialog
         open={saveOpen}
@@ -765,6 +1059,16 @@ function DangerZone({
       )}
     </>
   );
+}
+
+function downloadJson(filename: string, data: unknown): void {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function Field({
